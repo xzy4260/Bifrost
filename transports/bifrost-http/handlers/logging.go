@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"slices"
 	"sort"
 	"strconv"
@@ -23,7 +22,6 @@ import (
 	"github.com/maximhq/bifrost/framework/logstore"
 	"github.com/maximhq/bifrost/framework/queryscope"
 	"github.com/maximhq/bifrost/framework/sidekiq"
-	"github.com/maximhq/bifrost/framework/warp"
 	"github.com/maximhq/bifrost/plugins/logging"
 	"github.com/maximhq/bifrost/transports/v2/bifrost-http/lib"
 	"github.com/valyala/fasthttp"
@@ -51,55 +49,6 @@ type LoggingHandler struct {
 	// in which case the recalculate-cost endpoints return 503.
 	sidekiqRunner *sidekiq.Runner
 	sidekiqStore  SidekiqJobStore
-
-	// topics lists Warp's topics for the topics filter dimension. Nil until
-	// SetTopicLister wires it, in which case the dimension is empty.
-	topics warp.TopicLister
-	// logSearch serves GET /api/logs/search. Nil until SetLogSearch wires it,
-	// in which case the route answers 503.
-	logSearch LogSearcher
-}
-
-// SetTopicLister wires the Warp topic reader the topics filter dimension
-// lists from.
-func (h *LoggingHandler) SetTopicLister(topics warp.TopicLister) {
-	h.topics = topics
-}
-
-// topicFilterWindow is how far back the topics filter dimension looks for a
-// topic with requests. Warp's upkeep retires a topic silent for this long, so
-// the window holds exactly the topics still in use.
-const topicFilterWindow = 30 * 24 * time.Hour
-
-// topicFilterData lists the topics a caller may filter the logs by: those
-// with a request they may see in the last month, by name, largest first,
-// narrowed to the ones whose name contains query. The reader narrows before it
-// applies limit, so a matching topic outside the largest few is still found.
-//
-// It reads through Warp's own topic reader rather than the topic rows, so a
-// restricted caller is offered only the topics their own requests fall under,
-// as Warp's list_topics shows them (see TopicReader.ListTopics).
-func topicFilterData(ctx context.Context, topics warp.TopicLister, limit int, query string) ([]logging.KeyPair, error) {
-	if topics == nil {
-		return []logging.KeyPair{}, nil
-	}
-	end := time.Now().UTC()
-	start := end.Add(-topicFilterWindow)
-	list, err := topics.ListTopics(ctx, warp.TopicQuery{
-		Filter: logstore.WarpTopicAssignmentFilter{StartTime: &start, EndTime: &end}, Limit: limit,
-		NameContains: strings.ToLower(strings.TrimSpace(query)),
-	})
-	if err != nil {
-		if errors.Is(err, warp.ErrUnavailable) {
-			return []logging.KeyPair{}, nil
-		}
-		return nil, err
-	}
-	pairs := make([]logging.KeyPair, 0, len(list.Topics))
-	for _, topic := range list.Topics {
-		pairs = append(pairs, logging.KeyPair{ID: topic.ID, Name: topic.Label})
-	}
-	return pairs, nil
 }
 
 // SidekiqJobStore is the narrow read surface the recalculate-cost endpoints need
@@ -108,16 +57,6 @@ func topicFilterData(ctx context.Context, topics warp.TopicLister, limit int, qu
 type SidekiqJobStore interface {
 	GetSidekiqJob(ctx context.Context, id string) (*tables.TableSidekiqJob, error)
 	GetInFlightSidekiqJobByKind(ctx context.Context, kind string) (*tables.TableSidekiqJob, error)
-}
-
-// LogSearcher is semantic log search, which Warp's log index provides.
-type LogSearcher interface {
-	SearchLogs(ctx context.Context, queries []string, filters *logstore.SearchFilters, limit int) (warp.SemanticSearchResult, error)
-}
-
-// SetLogSearch wires the semantic search GET /api/logs/search serves.
-func (h *LoggingHandler) SetLogSearch(search LogSearcher) {
-	h.logSearch = search
 }
 
 // SetSidekiqBackend wires the sidekiq runner and job store, and registers the
@@ -258,7 +197,6 @@ const (
 	filterDimUsers          = "users"
 	filterDimBusinessUnits  = "business_units"
 	filterDimProjects       = "projects"
-	filterDimTopics         = "topics"
 	filterDimMetadataKeys   = "metadata_keys"
 )
 
@@ -280,7 +218,7 @@ var allFilterDimensions = []string{
 	filterDimModels, filterDimAliases, filterDimSelectedKeys, filterDimVirtualKeys,
 	filterDimRoutingRules, filterDimRoutingEngines, filterDimStopReasons, filterDimToolCallNames, filterDimApps,
 	filterDimUserAgents, filterDimTeams, filterDimCustomers, filterDimUsers,
-	filterDimBusinessUnits, filterDimProjects, filterDimTopics, filterDimMetadataKeys,
+	filterDimBusinessUnits, filterDimProjects, filterDimMetadataKeys,
 }
 
 var allMCPFilterDimensions = []string{
@@ -455,7 +393,6 @@ func (h *LoggingHandler) RegisterRoutes(r *router.Router, middlewares ...schemas
 	r.PUT("/api/logs/user-agent-mappings/{id}", lib.ChainMiddlewares(h.updateUserAgentMapping, middlewares...))
 	r.DELETE("/api/logs/user-agent-mappings/{id}", lib.ChainMiddlewares(h.deleteUserAgentMapping, middlewares...))
 	r.GET("/api/logs/{id}", lib.ChainMiddlewares(h.withHiddenRequestTypes(h.getLogByID), middlewares...))
-	r.GET("/api/logs/search", lib.ChainMiddlewares(h.withHiddenRequestTypes(h.searchLogs), middlewares...))
 	r.GET("/api/logs/{id}/trace", lib.ChainMiddlewares(h.withHiddenRequestTypes(h.getLogTrace), middlewares...))
 	r.GET("/api/logs/stats", lib.ChainMiddlewares(h.withHiddenRequestTypes(h.getLogsStats), middlewares...))
 	r.GET("/api/logs/histogram", lib.ChainMiddlewares(h.withHiddenRequestTypes(h.getLogsHistogram), middlewares...))
@@ -985,205 +922,6 @@ func (h *LoggingHandler) getLogs(ctx *fasthttp.RequestCtx) {
 	SendJSON(ctx, result)
 }
 
-// logSearchTimeout bounds one semantic search: its embedding requests and
-// vector searches.
-const logSearchTimeout = time.Minute
-
-// searchLogs finds logged conversations by meaning. Each query parameter is one
-// phrasing; a log scores by its best match across them. The other parameters
-// are the log filters the stats and histogram routes take, plus limit. Matches
-// are reloaded through the log store, so the caller's access scope applies.
-func (h *LoggingHandler) searchLogs(ctx *fasthttp.RequestCtx) {
-	// The request is checked whole before availability and before any search,
-	// so a bad one is a 400 whether or not Warp is on, and never pays for an
-	// embedding.
-	filters, ok := parseLogSearchFilters(ctx)
-	if !ok {
-		return
-	}
-	// Counted as sent, before de-duplication, as the spec's maxItems is: a
-	// repeated phrasing still counts, and an oversized request is never copied.
-	raw := ctx.QueryArgs().PeekMulti("query")
-	if len(raw) > warp.MaxSemanticQueries {
-		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("%d queries given; at most %d are accepted", len(raw), warp.MaxSemanticQueries))
-		return
-	}
-	queries := make([]string, 0, len(raw))
-	for _, value := range raw {
-		queries = append(queries, string(value))
-	}
-	if err := warp.ValidateLogSearch(queries, filters); err != nil {
-		SendError(ctx, fasthttp.StatusBadRequest, err.Error())
-		return
-	}
-	limit := 0
-	if raw := string(ctx.QueryArgs().Peek("limit")); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil || parsed < 1 || parsed > warp.MaxLogRows {
-			SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("limit must be between 1 and %d", warp.MaxLogRows))
-			return
-		}
-		limit = parsed
-	}
-	if h.logSearch == nil {
-		SendError(ctx, fasthttp.StatusServiceUnavailable, logSearchUnavailableMsg)
-		return
-	}
-	searchCtx, cancel := RequestWorkContext(ctx, logSearchTimeout)
-	defer cancel()
-	result, err := h.logSearch.SearchLogs(searchCtx, queries, filters, limit)
-	switch {
-	case errors.Is(err, warp.ErrInvalidSearchQuery):
-		SendError(ctx, fasthttp.StatusBadRequest, err.Error())
-	case errors.Is(err, warp.ErrUnavailable), errors.Is(err, warp.ErrNoVectorStore):
-		SendError(ctx, fasthttp.StatusServiceUnavailable, logSearchUnavailableMsg)
-	case err != nil:
-		// The cause can name embedding providers and vector store hosts, so it is
-		// logged here and the caller gets a fixed message.
-		logger.Warn("semantic log search failed: %v", err)
-		SendError(ctx, fasthttp.StatusInternalServerError, "semantic log search failed")
-	default:
-		SendJSON(ctx, result)
-	}
-}
-
-const logSearchUnavailableMsg = "semantic log search needs Warp enabled, with an embedding model and its log index set up"
-
-// logSearchStrictParams are the values parseHistogramFilters drops when they do
-// not parse. Dropped, a bound silently widens a search, so the search route
-// refuses them instead.
-var logSearchStrictParams = []struct {
-	name  string
-	parse func(string) error
-}{
-	{"start_time", func(v string) error { _, err := time.Parse(time.RFC3339Nano, v); return err }},
-	{"end_time", func(v string) error { _, err := time.Parse(time.RFC3339Nano, v); return err }},
-	{"min_latency", parseLogSearchBound},
-	{"max_latency", parseLogSearchBound},
-	{"min_cost", parseLogSearchBound},
-	{"max_cost", parseLogSearchBound},
-	{"min_tokens", func(v string) error { _, err := strconv.Atoi(v); return err }},
-	{"max_tokens", func(v string) error { _, err := strconv.Atoi(v); return err }},
-	{"missing_cost_only", func(v string) error { _, err := strconv.ParseBool(v); return err }},
-	// ResolvePeriod returns a nil start only for a period it does not recognise; an
-	// unknown timezone falls back to UTC instead, so it is not checked here.
-	{"period", func(v string) error {
-		if start, _ := ResolvePeriod(v, ""); start == nil {
-			return errors.New("unrecognised period")
-		}
-		return nil
-	}},
-}
-
-// parseLogSearchBound accepts a latency or cost bound: any number, including
-// +Inf and -Inf, but not NaN, which ParseFloat accepts and which no row
-// compares against, so it would turn the bound into a filter matching nothing.
-func parseLogSearchBound(v string) error {
-	f, err := strconv.ParseFloat(v, 64)
-	if err != nil {
-		return err
-	}
-	if math.IsNaN(f) {
-		return errors.New("not a number")
-	}
-	return nil
-}
-
-// logSearchParams are the query parameters the search route reads: its own
-// (query, limit), every key parseHistogramFilters reads, and the flags
-// parseLogSearchFilters reads to refuse. metadata_<key> filters are matched by
-// prefix. Anything else is refused: a filter the route does not read would be
-// silently dropped and widen the search, the failure the strict parsing above
-// exists to prevent.
-var logSearchParams = map[string]bool{
-	"query": true, "limit": true,
-	"providers": true, "models": true, "aliases": true, "status": true, "objects": true,
-	"selected_key_ids": true, "virtual_key_ids": true, "routing_rule_ids": true, "team_ids": true,
-	"customer_ids": true, "user_ids": true, "business_unit_ids": true, "project_ids": true,
-	"topic_ids": true, "routing_engine_used": true, "stop_reasons": true, "user_agents": true,
-	"apps": true, "session_id": true, "start_time": true, "end_time": true, "period": true,
-	"timezone": true, "min_latency": true, "max_latency": true, "min_tokens": true,
-	"max_tokens": true, "min_cost": true, "max_cost": true, "missing_cost_only": true,
-	"cache_hit_types": true, "content_search": true, "request_id": true,
-	"roots_only": true, "group_sessions": true, "fallback_hops_only": true,
-}
-
-// logSearchListParams are the list filters parseHistogramFilters reads, each with
-// its parser. A value that parses to no entries (",", "[]") would leave the
-// filter unset and so lift the restriction, so the search refuses it.
-var logSearchListParams = map[string]func(string) []string{
-	"providers": parseCommaSeparated, "models": parseCommaSeparated, "aliases": parseCommaSeparated,
-	"status": parseCommaSeparated, "objects": parseCommaSeparated, "selected_key_ids": parseCommaSeparated,
-	"virtual_key_ids": parseCommaSeparated, "routing_rule_ids": parseCommaSeparated, "team_ids": parseCommaSeparated,
-	"customer_ids": parseCommaSeparated, "user_ids": parseCommaSeparated, "business_unit_ids": parseCommaSeparated,
-	"project_ids": parseCommaSeparated, "routing_engine_used": parseCommaSeparated, "stop_reasons": parseCommaSeparated,
-	"cache_hit_types": parseCommaSeparated, "user_agents": parseStringArrayParam, "apps": parseStringArrayParam,
-}
-
-// parseLogSearchFilters reads the search route's filters: the histogram set,
-// with its malformed bounds refused rather than dropped, plus roots_only,
-// group_sessions and fallback_hops_only, which that parser does not read. They are read so the search
-// can refuse them; ignored, they would widen the result. On a refusal it has
-// already written the 400 and returns false.
-func parseLogSearchFilters(ctx *fasthttp.RequestCtx) (*logstore.SearchFilters, bool) {
-	// Every parameter but query (one phrasing each) and metadata_<key> (any of
-	// its values) is read once, by Peek, so a repeat is refused rather than
-	// silently ignored. A metadata parameter that names no key or no value is
-	// refused too: dropped by the parser, it would lift the filter it asked for.
-	seen := make(map[string]bool)
-	for name, value := range ctx.QueryArgs().All() {
-		key := string(name)
-		if metadataKey, isMetadata := strings.CutPrefix(key, "metadata_"); isMetadata {
-			if metadataKey == "" || len(parseMetadataFilterValues(string(value))) == 0 {
-				SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("%s must name a metadata key and at least one value", key))
-				return nil, false
-			}
-			continue
-		}
-		if !logSearchParams[key] {
-			SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("%s is not a filter semantic log search can apply", key))
-			return nil, false
-		}
-		if key != "query" && seen[key] {
-			SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("%s is given more than once; send it once, with every value in it", key))
-			return nil, false
-		}
-		seen[key] = true
-	}
-	for _, param := range logSearchStrictParams {
-		if raw := string(ctx.QueryArgs().Peek(param.name)); raw != "" {
-			if err := param.parse(raw); err != nil {
-				SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("invalid %s: %q", param.name, raw))
-				return nil, false
-			}
-		}
-	}
-	for name, parse := range logSearchListParams {
-		if raw := string(ctx.QueryArgs().Peek(name)); raw != "" && len(parse(raw)) == 0 {
-			SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("%s must name at least one value", name))
-			return nil, false
-		}
-	}
-	filters := parseHistogramFilters(ctx)
-	if filters == nil {
-		return nil, false
-	}
-	for _, flag := range []struct {
-		name string
-		dst  *bool
-	}{{"roots_only", &filters.RootsOnly}, {"group_sessions", &filters.GroupSessions}, {"fallback_hops_only", &filters.FallbackHopsOnly}} {
-		if raw := string(ctx.QueryArgs().Peek(flag.name)); raw != "" {
-			val, err := strconv.ParseBool(raw)
-			if err != nil {
-				SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("invalid %s: %q", flag.name, raw))
-				return nil, false
-			}
-			*flag.dst = val
-		}
-	}
-	return filters, true
-}
-
 // getLogTrace returns the causal chain behind one request: its retries, every
 // fallback hop in order, and each hop's error, guardrail, cache and latency
 // detail. The id can be the root request or any of its fallback hops. Reads go
@@ -1566,7 +1304,7 @@ func parseGuardrailOutcomesFilter(ctx *fasthttp.RequestCtx, filters *logstore.Se
 	}
 }
 
-// parseTopicIDsFilter reads the Warp topics a query narrows to. A topic_ids
+// parseTopicIDsFilter reads the topic ids a query narrows to. A topic_ids
 // that names no id ("," or blanks) writes a 400 and returns false: read as
 // absent it would widen the query to every topic.
 func parseTopicIDsFilter(ctx *fasthttp.RequestCtx, filters *logstore.SearchFilters) bool {
@@ -2250,15 +1988,9 @@ func (h *LoggingHandler) applyCurrentRankingNames(ctx context.Context, result *l
 
 // dashboardRankingDimensions is the fixed set of dimensions returned in the
 // consolidated dashboard payload, mirroring the dimension-ranking tabs on the
-// /workspace/dashboard page (Team, User, Virtual Key, Customer, Business Unit,
-// Project).
+// /workspace/dashboard page (Virtual Key).
 var dashboardRankingDimensions = []logstore.RankingDimension{
-	logstore.RankingDimensionTeam,
-	logstore.RankingDimensionUser,
 	logstore.RankingDimensionVirtualKey,
-	logstore.RankingDimensionCustomer,
-	logstore.RankingDimensionBusinessUnit,
-	logstore.RankingDimensionProject,
 }
 
 const dashboardMCPTopToolsLimit = 10
@@ -2510,7 +2242,6 @@ func (h *LoggingHandler) getAvailableFilterData(ctx *fasthttp.RequestCtx) {
 		users          []logging.KeyPair
 		businessUnits  []logging.KeyPair
 		projects       []logging.KeyPair
-		topics         []logging.KeyPair
 		metadataKeys   map[string][]string
 		mu             sync.Mutex
 	)
@@ -2700,18 +2431,6 @@ func (h *LoggingHandler) getAvailableFilterData(ctx *fasthttp.RequestCtx) {
 			return nil
 		})
 	}
-	if _, ok := want[filterDimTopics]; ok {
-		g.Go(func() error {
-			result, err := topicFilterData(gCtx, h.topics, defaultFilterDataLimit, query)
-			if err != nil {
-				return err
-			}
-			mu.Lock()
-			topics = result
-			mu.Unlock()
-			return nil
-		})
-	}
 	if _, ok := want[filterDimMetadataKeys]; ok {
 		g.Go(func() error {
 			result, err := h.logManager.GetAvailableMetadataKeys(gCtx, defaultFilterDataLimit, query)
@@ -2869,9 +2588,6 @@ func (h *LoggingHandler) getAvailableFilterData(ctx *fasthttp.RequestCtx) {
 	}
 	if _, ok := want[filterDimProjects]; ok {
 		payload[filterDimProjects] = projects
-	}
-	if _, ok := want[filterDimTopics]; ok {
-		payload[filterDimTopics] = topics
 	}
 	if _, ok := want[filterDimMetadataKeys]; ok {
 		if metadataKeys == nil {

@@ -86,6 +86,7 @@ function newRowId(): string {
 
 interface AddModelSheetProps {
 	onClose: () => void;
+	onSaved?: () => void;
 }
 
 /**
@@ -93,7 +94,7 @@ interface AddModelSheetProps {
  * it collects lands on the same governance_model_pricing row the catalog reads,
  * so the new model then behaves like any other catalog entry.
  */
-function AddModelSheet({ onClose }: AddModelSheetProps) {
+function AddModelSheet({ onClose, onSaved }: AddModelSheetProps) {
 	const { t } = useTranslation("models");
 	const { t: tc } = useTranslation("common");
 	const hasUpdateAccess = useRbac(RbacResource.ModelProvider, RbacOperation.Update);
@@ -156,6 +157,7 @@ function AddModelSheet({ onClose }: AddModelSheetProps) {
 				},
 			]).unwrap();
 			toast.success(t("modelCatalog.modelAdded"));
+			onSaved?.();
 			handleClose();
 		} catch (err) {
 			toast.error(getErrorMessage(err));
@@ -391,6 +393,9 @@ export default function AttributesTab({ hasAccess }: AttributesTabProps) {
 			await deleteModelCatalogEntry({ model: deleting.name, provider: deleting.provider }).unwrap();
 			toast.success(t("modelCatalog.modelDeleted"));
 			setDeleting(null);
+			// Pull the list again as soon as the row leaves service: the deleted
+			// model must disappear without waiting for a manual refresh.
+			void refetch();
 		} catch (err) {
 			toast.error(getErrorMessage(err));
 		}
@@ -411,8 +416,8 @@ export default function AttributesTab({ hasAccess }: AttributesTabProps) {
 
 	return (
 		<>
-			{editing && <AttributeSheet model={editing} onClose={() => setEditing(null)} />}
-			{adding && <AddModelSheet onClose={() => setAdding(false)} />}
+			{editing && <AttributeSheet model={editing} onClose={() => setEditing(null)} onSaved={() => void refetch()} />}
+			{adding && <AddModelSheet onClose={() => setAdding(false)} onSaved={() => void refetch()} />}
 			{deleting && (
 				<AlertDialog open onOpenChange={(open) => !open && !isDeleting && setDeleting(null)}>
 					<AlertDialogContent data-testid="model-catalog-delete-dialog">

@@ -152,14 +152,12 @@ export default function OverviewTab({ hasAccess }: OverviewTabProps) {
 			const modelsUsed = modelsUsedMap.get(p.name) ?? [];
 			const providerStats = statsMap.get(p.name);
 			const totalTraffic24h = providerStats?.total_requests ?? 0;
-			const totalCost24h = providerStats?.total_cost ?? 0;
 			return {
 				providerName: p.name,
 				isCustom,
 				baseProviderType: p.custom_provider_config?.base_provider_type,
 				modelsUsed,
 				totalTraffic24h,
-				totalCost24h,
 			};
 		});
 	}, [providers, statsMap, modelsUsedMap]);
@@ -206,7 +204,6 @@ export default function OverviewTab({ hasAccess }: OverviewTabProps) {
 			totalProviders={(providers ?? []).length}
 			totalModels={modelsData?.total ?? 0}
 			totalRequests24h={globalStats?.total_requests ?? 0}
-			totalCost24h={globalStats?.total_cost ?? 0}
 			isLoadingModels={isLoadingModels}
 		/>
 	);

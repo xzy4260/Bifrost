@@ -21,6 +21,9 @@ const RESERVED_ATTRIBUTES = new Set(["description", "context_window", "max_outpu
 interface AttributeSheetProps {
 	model: ModelDetails;
 	onClose: () => void;
+	// Fired after a successful save so the list behind the sheet can refresh
+	// right away instead of waiting for its own cache timing.
+	onSaved?: () => void;
 }
 
 // Local row type for the extra-attributes editor. We keep these outside any
@@ -67,7 +70,7 @@ function inputToCount(raw: string): number | undefined {
 	return Math.round(parsed);
 }
 
-export default function AttributeSheet({ model, onClose }: AttributeSheetProps) {
+export default function AttributeSheet({ model, onClose, onSaved }: AttributeSheetProps) {
 	const { t } = useTranslation("models");
 	const { t: tc } = useTranslation("common");
 	const [isOpen, setIsOpen] = useState(true);
@@ -182,6 +185,7 @@ export default function AttributeSheet({ model, onClose }: AttributeSheetProps) 
 				},
 			]).unwrap();
 			toast.success(t("modelCatalog.attributesSaved"));
+			onSaved?.();
 			handleClose();
 		} catch (err) {
 			toast.error(getErrorMessage(err));

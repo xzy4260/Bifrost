@@ -539,8 +539,7 @@
 			"Agent gateway configuration": "configurazione del gateway degli agenti",
 			"guardrail incidents": "incidenti dei guardrail",
 			"relay logs": "log dei relay",
-			"agent logs": "log degli agenti",
-			"Warp": "Warp"
+			"agent logs": "log degli agenti"
 		}
 	},
 	"loggingDisabled": {

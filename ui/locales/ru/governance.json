@@ -541,8 +541,7 @@
 			"Agent gateway configuration": "конфигурацию шлюза агентов",
 			"guardrail incidents": "инциденты ограничителей",
 			"relay logs": "журналы релеев",
-			"agent logs": "журналы агентов",
-			"Warp": "Warp"
+			"agent logs": "журналы агентов"
 		}
 	},
 	"loggingDisabled": {

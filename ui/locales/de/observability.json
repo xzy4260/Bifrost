@@ -79,12 +79,7 @@
 			"providerUsage": "Anbieternutzung",
 			"modelRankings": "Modell-Ranglisten",
 			"mcpUsage": "MCP-Nutzung",
-			"teamRankings": "Team-Ranglisten",
-			"userRankings": "Nutzer-Ranglisten",
 			"virtualKeyRankings": "Ranglisten der virtuellen Schlüssel",
-			"customerRankings": "Kunden-Ranglisten",
-			"buRankings": "BU-Ranglisten",
-			"projectRankings": "Projekt-Ranglisten",
 			"appRankings": "App-Ranglisten"
 		},
 		"export": {
@@ -1239,8 +1234,6 @@
 		"roundTripID": "Round-Trip-ID",
 		"exactRoundTripID": "Exakte Round-Trip-ID",
 		"nothingRecorded": "In diesem Zeitraum wurde nichts erfasst",
-		"topics": "Themen",
-		"searchTopics": "Themen suchen",
 		"modelRouters": "Router",
 		"searchModelRouters": "Router suchen",
 		"loadFailed": "Diese Liste konnte nicht geladen werden."

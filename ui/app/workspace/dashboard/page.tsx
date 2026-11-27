@@ -96,7 +96,6 @@ export default function DashboardPage() {
 			apps: parseAsSafeArrayOf.withDefault([]),
 			complexity_tiers: parseAsSafeArrayOf.withDefault([]),
 			complexity_mechanisms: parseAsSafeArrayOf.withDefault([]),
-			topic_ids: parseAsSafeArrayOf.withDefault([]),
 		},
 		{
 			history: "push",
@@ -157,7 +156,6 @@ export default function DashboardPage() {
 			...(urlState.apps.length > 0 && { apps: urlState.apps }),
 			...(urlState.complexity_tiers.length > 0 && { complexity_tiers: urlState.complexity_tiers }),
 			...(urlState.complexity_mechanisms.length > 0 && { complexity_mechanisms: urlState.complexity_mechanisms }),
-			...(urlState.topic_ids.length > 0 && { topic_ids: urlState.topic_ids }),
 		}),
 		[
 			urlState.period,
@@ -190,7 +188,6 @@ export default function DashboardPage() {
 			urlState.apps,
 			urlState.complexity_tiers,
 			urlState.complexity_mechanisms,
-			urlState.topic_ids,
 		],
 	);
 
@@ -233,9 +230,6 @@ export default function DashboardPage() {
 	const providerRef = useRef<ProviderUsageTabViewHandle>(null);
 	const mcpRef = useRef<MCPTabViewHandle>(null);
 	const modelRankingsRef = useRef<ModelRankingsTabViewHandle>(null);
-	const buRankingsRef = useRef<DimensionRankingsTabViewHandle>(null);
-	const projectRankingsRef = useRef<DimensionRankingsTabViewHandle>(null);
-	const userRankingsRef = useRef<DimensionRankingsTabViewHandle>(null);
 	const virtualKeyRankingsRef = useRef<DimensionRankingsTabViewHandle>(null);
 	const appRankingsRef = useRef<DimensionRankingsTabViewHandle>(null);
 
@@ -244,9 +238,6 @@ export default function DashboardPage() {
 		providerRef,
 		mcpRef,
 		modelRankingsRef,
-		buRankingsRef,
-		projectRankingsRef,
-		userRankingsRef,
 		virtualKeyRankingsRef,
 		appRankingsRef,
 	];
@@ -264,9 +255,6 @@ export default function DashboardPage() {
 			providerTokenData: null,
 			providerLatencyData: null,
 			rankingsData: null,
-			buRankingsData: null,
-			projectRankingsData: null,
-			userRankingsData: null,
 			virtualKeyRankingsData: null,
 			appRankingsData: null,
 			mcpHistogramData: null,
@@ -296,9 +284,6 @@ export default function DashboardPage() {
 			"provider-usage": providerRef,
 			mcp: mcpRef,
 			rankings: modelRankingsRef,
-			"bu-rankings": buRankingsRef,
-			"project-rankings": projectRankingsRef,
-			"user-rankings": userRankingsRef,
 			"virtual-key-rankings": virtualKeyRankingsRef,
 			"app-rankings": appRankingsRef,
 		};
@@ -391,7 +376,6 @@ export default function DashboardPage() {
 				apps: newFilters.apps || [],
 				complexity_tiers: newFilters.complexity_tiers || [],
 				complexity_mechanisms: newFilters.complexity_mechanisms || [],
-				topic_ids: newFilters.topic_ids || [],
 			});
 		},
 		[setUrlState, urlState.start_time, urlState.end_time],
@@ -492,7 +476,7 @@ export default function DashboardPage() {
 			className="no-padding-parent no-border-parent bg-background flex h-[calc(var(--app-content-viewport)_-_var(--app-bottom-padding))] w-full gap-3"
 		>
 			{/* Sidebar Filters */}
-			<LogsFilterSidebar filters={filters} onFiltersChange={setFilters} />
+			<LogsFilterSidebar filters={filters} onFiltersChange={setFilters} hideEntityFilters />
 
 			{/* Main Content */}
 			<ScrollArea className="bg-card flex min-w-0 flex-1 flex-col gap-4 rounded-md border" viewportClassName="no-table">
@@ -519,17 +503,8 @@ export default function DashboardPage() {
 									<TabsTrigger className="shrink-0" value="mcp" data-testid="dashboard-tab-mcp">
 										{t("dashboard.tabs.mcpUsage")}
 									</TabsTrigger>
-									<TabsTrigger className="shrink-0" value="user-rankings" data-testid="dashboard-tab-user-rankings">
-										{t("dashboard.tabs.userRankings")}
-									</TabsTrigger>
 									<TabsTrigger className="shrink-0" value="virtual-key-rankings" data-testid="dashboard-tab-virtual-key-rankings">
 										{t("dashboard.tabs.virtualKeyRankings")}
-									</TabsTrigger>
-									<TabsTrigger className="shrink-0" value="bu-rankings" data-testid="dashboard-tab-bu-rankings">
-										{t("dashboard.tabs.buRankings")}
-									</TabsTrigger>
-									<TabsTrigger className="shrink-0" value="project-rankings" data-testid="dashboard-tab-project-rankings">
-										{t("dashboard.tabs.projectRankings")}
 									</TabsTrigger>
 									<TabsTrigger value="app-rankings" data-testid="dashboard-tab-app-rankings">
 										{t("dashboard.tabs.appRankings")}
@@ -671,54 +646,6 @@ export default function DashboardPage() {
 									endTime={urlState.end_time}
 									mcpVolumeChartType={toChartType(urlState.mcp_volume_chart)}
 									onMcpVolumeChartToggle={handleMcpVolumeChartToggle}
-								/>
-							</div>
-						</TabsContent>
-
-						{/* Business Unit Rankings Tab */}
-						<TabsContent value="bu-rankings" {...(exportingAll && { forceMount: true })}>
-							<div id="dashboard-section-bu-rankings">
-								<DimensionRankingsTabView
-									ref={buRankingsRef}
-									filters={filters}
-									active={activeTab === "bu-rankings" || exportingAll}
-									dimension="business_unit"
-									dimensionLabel={t("labels.businessUnit")}
-									testIdPrefix="dashboard-bu-rankings"
-									dataKey="buRankingsData"
-									pdfMode={isExportingTab("bu-rankings")}
-								/>
-							</div>
-						</TabsContent>
-
-						{/* Project Rankings Tab */}
-						<TabsContent value="project-rankings" {...(exportingAll && { forceMount: true })}>
-							<div id="dashboard-section-project-rankings">
-								<DimensionRankingsTabView
-									ref={projectRankingsRef}
-									filters={filters}
-									active={activeTab === "project-rankings" || exportingAll}
-									dimension="project"
-									dimensionLabel={t("labels.project")}
-									testIdPrefix="dashboard-project-rankings"
-									dataKey="projectRankingsData"
-									pdfMode={isExportingTab("project-rankings")}
-								/>
-							</div>
-						</TabsContent>
-
-						{/* User Rankings Tab */}
-						<TabsContent value="user-rankings" {...(exportingAll && { forceMount: true })}>
-							<div id="dashboard-section-user-rankings">
-								<DimensionRankingsTabView
-									ref={userRankingsRef}
-									filters={filters}
-									active={activeTab === "user-rankings" || exportingAll}
-									dimension="user"
-									dimensionLabel={t("labels.user")}
-									testIdPrefix="dashboard-user-rankings"
-									dataKey="userRankingsData"
-									pdfMode={isExportingTab("user-rankings")}
 								/>
 							</div>
 						</TabsContent>

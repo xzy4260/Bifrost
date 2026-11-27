@@ -246,8 +246,6 @@ type ConfigData struct {
 	// ProxyConfig is the global outbound proxy (the dashboard's proxy settings page), not a
 	// provider's own proxy_config.
 	ProxyConfig *GlobalProxyFileConfig `json:"proxy_config,omitempty"`
-	// Warp is the Warp settings page (models, behaviour, log search, topics).
-	Warp *WarpFileConfig `json:"warp,omitempty"`
 
 	presentSections           map[string]bool
 	presentGovernanceSections map[string]bool
@@ -595,7 +593,6 @@ func (cd *ConfigData) UnmarshalJSON(data []byte) error {
 		WebSocket          *schemas.WebSocketConfig              `json:"websocket,omitempty"`
 		FeatureFlags       *FeatureFlagsFileConfig               `json:"feature_flags,omitempty"`
 		ProxyConfig        *GlobalProxyFileConfig                `json:"proxy_config,omitempty"`
-		Warp               *WarpFileConfig                       `json:"warp,omitempty"`
 		SkillsRegistry     *SkillsRegistryConfig                 `json:"skills_registry,omitempty"`
 	}
 
@@ -626,7 +623,6 @@ func (cd *ConfigData) UnmarshalJSON(data []byte) error {
 	cd.WebSocket = temp.WebSocket
 	cd.FeatureFlags = temp.FeatureFlags
 	cd.ProxyConfig = temp.ProxyConfig
-	cd.Warp = temp.Warp
 	cd.presentGovernanceSections = nil
 	if rawGovernance, ok := raw["governance"]; ok && len(rawGovernance) > 0 {
 		var rawGovernanceFields map[string]json.RawMessage
@@ -758,10 +754,6 @@ type Config struct {
 	GovernanceConfig *configstore.GovernanceConfig
 	FrameworkConfig  *framework.FrameworkConfig
 	ProxyConfig      *configstoreTables.GlobalProxyConfig
-	// warpFileConfig is config.json's warp section, applied by ApplyWarpFileConfig once the Warp
-	// service exists; warpFileIsSourceOfTruth applies it on every boot rather than when it changes.
-	warpFileConfig          *WarpFileConfig
-	warpFileIsSourceOfTruth bool
 	// HTTPClientFactory hands out outbound clients that honour ProxyConfig per purpose
 	// and follow its changes live (see network.HTTPClientFactory).
 	HTTPClientFactory *network.HTTPClientFactory
@@ -1073,15 +1065,6 @@ func promoteCalendarAligned(owner *bool, budgets []configstoreTables.TableBudget
 	}
 }
 
-// FeatureFlagWarp gates Warp, the in-dashboard agent. On by default in OSS
-// and off by default in the enterprise build, where an operator turns it on
-// per deployment. While it is off every /api/warp route answers 404 and new
-// logs are not embedded into Warp's index, and the dashboard hides the
-// launcher, dock and settings page. On is only the gate: Warp still answers
-// nothing until it is configured with a provider and a vector store.
-// The UI references the same id in ui/lib/constants/featureFlags.ts.
-const FeatureFlagWarp = "warp"
-
 // FeatureFlagPhraseSuggestions gates the phrase suggestions dashboard: a
 // semantic model router's Suggestions tab, its settings sheet and the draft
 // bar. Off by default in every build, so a few deployments can try the
@@ -1096,13 +1079,6 @@ const FeatureFlagPhraseSuggestions = "phrase-suggestions"
 // is already registered is not an error.
 func registerFeatureFlags(_ context.Context) error {
 	defs := []featureflags.FlagDef{
-		{
-			ID:                FeatureFlagWarp,
-			DisplayName:       "Warp",
-			Description:       "Warp, the in-dashboard agent that answers questions about this deployment's logs, spend and configuration. While off, the Warp API and UI are hidden and new logs are not indexed for Warp's semantic search.",
-			Default:           true,
-			EnterpriseDefault: new(false),
-		},
 		{
 			ID:          FeatureFlagPhraseSuggestions,
 			DisplayName: "Phrase suggestions",
@@ -1302,9 +1278,6 @@ func LoadConfig(ctx context.Context, configDirPath string) (*Config, error) {
 	}
 	// 9a. Global proxy config (read by the enterprise build when it builds its outbound clients)
 	loadProxyConfig(ctx, config, &configData)
-	// 9b. Warp config from the file, applied later by the server through the Warp service
-	config.warpFileConfig = configData.Warp
-	config.warpFileIsSourceOfTruth = configData.isConfigJSONSourceOfTruth()
 	// 10. Plugins
 	loadPlugins(ctx, config, &configData)
 	// 11. Skills registry (after plugins, before framework)

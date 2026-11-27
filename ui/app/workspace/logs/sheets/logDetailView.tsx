@@ -499,7 +499,7 @@ function RoutingDecisionLogs({ logs }: { logs: string }) {
 	);
 }
 
-// A response that ends on a tool call the caller runs itself (Warp's agent loop, any
+// A response that ends on a tool call the caller runs itself (an agent loop, any
 // Responses client) has no result in this row: the caller executes the tool and, if
 // it carries on, sends the output with a later request. Point at the next row in the
 // same session, without claiming it is the one that carries the result.

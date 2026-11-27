@@ -79,12 +79,7 @@
 			"providerUsage": "プロバイダー使用",
 			"modelRankings": "モデルランキング",
 			"mcpUsage": "MCP の使用",
-			"teamRankings": "チームランキング",
-			"userRankings": "ユーザーランキング",
 			"virtualKeyRankings": "仮想キーランキング",
-			"customerRankings": "顧客ランキング",
-			"buRankings": "BUランキング",
-			"projectRankings": "プロジェクトランキング",
 			"appRankings": "アプリランキング"
 		},
 		"export": {
@@ -1233,8 +1228,6 @@
 		"roundTripID": "ラウンドトリップ ID",
 		"exactRoundTripID": "ラウンドトリップ ID（完全一致）",
 		"nothingRecorded": "この期間に記録はありません",
-		"topics": "トピック",
-		"searchTopics": "トピックを検索",
 		"modelRouters": "ルーター",
 		"searchModelRouters": "ルーターを検索",
 		"loadFailed": "このリストを読み込めませんでした。"

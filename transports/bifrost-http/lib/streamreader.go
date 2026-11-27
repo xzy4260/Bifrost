@@ -10,6 +10,7 @@ import (
 
 	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/valyala/fasthttp"
 )
 
 // SSEStreamReader is an io.ReadCloser that delivers one event per Read call,
@@ -39,6 +40,13 @@ type SSEStreamReader struct {
 	// whether the next byte written starts a fresh SSE line. True initially: the start of a
 	// stream is a line boundary.
 	atLineBoundary bool
+
+	// doneHook runs once when the stream finishes, either because the producer
+	// called Done or because fasthttp closed the reader (client disconnect).
+	// The concurrency tracker uses it to hold a streamed request's in-flight slot
+	// for the real duration of the stream.
+	doneHook func()
+	doneOnce sync.Once
 }
 
 // NewSSEStreamReader creates a new SSEStreamReader with a buffered event channel.
@@ -50,6 +58,25 @@ func NewSSEStreamReader() *SSEStreamReader {
 		closeCh:        make(chan struct{}),
 		atLineBoundary: true,
 	}
+}
+
+// NewTrackedSSEStreamReader creates an SSEStreamReader that releases this
+// request's in-flight concurrency slot when the stream ends. Use it in place of
+// NewSSEStreamReader from any handler that streams an inference response.
+func NewTrackedSSEStreamReader(ctx *fasthttp.RequestCtx) *SSEStreamReader {
+	reader := NewSSEStreamReader()
+	if slot := ConcurrencySlotFrom(ctx); slot != nil {
+		reader.doneHook = slot.Claim()
+	}
+	return reader
+}
+
+func (r *SSEStreamReader) runDoneHook() {
+	r.doneOnce.Do(func() {
+		if r.doneHook != nil {
+			r.doneHook()
+		}
+	})
 }
 
 // Read implements io.Reader. It blocks until an event is available, then returns
@@ -76,6 +103,7 @@ func (r *SSEStreamReader) Close() error {
 	r.closeOnce.Do(func() {
 		close(r.closeCh)
 	})
+	r.runDoneHook()
 	return nil
 }
 
@@ -231,6 +259,7 @@ func (r *SSEStreamReader) SendHeartbeatWithFraming(framing SSEHeartbeatFraming) 
 // Must be called exactly once by the producer goroutine when streaming is complete.
 func (r *SSEStreamReader) Done() {
 	close(r.eventCh)
+	r.runDoneHook()
 }
 
 // DefaultSSEHeartbeatInterval is how often a heartbeat goroutine started with

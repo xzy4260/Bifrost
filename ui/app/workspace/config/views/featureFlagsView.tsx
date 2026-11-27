@@ -17,7 +17,6 @@ import { toast } from "sonner";
 // the server-provided text.
 function flagText(t: TFunction<"config">, flag: FeatureFlagStatus): { name: string; description: string } {
 	const known: Record<string, { name: string; description: string }> = {
-		warp: { name: t("featureFlags.flags.warp.name"), description: t("featureFlags.flags.warp.description") },
 		"phrase-suggestions": {
 			name: t("featureFlags.flags.phrase-suggestions.name"),
 			description: t("featureFlags.flags.phrase-suggestions.description"),

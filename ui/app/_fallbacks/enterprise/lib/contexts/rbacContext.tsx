@@ -46,8 +46,6 @@ export enum RbacResource {
 	EdgeConfig = "EdgeConfig",
 	SkillsRepository = "SkillsRepository",
 	Notifications = "Notifications",
-	Warp = "Warp",
-	WarpSession = "WarpSession",
 	BackgroundJobs = "BackgroundJobs",
 	Alerting = "Alerting",
 	Datasheet = "Datasheet",

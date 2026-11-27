@@ -538,8 +538,7 @@
 			"Agent gateway configuration": "Agent 閘道設定",
 			"guardrail incidents": "護欄事件",
 			"relay logs": "中繼日誌",
-			"agent logs": "Agent 日誌",
-			"Warp": "Warp"
+			"agent logs": "Agent 日誌"
 		}
 	},
 	"loggingDisabled": {

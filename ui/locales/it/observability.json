@@ -79,12 +79,7 @@
 			"providerUsage": "Utilizzo Provider",
 			"modelRankings": "Classifica modelli",
 			"mcpUsage": "Utilizzo MCP",
-			"teamRankings": "Classifica team",
-			"userRankings": "Classifica utenti",
 			"virtualKeyRankings": "Classifica chiavi virtuali",
-			"customerRankings": "Classifica clienti",
-			"buRankings": "Classifica BU",
-			"projectRankings": "Classifica progetti",
 			"appRankings": "Classifica app"
 		},
 		"export": {
@@ -1239,8 +1234,6 @@
 		"roundTripID": "ID di andata e ritorno",
 		"exactRoundTripID": "ID di andata e ritorno esatto",
 		"nothingRecorded": "Nulla registrato in questo intervallo di tempo",
-		"topics": "Argomenti",
-		"searchTopics": "Cerca argomenti",
 		"modelRouters": "Router",
 		"searchModelRouters": "Cerca router",
 		"loadFailed": "Impossibile caricare questo elenco."

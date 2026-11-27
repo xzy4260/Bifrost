@@ -2,7 +2,7 @@ import "i18next";
 
 import type { resources } from "./resources";
 
-// Arrays (e.g. warp.errors.*.suggestions, read with returnObjects) are typed as
+// Arrays (e.g. errors.*.suggestions, read with returnObjects) are typed as
 // leaves. Left as-is, i18next expands them into `${number}` keys crossed with
 // plural suffixes, which blows TypeScript's instantiation limit (TS2589).
 type ArraysAsLeaves<T> = T extends readonly unknown[] ? string : T extends object ? { [K in keyof T]: ArraysAsLeaves<T[K]> } : T;

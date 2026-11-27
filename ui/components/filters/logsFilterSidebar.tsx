@@ -41,9 +41,13 @@ const COLLAPSE_STORAGE_KEY = "logs-filter-sidebar-collapsed";
 interface LogsSidebarProps {
 	filters: LogFilters;
 	onFiltersChange: (filters: LogFilters) => void;
+	// Personal build: the enterprise entity dimensions (user/team/customer/
+	// business unit/project) stay out of the dashboard, which has no entity
+	// governance to filter by.
+	hideEntityFilters?: boolean;
 }
 
-export function LogsFilterSidebar({ filters, onFiltersChange }: LogsSidebarProps) {
+export function LogsFilterSidebar({ filters, onFiltersChange, hideEntityFilters = false }: LogsSidebarProps) {
 	const { t } = useTranslation("observability");
 	const isMobile = useIsMobile();
 	const [collapsed, setCollapsed] = useState(false);
@@ -141,12 +145,15 @@ export function LogsFilterSidebar({ filters, onFiltersChange }: LogsSidebarProps
 					<RequestSessionFilter filters={filters} onFiltersChange={onFiltersChange} />
 					<AgentCorrelationFilter filters={filters} onFiltersChange={onFiltersChange} />
 					<LocalCachingFilter filters={filters} onFiltersChange={onFiltersChange} />
-					<UserFilter filters={filters} onFiltersChange={onFiltersChange} />
-					<TeamFilter filters={filters} onFiltersChange={onFiltersChange} />
-					<CustomerFilter filters={filters} onFiltersChange={onFiltersChange} />
-					<BusinessUnitFilter filters={filters} onFiltersChange={onFiltersChange} />
-					<ProjectFilter filters={filters} onFiltersChange={onFiltersChange} />
-					<TopicFilter filters={filters} onFiltersChange={onFiltersChange} />
+					{!hideEntityFilters && (
+						<>
+							<UserFilter filters={filters} onFiltersChange={onFiltersChange} />
+							<TeamFilter filters={filters} onFiltersChange={onFiltersChange} />
+							<CustomerFilter filters={filters} onFiltersChange={onFiltersChange} />
+							<BusinessUnitFilter filters={filters} onFiltersChange={onFiltersChange} />
+							<ProjectFilter filters={filters} onFiltersChange={onFiltersChange} />
+						</>
+					)}
 					<SessionFilter filters={filters} onFiltersChange={onFiltersChange} />
 					<CostFilter filters={filters} onFiltersChange={onFiltersChange} />
 					<StopReasonFilter filters={filters} onFiltersChange={onFiltersChange} />
@@ -1473,66 +1480,6 @@ function ProjectFilter({ filters, onFiltersChange, defaultOpen }: FilterComponen
 				onSearch={setSearchQuery}
 				fetching={isFetching}
 				testIdPrefix="projects-filter"
-			/>
-		</FilterSection>
-	);
-}
-
-// ---------------------------------------------------------------------------
-// TopicFilter
-// ---------------------------------------------------------------------------
-
-// Warp files every indexed request under a topic; this narrows the logs to
-// one or more of them. Unlike the org dimensions a topic's id is opaque and
-// its name is the only thing a person recognises, so rows are keyed by id and
-// shown by name, and nothing can be typed in that the server did not offer.
-function TopicFilter({ filters, onFiltersChange, defaultOpen }: FilterComponentProps) {
-	const { t } = useTranslation("observability");
-	const hasActive = (filters.topic_ids || []).length > 0;
-	const [opened, setOpened] = useState(defaultOpen || hasActive);
-	const searchInputRef = useAutoFocusOnOpen(opened);
-	const [searchQuery, setSearchQuery] = useState("");
-	const {
-		data: filterData,
-		isUninitialized,
-		isLoading,
-		isFetching,
-	} = useGetAvailableFilterDataQuery({ dimensions: ["topics"], q: searchQuery || undefined }, { skip: !opened && !hasActive });
-	const availableTopics = filterData?.topics || [];
-	const nameById = useMemo(() => new Map(availableTopics.map((topic) => [topic.id, topic.name])), [availableTopics]);
-
-	if (!isUninitialized && !isLoading && availableTopics.length === 0 && !hasActive && !opened) return null;
-
-	const current = filters.topic_ids || [];
-	// A selected topic the current search does not list stays visible, so a
-	// link into a topic shows which one is applied.
-	const items = [
-		...current.filter((id) => !nameById.has(id)).map((id) => ({ key: id, label: id })),
-		...availableTopics.map((topic) => ({ key: topic.id, label: topic.name })),
-	];
-
-	const toggle = (id: string) => {
-		const next = current.includes(id) ? current.filter((v) => v !== id) : [...current, id];
-		onFiltersChange({ ...filters, topic_ids: next });
-	};
-
-	return (
-		<FilterSection
-			title={t("filters.topics")}
-			defaultOpen={defaultOpen || hasActive}
-			loading={isLoading}
-			onOpenChange={setOpened}
-			testId="topics-filter-toggle"
-		>
-			<SearchableCheckboxList
-				inputRef={searchInputRef}
-				placeholder={t("filters.searchTopics")}
-				items={items}
-				isSelected={(id) => current.includes(id)}
-				onToggle={toggle}
-				onSearch={setSearchQuery}
-				fetching={isFetching}
-				testIdPrefix="topics-filter"
 			/>
 		</FilterSection>
 	);

@@ -1,7 +1,6 @@
 import { LanguageMenuSub } from "@/components/language-switcher";
 import NotificationCenter from "@/components/notificationCenter";
 import { ThemeToggle } from "@/components/themeToggle";
-import WarpLauncher from "@/components/warp/warpLauncher";
 import { deriveTitleFromPathname, getRouteTitleI18nKey } from "@/components/topbar.utils";
 import {
 	DropdownMenu,
@@ -192,7 +191,6 @@ export default function Topbar() {
 			<span ref={setMobileFilterSlot} className="flex shrink-0 items-center md:hidden" />
 			<NotificationCenter />
 			<ThemeToggle />
-			<WarpLauncher />
 
 			<DropdownMenu>
 				<DropdownMenuTrigger asChild>

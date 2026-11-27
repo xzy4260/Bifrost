@@ -2,7 +2,6 @@ import FullPageLoader from "@/components/fullPageLoader";
 import NotAvailableBanner from "@/components/notAvailableBanner";
 import OnboardingWidget from "@/components/onboardingWidget";
 import ProgressProvider from "@/components/progressBar";
-import WarpDock from "@/components/warp/warpDock";
 import Sidebar from "@/components/sidebar";
 import { ThemeProvider } from "@/components/themeProvider";
 import Topbar from "@/components/topbar";
@@ -11,7 +10,6 @@ import { CommandPaletteProvider } from "@/components/commandPalette/commandPalet
 import { SidebarProvider } from "@/components/ui/sidebar";
 import { useNotificationSync } from "@/hooks/useNotificationSync";
 import { useStoreSync } from "@/hooks/useStoreSync";
-import { WarpProvider } from "@/lib/contexts/warpContext";
 import { TopbarProvider } from "@/lib/contexts/topbarContext";
 import { WebSocketProvider } from "@/hooks/useWebSocket";
 import i18n from "@/lib/i18n";
@@ -114,7 +112,6 @@ function AppContent({ children }: { children: React.ReactNode }) {
 			<CookiesProvider>
 				<StoreSyncInitializer />
 				<TopbarProvider>
-					<WarpProvider>
 						<SidebarProvider>
 							<CommandPaletteProvider>
 								<Sidebar />
@@ -124,12 +121,6 @@ function AppContent({ children }: { children: React.ReactNode }) {
 							    sidebar (both show the page body background). */}
 								<div className="flex h-dvh w-full min-w-0 flex-col">
 									<Topbar />
-									{/* Warp docks beside the content, never beside the topbar. The topbar
-								    keeps its full width when the dock opens, so its title, its
-								    description portal and its menu anchors are not remeasured - and
-								    the page keeps a fixed frame while only the region below it
-								    splits. */}
-									<WarpDock>
 										{/* No w-full: in a column flex container the cross axis is width, and
 							    an explicit 100% would sit *outside* the right margin, pushing it
 							    off-screen. Default align-items:stretch already fills the column
@@ -151,11 +142,9 @@ function AppContent({ children }: { children: React.ReactNode }) {
 											</main>
 											{bifrostConfig?.is_db_connected && <OnboardingWidget />}
 										</div>
-									</WarpDock>
 								</div>
 							</CommandPaletteProvider>
 						</SidebarProvider>
-					</WarpProvider>
 				</TopbarProvider>
 			</CookiesProvider>
 		</WebSocketProvider>

@@ -38,7 +38,6 @@ import (
 	"github.com/maximhq/bifrost/framework/temptoken"
 	"github.com/maximhq/bifrost/framework/tracing"
 	"github.com/maximhq/bifrost/framework/vectorstore"
-	"github.com/maximhq/bifrost/framework/warp"
 	"github.com/maximhq/bifrost/framework/webhooks"
 	"github.com/maximhq/bifrost/plugins/governance"
 	"github.com/maximhq/bifrost/plugins/logging"
@@ -297,7 +296,6 @@ type BifrostHTTPServer struct {
 	WebSocketHandler     *handlers.WebSocketHandler
 	NotificationService  *handlers.NotificationService
 	RSSFeedsHandler      *handlers.RSSFeedsHandler
-	WarpHandler          *handlers.WarpHandler
 	MCPServerHandler     *handlers.MCPServerHandler
 	BifrostMCP           *handlers.BifrostMCP          // the gateway's API as MCP tools on /v1/mcp; its server loads after boot
 	BifrostMCPToolAccess handlers.BifrostMCPToolAccess // set before StartBifrostMCP to shape tools/list per caller
@@ -347,18 +345,6 @@ type BifrostHTTPServer struct {
 	// VirtualKeyBusinessUnitResolver names each VK's owning business unit on the
 	// governance read paths. Nil on OSS builds; set by the enterprise wrapper.
 	VirtualKeyBusinessUnitResolver handlers.VirtualKeyBusinessUnitResolver
-	// WarpUserGovernanceReader answers Warp's describe_user_limits: what an
-	// access profile lets one person spend. Nil on OSS builds, which have no
-	// per-user governance, so Warp does not offer the tool; set by the
-	// enterprise wrapper before RegisterAPIRoutes, like the resolvers above.
-	WarpUserGovernanceReader warp.UserGovernanceReader
-	// WarpCallerRestrictionResolver tells Warp whether row-level access control
-	// narrows the caller's reads, so a restricted caller's totals are not
-	// described as the whole deployment's. Nil on OSS builds, where the
-	// request's own query scope is the only one; set by the enterprise wrapper
-	// before RegisterAPIRoutes, like the reader above.
-	WarpCallerRestrictionResolver warp.CallerRestrictionResolver
-
 	SidekiqRunner *sidekiq.Runner
 	// GovernanceHandler is kept so the expired-key cleanup scheduler can be started and stopped.
 	GovernanceHandler     *handlers.GovernanceHandler
@@ -2711,19 +2697,6 @@ func (s *BifrostHTTPServer) ReloadPlugin(ctx context.Context, name string, path 
 	if err := s.SyncLoadedPlugin(ctx, name, plugin, placement, order); err != nil {
 		return err
 	}
-	// Rebind Warp's reader onto the live service rather than rebuilding the
-	// handler: routes were registered at startup and hold the original
-	// handler's closures, so a fresh handler would never be reached. Without
-	// this, enabling logging at runtime leaves the chat endpoint answering 503
-	// until the process restarts.
-	//
-	// After the sync, not before: SyncLoadedPlugin replaces the configured
-	// plugin and can then fail in Client.ReloadPlugin, which returns without
-	// rolling back. Rebinding first left Warp researching through the new log
-	// manager while the Bifrost client was still running the previous plugin.
-	if loggerPlugin, ok := plugin.(*logging.LoggerPlugin); ok && s.WarpHandler != nil {
-		s.WarpHandler.Service().SetLogReader(handlers.NewWarpLogReader(loggerPlugin.GetPluginLogManager()))
-	}
 	return nil
 }
 
@@ -2854,14 +2827,6 @@ func (s *BifrostHTTPServer) RemovePlugin(ctx context.Context, displayName string
 	// 3. Reload observability plugins if necessary
 	if isObservability {
 		s.reloadObservabilityPlugins()
-	}
-
-	// 3a. Warp's reader belongs to the plugin that was just removed. AddPlugin
-	// rebinds it on the way in, and without the matching clear on the way out
-	// Warp kept researching through a log manager nobody owns any more - and
-	// CanChat stayed true, because it only asks whether logs is non-nil.
-	if _, ok := plugin.(*logging.LoggerPlugin); ok && s.WarpHandler != nil {
-		s.WarpHandler.Service().SetLogReader(nil)
 	}
 
 	// 4. Update status and marshaller
@@ -3207,49 +3172,7 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
 		s.RSSFeedsHandler = handlers.NewRSSFeedsHandler(s.Config.ConfigStore, nil)
 		s.RSSFeedsHandler.Start(s.Ctx)
 	}
-	// This is the first point in Bootstrap where the logging plugin - and so
-	// the log manager Warp's chat route needs - is known, which is why Warp is
-	// built here rather than earlier.
-	//
-	// A nil log manager here is a supported deployment (logging disabled), not
-	// a failure - Warp then serves only its config routes.
-	//
-	// The nil check stays even though nothing builds a prior instance today:
-	// RegisterAPIRoutes has exactly one caller now, but if that ever changes -
-	// a config or plugin reload re-running it - this must not leak the
-	// previous instance's subscriptions and worker pool.
-	if s.WarpHandler != nil {
-		s.WarpHandler.Shutdown()
-	}
-	s.WarpHandler = handlers.NewWarpHandler(s.Config.ConfigStore, loggerPlugin, s.Client, s.Config.LogsStore, s.Config.VectorStore, s.SidekiqRunner, s.Config.ModelCatalog, logger, func() bool {
-		return s.Config.FeatureFlags != nil && s.Config.FeatureFlags.IsEnabled(lib.FeatureFlagWarp)
-	}, handlers.WarpResolvers{
-		ExternalQuotaBudgets: s.ExternalQuotaBudgetResolver,
-		VirtualKeyAssignees:  s.VirtualKeyAssigneeResolver,
-		UserGovernance:       s.WarpUserGovernanceReader,
-		CallerRestriction:    s.WarpCallerRestrictionResolver,
-	})
-	if loggingHandler != nil {
-		loggingHandler.SetTopicLister(s.WarpHandler.Service())
-	}
 	s.subscribeCaptureDeletes(loggerPlugin)
-	// Read at each sweep rather than once: the cleaner is built in Bootstrap,
-	// after this, and its retention can change at runtime.
-	s.WarpHandler.Service().SetLogRetention(func() int {
-		if s.LogsCleaner == nil {
-			return 0
-		}
-		return s.LogsCleaner.RetentionDays()
-	})
-	// config.json's warp section saves through the service, so it is validated and provisions its
-	// vector namespace exactly like a save from the settings page.
-	s.Config.ApplyWarpFileConfig(s.Ctx, s.WarpHandler.Service())
-	if s.BifrostMCP != nil {
-		s.WarpHandler.Service().SetManagementTools(handlers.NewWarpManagementTools(s.BifrostMCP))
-	}
-	if loggingHandler != nil {
-		loggingHandler.SetLogSearch(s.WarpHandler)
-	}
 	// Start WebSocket heartbeat
 	s.WebSocketHandler.StartHeartbeat()
 	// Adding telemetry middleware
@@ -3384,11 +3307,6 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
 	if s.RSSFeedsHandler != nil {
 		s.RSSFeedsHandler.RegisterRoutes(s.Router, middlewares...)
 	}
-	if s.WarpHandler != nil {
-		s.WarpHandler.RegisterRoutes(s.Router, middlewares...)
-	}
-	s.registerUserLimitsRoutes(middlewares...)
-	handlers.NewCallerHandler(s.WarpCallerRestrictionResolver).RegisterRoutes(s.Router, middlewares...)
 	if s.ConcurrencyTracker != nil {
 		var configStore configstore.ConfigStore
 		if s.Config != nil {
@@ -3431,16 +3349,6 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
 		handlers.SendError(ctx, fasthttp.StatusNotFound, "Route not found: "+string(ctx.Path()))
 	}
 	return nil
-}
-
-// registerUserLimitsRoutes registers the per-user limits routes behind
-// middlewares. Per-user limits exist only where the deployment supplies a reader
-// for them (Enterprise access profiles), so without one the routes are absent.
-func (s *BifrostHTTPServer) registerUserLimitsRoutes(middlewares ...schemas.BifrostHTTPMiddleware) {
-	if s.WarpUserGovernanceReader == nil {
-		return
-	}
-	handlers.NewUserLimitsHandler(s.WarpUserGovernanceReader).RegisterRoutes(s.Router, middlewares...)
 }
 
 // ObserveWarmupRoutingEmbedding forwards semantic-routing warmup embedding
@@ -4170,11 +4078,6 @@ func (s *BifrostHTTPServer) StartBifrostMCP(ctx context.Context, defaultSpecURL 
 		ToolAccess: s.BifrostMCPToolAccess,
 	}))
 	handlers.NewBifrostMCPHandler(s.BifrostMCP).RegisterRoutes(s.Router, middlewares...)
-	// Warp's routes are registered before the Bifrost MCP exists, so its tools
-	// are bound here; a Warp handler built later binds them itself.
-	if s.WarpHandler != nil {
-		s.WarpHandler.Service().SetManagementTools(handlers.NewWarpManagementTools(s.BifrostMCP))
-	}
 	s.BifrostMCP.Start(ctx)
 }
 
@@ -4287,16 +4190,6 @@ func (s *BifrostHTTPServer) Start() error {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			// Warp first. Its indexer workers call s.Client.EmbeddingRequest (and its
-			// chat turns s.Client.ResponsesRequest), and
-			// LogIndexer.Close waits for them - so shutting the client down first
-			// cancelled its context underneath work that was still being waited on,
-			// and pending indexing failed during an orderly shutdown.
-			if s.WarpHandler != nil {
-				logger.Info("shutting down warp...")
-				s.WarpHandler.Shutdown()
-				logger.Info("warp shutdown completed")
-			}
 			logger.Info("closing agent gateway...")
 			s.CloseAgentGateway()
 			logger.Info("shutting down bifrost client...")

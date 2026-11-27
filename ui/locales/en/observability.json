@@ -79,12 +79,7 @@
 			"providerUsage": "Provider Usage",
 			"modelRankings": "Model Rankings",
 			"mcpUsage": "MCP usage",
-			"teamRankings": "Team Rankings",
-			"userRankings": "User Rankings",
 			"virtualKeyRankings": "Virtual Key Rankings",
-			"customerRankings": "Customer Rankings",
-			"buRankings": "BU Rankings",
-			"projectRankings": "Project Rankings",
 			"appRankings": "App Rankings"
 		},
 		"export": {
@@ -1242,8 +1237,6 @@
 		"roundTripID": "Round trip ID",
 		"exactRoundTripID": "Exact round trip ID",
 		"nothingRecorded": "Nothing recorded in this time range",
-		"topics": "Topics",
-		"searchTopics": "Search topics",
 		"modelRouters": "Routers",
 		"searchModelRouters": "Search routers",
 		"loadFailed": "Could not load this list."

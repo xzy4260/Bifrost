@@ -126,9 +126,6 @@ function buildFilterParams(filters: LogFilters): Record<string, string | number>
 	if (filters.project_ids && filters.project_ids.length > 0) {
 		params.project_ids = filters.project_ids.join(",");
 	}
-	if (filters.topic_ids && filters.topic_ids.length > 0) {
-		params.topic_ids = filters.topic_ids.join(",");
-	}
 	if (filters.apps && filters.apps.length > 0) {
 		params.apps = JSON.stringify(filters.apps);
 	}

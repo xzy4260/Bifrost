@@ -79,12 +79,7 @@
 			"providerUsage": "供应商用量",
 			"modelRankings": "模型排行",
 			"mcpUsage": "MCP 用量",
-			"teamRankings": "团队排行",
-			"userRankings": "用户排行",
 			"virtualKeyRankings": "Key 排行",
-			"customerRankings": "客户排行",
-			"buRankings": "业务单元排行",
-			"projectRankings": "项目排行",
 			"appRankings": "应用排行"
 		},
 		"export": {
@@ -1237,8 +1232,6 @@
 		"roundTripID": "往返 ID",
 		"exactRoundTripID": "精确往返 ID",
 		"nothingRecorded": "此时间范围内没有记录",
-		"topics": "主题",
-		"searchTopics": "搜索主题",
 		"modelRouters": "路由器",
 		"searchModelRouters": "搜索路由器",
 		"loadFailed": "无法加载此列表。"

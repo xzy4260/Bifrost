@@ -79,12 +79,7 @@
 			"providerUsage": "供應商用量",
 			"modelRankings": "模型排行",
 			"mcpUsage": "MCP 用量",
-			"teamRankings": "團隊排行",
-			"userRankings": "使用者排行",
 			"virtualKeyRankings": "虛擬金鑰排行",
-			"customerRankings": "客戶排行",
-			"buRankings": "業務單元排行",
-			"projectRankings": "專案排行",
 			"appRankings": "應用排行"
 		},
 		"export": {
@@ -1234,8 +1229,6 @@
 		"roundTripID": "往返 ID",
 		"exactRoundTripID": "精確往返 ID",
 		"nothingRecorded": "在此時間範圍內沒有任何記錄",
-		"topics": "主題",
-		"searchTopics": "搜尋主題",
 		"modelRouters": "路由器",
 		"searchModelRouters": "搜尋路由器",
 		"loadFailed": "無法載入此清單。"

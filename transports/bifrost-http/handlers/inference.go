@@ -2396,9 +2396,8 @@ func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bi
 	// Use SSEStreamReader to bypass fasthttp's internal pipe (fasthttputil.PipeConns)
 	// which batches multiple SSE events into single TCP segments.
 	// Each event is delivered individually via a channel, ensuring one HTTP chunk per event.
-	reader := lib.NewSSEStreamReader()
+	reader := lib.NewTrackedSSEStreamReader(ctx)
 	ctx.Response.SetBodyStream(reader, -1)
-
 	// Producer goroutine: processes the stream channel, formats SSE events, sends to reader
 	go func() {
 		var transportLogs []schemas.PluginLogEntry

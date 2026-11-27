@@ -79,12 +79,7 @@
 			"providerUsage": "Использование провайдеров",
 			"modelRankings": "Рейтинг моделей",
 			"mcpUsage": "Использование MCP",
-			"teamRankings": "Рейтинг команд",
-			"userRankings": "Рейтинг пользователей",
 			"virtualKeyRankings": "Рейтинг виртуальных ключей",
-			"customerRankings": "Рейтинг клиентов",
-			"buRankings": "Рейтинг БЕ",
-			"projectRankings": "Рейтинг проектов",
 			"appRankings": "Рейтинг приложений"
 		},
 		"export": {
@@ -1289,8 +1284,6 @@
 		"roundTripID": "ID цикла запросов",
 		"exactRoundTripID": "Точный ID цикла запросов",
 		"nothingRecorded": "За этот период ничего не записано",
-		"topics": "Темы",
-		"searchTopics": "Поиск тем",
 		"modelRouters": "Маршрутизаторы",
 		"searchModelRouters": "Поиск маршрутизаторов",
 		"loadFailed": "Не удалось загрузить этот список."

@@ -12,17 +12,12 @@ import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { getLocale } from "@/lib/i18n";
 
-function formatCost(dollars: number) {
-	return `$${dollars.toFixed(4)}`;
-}
-
 export interface ModelCatalogRow {
 	providerName: string;
 	isCustom: boolean;
 	baseProviderType?: string;
 	modelsUsed: string[];
 	totalTraffic24h: number;
-	totalCost24h: number;
 }
 
 // The filter spells "no provider filter" as a sentinel, since the control needs a value to
@@ -36,7 +31,6 @@ interface ModelCatalogTableProps {
 	totalProviders: number;
 	totalModels: number;
 	totalRequests24h: number;
-	totalCost24h: number;
 	isLoadingModels: boolean;
 }
 
@@ -47,7 +41,6 @@ export default function ModelCatalogTable({
 	totalProviders,
 	totalModels,
 	totalRequests24h,
-	totalCost24h,
 	isLoadingModels,
 }: ModelCatalogTableProps) {
 	const { t } = useTranslation("models");
@@ -56,13 +49,12 @@ export default function ModelCatalogTable({
 		{ label: t("modelCatalog.totalProviders"), value: totalProviders.toLocaleString(getLocale()) },
 		{ label: t("modelCatalog.totalModels"), value: totalModels.toLocaleString(getLocale()) },
 		{ label: t("modelCatalog.totalRequests24h"), value: totalRequests24h.toLocaleString(getLocale()) },
-		{ label: t("modelCatalog.totalCost24h"), value: formatCost(totalCost24h) },
 	];
 
 	return (
 		<div className="space-y-6">
 			{/* Summary Cards */}
-			<div className="grid grid-cols-1 gap-4 md:grid-cols-4">
+			<div className="grid grid-cols-1 gap-4 md:grid-cols-3">
 				{summaryCards.map((card) => (
 					<Card key={card.label} className="py-4 shadow-none">
 						<CardContent className="px-4">
@@ -90,10 +82,9 @@ export default function ModelCatalogTable({
 			<div className="rounded-sm border">
 				<Table className="min-w-[760px] table-fixed">
 					<colgroup>
-						<col className="w-[220px]" />
+						<col className="w-[240px]" />
 						<col />
 						<col className="w-[180px]" />
-						<col className="w-[160px]" />
 					</colgroup>
 					<TableHeader>
 						<TableRow>
@@ -112,13 +103,12 @@ export default function ModelCatalogTable({
 								</TooltipProvider>
 							</TableHead>
 							<TableHead className="text-right">{t("modelCatalog.totalTraffic24h")}</TableHead>
-							<TableHead className="text-right">{t("modelCatalog.totalCost24h")}</TableHead>
 						</TableRow>
 					</TableHeader>
 					<TableBody>
 						{rows.length === 0 ? (
 							<TableRow>
-								<TableCell colSpan={4} className="h-24 text-center">
+								<TableCell colSpan={3} className="h-24 text-center">
 									<span className="text-muted-foreground text-sm">{t("modelCatalog.noMatchingProviders")}</span>
 								</TableCell>
 							</TableRow>
@@ -156,7 +146,6 @@ export default function ModelCatalogTable({
 										)}
 									</TableCell>
 									<TableCell className="text-right font-mono text-sm">{row.totalTraffic24h.toLocaleString(getLocale())}</TableCell>
-									<TableCell className="text-right font-mono text-sm">{formatCost(row.totalCost24h)}</TableCell>
 								</TableRow>
 							))
 						)}

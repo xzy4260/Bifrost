@@ -538,8 +538,7 @@
 			"Agent gateway configuration": "エージェントゲートウェイ設定",
 			"guardrail incidents": "ガードレールインシデント",
 			"relay logs": "リレーログ",
-			"agent logs": "エージェントログ",
-			"Warp": "Warp"
+			"agent logs": "エージェントログ"
 		}
 	},
 	"loggingDisabled": {

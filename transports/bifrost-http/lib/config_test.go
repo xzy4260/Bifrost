@@ -25186,37 +25186,6 @@ func TestReconcileProviderKeys_AnthropicWorkloadIdentity(t *testing.T) {
 	require.NotEqual(t, syncedHash, merged[0].ConfigHash)
 }
 
-// Warp ships behind a feature flag that is on for OSS and off for enterprise,
-// where an operator turns it on per deployment. Either build can flip it.
-// registerFeatureFlags runs on every LoadConfig, and tests call LoadConfig many
-// times per process, so a second registration must not surface as an error.
-func TestRegisterFeatureFlags_WarpDefaultsPerBuildAndIsIdempotent(t *testing.T) {
-	require.NoError(t, registerFeatureFlags(context.Background()))
-	require.NoError(t, registerFeatureFlags(context.Background()), "re-registering on a later LoadConfig must not fail")
-
-	def, ok := featureflags.LookupDef(FeatureFlagWarp)
-	require.True(t, ok, "warp flag must be registered")
-	require.True(t, def.DefaultFor(false), "Warp is on by default in OSS")
-	require.False(t, def.DefaultFor(true), "Warp is off by default in enterprise until an operator enables it")
-	require.False(t, def.EnterpriseOnly, "enterprise can still turn it on")
-
-	oss, err := featureflags.New(featureflags.Config{})
-	require.NoError(t, err)
-	require.True(t, oss.IsEnabled(FeatureFlagWarp))
-	_, err = oss.Set(context.Background(), FeatureFlagWarp, false)
-	require.NoError(t, err)
-	require.False(t, oss.IsEnabled(FeatureFlagWarp), "an OSS operator can still turn Warp off")
-
-	enterprise, err := featureflags.New(featureflags.Config{IsEnterprise: true})
-	require.NoError(t, err)
-	require.False(t, enterprise.IsEnabled(FeatureFlagWarp))
-	status, err := enterprise.Status(FeatureFlagWarp)
-	require.NoError(t, err)
-	require.False(t, status.Default, "the reported default is the enterprise one")
-	_, err = enterprise.Set(context.Background(), FeatureFlagWarp, true)
-	require.NoError(t, err)
-	require.True(t, enterprise.IsEnabled(FeatureFlagWarp))
-}
 
 // The phrase suggestions dashboard ships behind a flag that is off in both
 // builds, so a few deployments can try the suggestion APIs first; either build

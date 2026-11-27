@@ -963,7 +963,7 @@ export const createColumns = (
 	const metadataColumns: ColumnDef<LogEntry>[] = metadataKeys.map((key) => ({
 		id: `metadata_${key}`,
 		header: key.charAt(0).toUpperCase() + key.slice(1),
-		// Fit the header text, since keys like warp-conversation-id overflow a fixed width.
+		// Fit the header text, since long identifier keys overflow a fixed width.
 		size: Math.min(280, Math.max(160, key.length * 8 + 48)),
 		cell: ({ row }) => {
 			const value = row.original.metadata?.[key];

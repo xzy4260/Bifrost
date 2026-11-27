@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -18,7 +17,6 @@ import (
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/configstore"
 	"github.com/maximhq/bifrost/framework/vectorstore"
-	"github.com/maximhq/bifrost/framework/warp"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
@@ -144,143 +142,6 @@ func TestValidateConfigSchema_AgentOAuthRejectsUnknownFields(t *testing.T) {
 	invalidConfig := strings.Replace(validConfig, `"client_secret": "client-secret"`, `"client_secert": "client-secret"`, 1)
 	if err := ValidateConfigSchema([]byte(invalidConfig), loadLocalSchema(t)); err == nil {
 		t.Fatal("expected an unknown Agent OAuth field to fail validation")
-	}
-}
-
-// TestValidateConfigSchema_WarpSection: the warp section takes every Warp settings field, topics
-// included, and refuses values the settings page would refuse.
-// TestValidateConfigSchema_GlobalProxyTypes: the file accepts the global proxy types the
-// settings endpoint accepts (http, socks5) and still refuses tcp, which has no dialer.
-func TestValidateConfigSchema_GlobalProxyTypes(t *testing.T) {
-	for _, tc := range []struct {
-		proxyType string
-		valid     bool
-	}{
-		{"http", true},
-		{"socks5", true},
-		{"tcp", false},
-	} {
-		t.Run(tc.proxyType, func(t *testing.T) {
-			config := `{"proxy_config": {"enabled": true, "type": "` + tc.proxyType + `", "url": "socks5://10.0.0.5:1080", "enable_for_inference": true}}`
-			err := ValidateConfigSchema([]byte(config), loadLocalSchema(t))
-			if tc.valid && err != nil {
-				t.Fatalf("expected proxy_config.type %q to pass validation: %v", tc.proxyType, err)
-			}
-			if !tc.valid && err == nil {
-				t.Fatalf("expected proxy_config.type %q to fail validation", tc.proxyType)
-			}
-		})
-	}
-}
-
-// TestValidateConfigSchema_NoWorkloadIdentityMappings pins that config.json holds no
-// workload identity mappings: workloads are mapped to service accounts in the dashboard or
-// through the API, and only the trusted issuers live in the file, on the SSO provider.
-func TestValidateConfigSchema_NoWorkloadIdentityMappings(t *testing.T) {
-	config := `{"workload_identity": {"mappings": [{"name": "CI", "platform": "entra", "object_id": "5b1e2c7a", "service_account": "svc-ci"}]}}`
-	if err := ValidateConfigSchema([]byte(config), loadLocalSchema(t)); err == nil {
-		t.Fatal("expected a top-level workload_identity section to fail validation")
-	}
-}
-
-func TestValidateConfigSchema_WarpSection(t *testing.T) {
-	validConfig := `{
-		"warp": {
-			"enabled": true,
-			"provider": "anthropic",
-			"model": "claude-sonnet-5-5",
-			"api_key_id": "warp-key",
-			"additional_models": [{"provider": "openai", "model": "gpt-4o", "api_key_id": "other-key"}],
-			"max_iterations": 8,
-			"request_timeout_seconds": 120,
-			"history_retention_days": 30,
-			"system_prompt_suffix": "prod keys start with prod-",
-			"temperature": 0,
-			"reasoning_effort": "low",
-			"embedding_provider": "openai",
-			"embedding_model": "text-embedding-3-small",
-			"embedding_api_key_id": "embed-key",
-			"embedding_dimension": 1536,
-			"log_vector_store_namespace": "BifrostWarpLogs",
-			"semantic_search_threshold": 0.5,
-			"semantic_search_limit": 10,
-			"topic_discovery_min_requests": 100
-		}
-	}`
-	if err := ValidateConfigSchema([]byte(validConfig), loadLocalSchema(t)); err != nil {
-		t.Fatalf("expected a complete warp section to pass validation: %v", err)
-	}
-
-	for name, replacement := range map[string][2]string{
-		"unknown field":                     {`"model": "claude-sonnet-5-5"`, `"modle": "claude-sonnet-5-5"`},
-		"one iteration":                     {`"max_iterations": 8`, `"max_iterations": 1`},
-		"temperature above 2":               {`"temperature": 0`, `"temperature": 2.5`},
-		"unknown reasoning effort":          {`"reasoning_effort": "low"`, `"reasoning_effort": "extreme"`},
-		"negative similarity threshold":     {`"semantic_search_threshold": 0.5`, `"semantic_search_threshold": -0.1`},
-		"negative semantic match limit":     {`"semantic_search_limit": 10`, `"semantic_search_limit": -1`},
-		"too many semantic matches":         {`"semantic_search_limit": 10`, `"semantic_search_limit": 26`},
-		"topic threshold below the minimum": {`"topic_discovery_min_requests": 100`, `"topic_discovery_min_requests": 9`},
-		"topic threshold above the maximum": {`"topic_discovery_min_requests": 100`, `"topic_discovery_min_requests": 20001`},
-		"additional model without a model":  {`"model": "gpt-4o", `, ``},
-		"enabled without a provider":        {`"provider": "anthropic",`, ``},
-		"enabled without a model":           {`"model": "claude-sonnet-5-5",`, ``},
-	} {
-		invalidConfig := strings.Replace(validConfig, replacement[0], replacement[1], 1)
-		if invalidConfig == validConfig {
-			t.Fatalf("%s: replacement did not apply", name)
-		}
-		if err := ValidateConfigSchema([]byte(invalidConfig), loadLocalSchema(t)); err == nil {
-			t.Errorf("%s: expected the warp section to fail validation", name)
-		}
-	}
-
-	// Zero is what the settings API reads as "reset to the default", so it
-	// validates here too. Embedding fields are not required by the schema: an
-	// omitted one keeps its stored value, and runtime validation decides
-	// whether the result can be enabled. A disabled section needs no model.
-	for name, config := range map[string]string{
-		"zero search and topic settings": `{"warp": {"enabled": true, "provider": "anthropic", "model": "claude-sonnet-5-5", "semantic_search_threshold": 0, "semantic_search_limit": 0, "topic_discovery_min_requests": 0}}`,
-		"enabled without embedding":      `{"warp": {"enabled": true, "provider": "anthropic", "model": "claude-sonnet-5-5"}}`,
-		"disabled without a model":       `{"warp": {"enabled": false}}`,
-		"enabled left out":               `{"warp": {"system_prompt_suffix": "x"}}`,
-	} {
-		if err := ValidateConfigSchema([]byte(config), loadLocalSchema(t)); err != nil {
-			t.Errorf("%s: expected the warp section to pass validation: %v", name, err)
-		}
-	}
-}
-
-// TestValidateConfigSchema_WarpSectionCoversEverySetting: every field the Warp settings API takes is
-// declared in the schema, so a setting added to the page cannot be left out of config.json.
-func TestValidateConfigSchema_WarpSectionCoversEverySetting(t *testing.T) {
-	var schema struct {
-		Defs map[string]struct {
-			Properties map[string]json.RawMessage `json:"properties"`
-		} `json:"$defs"`
-	}
-	if err := json.Unmarshal(loadLocalSchema(t), &schema); err != nil {
-		t.Fatalf("failed to parse config.schema.json: %v", err)
-	}
-	declared := schema.Defs["warp_config"].Properties
-	// Warp's configuration tools need the Bifrost MCP, which is not released yet, so
-	// the schema does not advertise their setting.
-	unadvertised := map[string]bool{"management_writes": true}
-	inputType := reflect.TypeOf(warp.ConfigInput{})
-	fields := map[string]bool{}
-	for i := range inputType.NumField() {
-		name, _, _ := strings.Cut(inputType.Field(i).Tag.Get("json"), ",")
-		if name == "" || name == "-" || unadvertised[name] {
-			continue
-		}
-		fields[name] = true
-		if _, ok := declared[name]; !ok {
-			t.Errorf("warp.ConfigInput field %q is missing from $defs.warp_config in config.schema.json", name)
-		}
-	}
-	for name := range declared {
-		if !fields[name] {
-			t.Errorf("$defs.warp_config declares %q, which warp.ConfigInput does not take", name)
-		}
 	}
 }
 

@@ -7,10 +7,8 @@ import { useTranslation } from "react-i18next";
 
 import { preserveTimeFilters } from "@/components/navigation/navItem";
 import { useNavItems } from "@/components/navigation/navItems";
-import { WarpIcon } from "@/components/ui/icons";
 import { useCopyToClipboard } from "@/hooks/useCopyToClipboard";
 import { IS_ENTERPRISE } from "@/lib/constants/config";
-import { useWarp } from "@/lib/contexts/warpContext";
 import { cn } from "@/lib/utils";
 import { withBasePath } from "@/lib/utils/basePath";
 
@@ -26,7 +24,7 @@ import {
 } from "./commandPalette.utils";
 import { usePaletteActions } from "./commandPaletteActions";
 
-// One rendered row, whatever it does: open a page, run an action, open a nested page, or ask Warp.
+// One rendered row, whatever it does: open a page, run an action, or open a nested page.
 interface PaletteRow {
 	id: string;
 	title: string;
@@ -43,8 +41,6 @@ interface CommandGroupView {
 	heading: string;
 	rows: PaletteRow[];
 }
-
-const WARP_ROW_ID = "warp:ask";
 
 const navRow = (command: PaletteNavCommand, showSection: boolean, currentId?: string): PaletteRow => ({
 	id: command.id,
@@ -71,7 +67,6 @@ export default function CommandPalette({ open, onOpenChange }: { open: boolean; 
 	const pathname = useLocation({ select: (l) => l.pathname });
 	const search = useLocation({ select: (l) => l.searchStr ?? "" });
 	const navItems = useNavItems();
-	const warp = useWarp();
 	// The hook catches the TypeError of a missing navigator.clipboard (plain HTTP hosts) and toasts the failure.
 	const { copy } = useCopyToClipboard({
 		successMessage: t("commandPalette.toast.linkCopied"),
@@ -81,7 +76,7 @@ export default function CommandPalette({ open, onOpenChange }: { open: boolean; 
 	const [selected, setSelected] = useState("");
 	const [pageStack, setPageStack] = useState<string[]>([]);
 	const [wasOpen, setWasOpen] = useState(open);
-	// Set when a row hands focus to something else (a sheet, the Warp dock), so closing does not pull it back.
+	// Set when a row hands focus to something else (a sheet), so closing does not pull it back.
 	const skipFocusRestore = useRef(false);
 
 	// Reset while rendering the opening frame, not in an effect after it, so the first frame
@@ -167,15 +162,8 @@ export default function CommandPalette({ open, onOpenChange }: { open: boolean; 
 			const rootActions = pageGroup ? actions : [...actions, ...thisPage];
 			out.push({ id: "actions", heading: t("commandPalette.groups.actions"), rows: rootActions.map((a) => actionRow(a, false)) });
 		}
-		// Offered on every query, not only a miss: a question can still match a page by a stray word.
-		if (trimmed && warp)
-			out.push({
-				id: "warp",
-				heading: t("nav.warp"),
-				rows: [{ id: WARP_ROW_ID, title: t("warp.ask"), detail: trimmed, icon: WarpIcon, trailing: "enter" }],
-			});
 		return out;
-	}, [page, trimmed, thisPage, pageCommands, commands, actions, currentId, warp, t]);
+	}, [page, trimmed, thisPage, pageCommands, commands, actions, currentId, t]);
 
 	const rowByValue = useMemo(() => {
 		const map = new Map<string, PaletteRow>();
@@ -207,11 +195,6 @@ export default function CommandPalette({ open, onOpenChange }: { open: boolean; 
 		if (row.action?.run) {
 			skipFocusRestore.current = true;
 			return row.action.run();
-		}
-		if (row.id === WARP_ROW_ID && warp) {
-			skipFocusRestore.current = true;
-			onOpenChange(false);
-			warp.ask(trimmed);
 		}
 	};
 

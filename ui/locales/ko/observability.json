@@ -79,12 +79,7 @@
 			"providerUsage": "공급자 사용량",
 			"modelRankings": "모델 순위",
 			"mcpUsage": "MCP 사용법",
-			"teamRankings": "팀 순위",
-			"userRankings": "사용자 순위",
 			"virtualKeyRankings": "가상 키 순위",
-			"customerRankings": "고객 순위",
-			"buRankings": "BU 순위",
-			"projectRankings": "프로젝트 순위",
 			"appRankings": "앱 순위"
 		},
 		"export": {
@@ -1234,8 +1229,6 @@
 		"roundTripID": "라운드 트립 ID",
 		"exactRoundTripID": "정확한 라운드 트립 ID",
 		"nothingRecorded": "이 기간에는 기록된 내용이 없습니다.",
-		"topics": "주제",
-		"searchTopics": "주제 검색",
 		"modelRouters": "라우터",
 		"searchModelRouters": "라우터 검색",
 		"loadFailed": "이 목록을 불러오지 못했어요."

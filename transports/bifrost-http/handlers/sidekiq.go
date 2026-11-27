@@ -31,8 +31,8 @@ type SidekiqJobsRunner interface {
 }
 
 // SidekiqHandler exposes every sidekiq job, whatever its kind, so one UI surface can show
-// status and progress and cancel any of them. Feature-specific routes (cost recalculation,
-// Warp backfill) stay as they are and remain the way to start a job.
+// status and progress and cancel any of them. Feature-specific routes (cost recalculation)
+// stay as they are and remain the way to start a job.
 type SidekiqHandler struct {
 	store  SidekiqJobsStore
 	runner SidekiqJobsRunner
@@ -72,10 +72,14 @@ type sidekiqJobsResponse struct {
 	Jobs []sidekiqJobView `json:"jobs"`
 }
 
-// sidekiqAdmin gates both routes. Warp backfills are admin-only on their own routes, so the
-// generic surface must not be a way around that: it admits the same callers Warp does.
+// sidekiqAdmin gates both routes: the local admin, or a caller enterprise RBAC
+// already authorized (the only place a role ID is set).
 func sidekiqAdmin(ctx *fasthttp.RequestCtx) bool {
-	return warpAdmin(ctx)
+	if admin, _ := ctx.UserValue(schemas.IsLocalAdminContextKey).(bool); admin {
+		return true
+	}
+	roleID, _ := ctx.UserValue(schemas.BifrostContextKeyUserRoleID).(uint)
+	return roleID != 0
 }
 
 // listJobs handles GET /api/sidekiq/jobs: every active job plus those finished within

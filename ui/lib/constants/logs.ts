@@ -239,7 +239,7 @@ export interface ClientApp {
 // every release, so never match on an exact string. Identifiers are best-effort
 // and meant to be extended as new clients appear.
 const userAgentAppMatchers: { identifiers: string[]; app: ClientApp }[] = [
-	{ identifiers: ["bifrost-warp"], app: { name: "Warp", icon: withBasePath("/images/warp.svg") } },
+	{ identifiers: ["bifrost-mcp"], app: { name: "Bifrost MCP", icon: withBasePath("/images/bifrost.svg") } },
 	{ identifiers: ["chatgpt-web"], app: { name: "ChatGPT Web", icon: withBasePath("/images/openai.png") } },
 	{ identifiers: ["claude-chat-web", "claude-web"], app: { name: "Claude Chat Web", icon: withBasePath("/images/claude-desktop.png") } },
 	{ identifiers: ["claude-desktop"], app: { name: "Claude Desktop", icon: withBasePath("/images/claude-desktop.png") } },

@@ -71,8 +71,7 @@ var bifrostMCPDeniedRoutes = bifrostMCPRouteSet(
 	"GET /api/mcp/per-user-headers/flows/{id}", "PUT /api/mcp/per-user-headers/flows/{id}",
 	"GET /api/oauth2/consent/flows/{id}", "PUT /api/oauth2/consent/flows/{id}",
 	// Streams (SSE) and WebSocket upgrades, which a request/response tool cannot carry.
-	"POST /api/warp/chat", "GET /ws", "GET /v1/realtime", "GET /openai/v1/realtime",
-	"GET /v1/responses", "GET /openai/v1/responses",
+	"GET /ws", "GET /v1/realtime", "GET /openai/v1/realtime", "GET /v1/responses", "GET /openai/v1/responses",
 	"POST /genai/v1beta/models/{model}:streamGenerateContent",
 	"POST /litellm/genai/v1beta/models/{model}:streamGenerateContent",
 	"POST /langchain/genai/v1beta/models/{model}:streamGenerateContent",
@@ -579,12 +578,10 @@ type bifrostMCPCaller struct {
 	headers http.Header
 	proto   string // set: the scheme the request arrived with, as x-bf-forwarded-proto
 	remote  net.Addr
-	cookie  string // the dashboard's Cookie header; set only for Warp (see warpManagementCaller)
 }
 
 // WithBifrostMCPCaller records on ctx who the Bifrost MCP's tool calls act
-// for. The /v1/mcp handler sets it from the inbound request; an in-process
-// client (Warp) sets it from its own caller's request.
+// for. The /v1/mcp handler sets it from the inbound request.
 func WithBifrostMCPCaller(ctx context.Context, req *fasthttp.Request, remote net.Addr) context.Context {
 	caller := bifrostMCPCaller{headers: http.Header{}, remote: remote}
 	for name, value := range req.Header.All() {
@@ -677,8 +674,7 @@ func (e *BifrostMCPExecutor) Shutdown(ctx context.Context) error {
 
 // bifrostMCPTransport gives each call the public URL's scheme (its host is the
 // base URL's, from the request URL) and drops any Cookie header, whatever put it
-// there, so a /v1/mcp call never carries a browser session. The one exception is
-// Warp's caller, whose dashboard cookie replaces it.
+// there, so a /v1/mcp call never carries a browser session.
 type bifrostMCPTransport struct{ next http.RoundTripper }
 
 func (t bifrostMCPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -690,9 +686,6 @@ func (t bifrostMCPTransport) RoundTrip(req *http.Request) (*http.Response, error
 	caller, _ := req.Context().Value(bifrostMCPCallerKey{}).(bifrostMCPCaller)
 	if caller.proto != "" {
 		req.Header.Set("x-bf-forwarded-proto", caller.proto)
-	}
-	if caller.cookie != "" {
-		req.Header.Set("Cookie", caller.cookie)
 	}
 	return t.next.RoundTrip(req)
 }

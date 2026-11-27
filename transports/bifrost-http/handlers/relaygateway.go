@@ -166,7 +166,7 @@ func (r *RelayGatewayHandler) handle(ctx *fasthttp.RequestCtx) {
 	// is read on its own goroutine, up to a buffer ahead of the caller, so a slow caller does not
 	// stall it; a second goroutine hands the chunks to fasthttp through an SSEStreamReader; and an SSE
 	// reply gets the comment heartbeat, so a caller who left is noticed while the upstream is quiet.
-	reader := lib.NewSSEStreamReader()
+	reader := lib.NewTrackedSSEStreamReader(ctx)
 	ctx.Response.SetBodyStream(reader, -1)
 	var heartbeatDone chan struct{}
 	var heartbeatExited <-chan struct{}

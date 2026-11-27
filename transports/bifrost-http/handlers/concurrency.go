@@ -17,9 +17,7 @@ import (
 const unknownVirtualKeyLabel = "unknown"
 
 // ConcurrencyTracker counts the inference requests currently in flight, keyed by
-// the virtual key the caller presented. The counter is decremented when the
-// handler returns, which for a streaming request is when the stream ends, so the
-// figure reflects real concurrency rather than request starts.
+// the virtual key the caller presented.
 type ConcurrencyTracker struct {
 	mu     sync.Mutex
 	active map[string]int
@@ -31,7 +29,11 @@ func NewConcurrencyTracker() *ConcurrencyTracker {
 	return &ConcurrencyTracker{active: make(map[string]int)}
 }
 
-// Middleware counts the wrapped request for its whole lifetime.
+// Middleware counts the wrapped request for its whole lifetime. A streamed
+// response outlives the handler — the handler returns as soon as it hands
+// fasthttp a body stream, and the tokens are written afterwards — so a
+// streaming handler claims the request's lib.ConcurrencySlot through its stream
+// reader, and the count drops when the stream ends instead.
 func (t *ConcurrencyTracker) Middleware() schemas.BifrostHTTPMiddleware {
 	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 		return func(ctx *fasthttp.RequestCtx) {
@@ -40,7 +42,18 @@ func (t *ConcurrencyTracker) Middleware() schemas.BifrostHTTPMiddleware {
 				key = *vk
 			}
 			t.add(key, 1)
-			defer t.add(key, -1)
+			var once sync.Once
+			slot := lib.NewConcurrencySlot(func() { once.Do(func() { t.add(key, -1) }) })
+			lib.SetConcurrencySlot(ctx, slot)
+			// Everything that is not streamed finishes when the handler returns.
+			// A streamed response claims the slot, which hands the release to the
+			// stream reader instead.
+			defer func() {
+				if slot.Claimed() {
+					return
+				}
+				slot.Claim()()
+			}()
 			next(ctx)
 		}
 	}
