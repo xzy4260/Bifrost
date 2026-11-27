@@ -1,0 +1,756 @@
+package utils
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"slices"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/maximhq/bifrost/core/network"
+	"github.com/valyala/fasthttp"
+)
+
+func BenchmarkConfigureDialer(b *testing.B) {
+	b.Run("Setup", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			client := ConfigureDialer(&fasthttp.Client{}, false)
+			if client.Dial == nil {
+				b.Fatal("expected a dial function")
+			}
+		}
+	})
+	b.Run("SSRFRejection", func(b *testing.B) {
+		client := ConfigureDialer(&fasthttp.Client{}, false)
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := client.Dial("10.0.0.1:80"); err == nil {
+				b.Fatal("expected private IP rejection")
+			}
+		}
+	})
+}
+
+// TestConfigureDialer_SetsRetryIfErr verifies that ConfigureDialer installs
+// the StaleConnectionRetryIfErr callback on the client.
+func TestConfigureDialer_SetsRetryIfErr(t *testing.T) {
+	client := &fasthttp.Client{}
+	if client.RetryIfErr != nil {
+		t.Fatal("precondition: RetryIfErr should be nil on a new client")
+	}
+
+	ConfigureDialer(client, false)
+
+	if client.RetryIfErr == nil {
+		t.Fatal("ConfigureDialer should set RetryIfErr")
+	}
+
+	// Verify it behaves like StaleConnectionRetryIfErr
+	reset, retry := client.RetryIfErr(nil, 1, fmt.Errorf("cannot find whitespace in the first line of response"))
+	if !reset || !retry {
+		t.Error("RetryIfErr should retry on whitespace error")
+	}
+	reset, retry = client.RetryIfErr(nil, 1, fmt.Errorf("dial tcp: no such host"))
+	if reset || retry {
+		t.Error("RetryIfErr should not retry on unrelated errors")
+	}
+}
+
+// TestConfigureDialer_SetsDial verifies that ConfigureDialer installs a custom
+// Dial function on the client when no existing Dial is present.
+func TestConfigureDialer_SetsDial(t *testing.T) {
+	client := &fasthttp.Client{}
+	if client.Dial != nil {
+		t.Fatal("precondition: Dial should be nil on a new client")
+	}
+
+	ConfigureDialer(client, false)
+
+	if client.Dial == nil {
+		t.Fatal("ConfigureDialer should set a Dial function")
+	}
+}
+
+// TestConfigureDialer_ComposesWithExistingDial verifies that when a custom Dial
+// function is already set (e.g., from ConfigureProxy), ConfigureDialer wraps it
+// and still enables TCP keepalive on the resulting connection.
+func TestConfigureDialer_ComposesWithExistingDial(t *testing.T) {
+	var proxyDialCalled atomic.Bool
+
+	client := &fasthttp.Client{}
+	// Simulate a proxy dial function (set by ConfigureProxy)
+	client.Dial = func(addr string) (net.Conn, error) {
+		proxyDialCalled.Store(true)
+		return net.Dial("tcp", addr)
+	}
+
+	ConfigureDialer(client, false)
+
+	// Start a test server to connect to
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "ok")
+	}))
+	defer server.Close()
+
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
+
+	req.SetRequestURI(server.URL)
+	req.Header.SetMethod(http.MethodGet)
+
+	if err := client.Do(req, resp); err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	if resp.StatusCode() != 200 {
+		t.Fatalf("expected 200, got %d", resp.StatusCode())
+	}
+	if !proxyDialCalled.Load() {
+		t.Error("ConfigureDialer should have called the existing proxy dial function")
+	}
+}
+
+// TestConfigureDialer_TCPKeepAliveEnabled verifies that connections created
+// through ConfigureDialer have TCP keepalive enabled.
+func TestConfigureDialer_TCPKeepAliveEnabled(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "ok")
+	}))
+	defer server.Close()
+
+	// Test without existing dial (direct connection path)
+	t.Run("without_existing_dial", func(t *testing.T) {
+		client := &fasthttp.Client{}
+		ConfigureDialer(client, false)
+
+		req := fasthttp.AcquireRequest()
+		resp := fasthttp.AcquireResponse()
+		defer fasthttp.ReleaseRequest(req)
+		defer fasthttp.ReleaseResponse(resp)
+
+		req.SetRequestURI(server.URL)
+		req.Header.SetMethod(http.MethodGet)
+
+		if err := client.Do(req, resp); err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		if resp.StatusCode() != 200 {
+			t.Fatalf("expected 200, got %d", resp.StatusCode())
+		}
+	})
+
+	// Test with existing dial (proxy composition path)
+	t.Run("with_existing_dial", func(t *testing.T) {
+		var connFromProxy net.Conn
+		client := &fasthttp.Client{}
+		client.Dial = func(addr string) (net.Conn, error) {
+			conn, err := net.Dial("tcp", addr)
+			connFromProxy = conn
+			return conn, err
+		}
+		ConfigureDialer(client, false)
+
+		req := fasthttp.AcquireRequest()
+		resp := fasthttp.AcquireResponse()
+		defer fasthttp.ReleaseRequest(req)
+		defer fasthttp.ReleaseResponse(resp)
+
+		req.SetRequestURI(server.URL)
+		req.Header.SetMethod(http.MethodGet)
+
+		if err := client.Do(req, resp); err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+
+		// Verify the proxy-returned connection is a TCP connection
+		// (ConfigureDialer enables keepalive via SetKeepAliveConfig on it)
+		if connFromProxy == nil {
+			t.Fatal("proxy dial should have been called")
+		}
+		if _, ok := connFromProxy.(*net.TCPConn); !ok {
+			t.Errorf("expected *net.TCPConn, got %T", connFromProxy)
+		}
+	})
+}
+
+// TestConfigureDialer_ReturnValue verifies that ConfigureDialer returns the
+// same client pointer it received (for chaining).
+func TestConfigureDialer_ReturnValue(t *testing.T) {
+	client := &fasthttp.Client{}
+	result := ConfigureDialer(client, false)
+	if result != client {
+		t.Error("ConfigureDialer should return the same client pointer")
+	}
+}
+
+// TestConfigureDialer_KeepsFactoryClientOnItsProxy verifies that a client handed out
+// by network.HTTPClientFactory still reaches its target through the factory's proxy
+// after ConfigureDialer: replacing its forwarding transport would send every holder
+// of that shared client direct.
+func TestConfigureDialer_KeepsFactoryClientOnItsProxy(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("via proxy"))
+	}))
+	defer backend.Close()
+	// The proxy tunnels every CONNECT to backend, whatever target it names.
+	var proxied atomic.Int32
+	var tunnelTarget atomic.Value
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "CONNECT required", http.StatusMethodNotAllowed)
+			return
+		}
+		proxied.Add(1)
+		tunnelTarget.Store(r.Host)
+		upstream, err := net.Dial("tcp", backend.Listener.Addr().String())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		downstream, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			upstream.Close()
+			return
+		}
+		_, _ = downstream.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		go func() { _, _ = io.Copy(upstream, downstream); upstream.Close() }()
+		_, _ = io.Copy(downstream, upstream)
+		downstream.Close()
+	}))
+	defer proxy.Close()
+
+	factory := network.NewHTTPClientFactory(&network.GlobalProxyConfig{
+		Enabled:            true,
+		Type:               network.GlobalProxyTypeHTTP,
+		URL:                proxy.URL,
+		EnableForInference: true,
+	}, testLogger{})
+	client := ConfigureDialer(factory.GetFasthttpClient(network.ClientPurposeInference), true)
+
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseResponse(resp)
+	// TEST-NET-3: never answers directly, so only the proxy can respond.
+	req.SetRequestURI("http://203.0.113.10/v1/models")
+	err := client.DoTimeout(req, resp, 2*time.Second)
+	if err != nil {
+		t.Fatalf("request through the factory client failed (sent direct?): %v", err)
+	}
+	if proxied.Load() != 1 || string(resp.Body()) != "via proxy" {
+		t.Fatalf("expected the request to go through the factory proxy, proxy saw %d tunnel(s), body %q", proxied.Load(), resp.Body())
+	}
+	if got := tunnelTarget.Load(); got != "203.0.113.10:80" {
+		t.Fatalf("proxy tunnel target = %v, want 203.0.113.10:80", got)
+	}
+}
+
+// TestConfigureDialer_Idempotent verifies that calling ConfigureDialer multiple
+// times doesn't break the client.
+func TestConfigureDialer_Idempotent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "ok")
+	}))
+	defer server.Close()
+
+	client := &fasthttp.Client{}
+	ConfigureDialer(client, false)
+	ConfigureDialer(client, false) // called again
+
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
+
+	req.SetRequestURI(server.URL)
+	req.Header.SetMethod(http.MethodPost)
+	req.SetBodyString(`{"test": true}`)
+
+	if err := client.Do(req, resp); err != nil {
+		t.Fatalf("request failed after double ConfigureDialer: %v", err)
+	}
+	if resp.StatusCode() != 200 {
+		t.Fatalf("expected 200, got %d", resp.StatusCode())
+	}
+}
+
+// TestConfigureDialer_WithRetryOnStaleConnection is an integration test that
+// verifies ConfigureDialer enables successful POST retry after TTL mismatch.
+// This combines both the retry and keepalive behaviors.
+func TestConfigureDialer_WithRetryOnStaleConnection(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping TTL mismatch test in short mode (requires 11s wait)")
+	}
+
+	const (
+		serverIdleTimeout = 10 * time.Second
+		clientIdleTimeout = 15 * time.Second
+		waitBetween       = 11 * time.Second
+	)
+
+	var requestCount atomic.Int32
+
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"ok": true, "request": %d}`, requestCount.Load())
+	}))
+	server.Config.IdleTimeout = serverIdleTimeout
+	server.Start()
+	defer server.Close()
+
+	client := &fasthttp.Client{
+		MaxIdleConnDuration: clientIdleTimeout,
+		MaxConnsPerHost:     10,
+	}
+	// Use ConfigureDialer (the function under test) instead of manually setting RetryIfErr
+	ConfigureDialer(client, false)
+
+	// First request: establish connection in pool
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
+
+	req.SetRequestURI(server.URL)
+	req.Header.SetMethod(http.MethodPost)
+	req.SetBodyString(`{"prompt": "hello"}`)
+
+	if err := client.Do(req, resp); err != nil {
+		t.Fatalf("First POST failed: %v", err)
+	}
+	if resp.StatusCode() != 200 {
+		t.Fatalf("First POST: expected 200, got %d", resp.StatusCode())
+	}
+	_ = resp.Body()
+
+	// Wait for server TTL to expire
+	t.Logf("Waiting %v for server idle timeout to expire...", waitBetween)
+	time.Sleep(waitBetween)
+
+	// Second request: stale connection should be retried by ConfigureDialer's retry policy
+	req2 := fasthttp.AcquireRequest()
+	resp2 := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req2)
+	defer fasthttp.ReleaseResponse(resp2)
+
+	req2.SetRequestURI(server.URL)
+	req2.Header.SetMethod(http.MethodPost)
+	req2.SetBodyString(`{"prompt": "world"}`)
+
+	if err := client.Do(req2, resp2); err != nil {
+		t.Fatalf("Second POST failed (ConfigureDialer retry should have saved it): %v", err)
+	}
+	if resp2.StatusCode() != 200 {
+		t.Fatalf("Second POST: expected 200, got %d", resp2.StatusCode())
+	}
+	t.Logf("Second POST succeeded after TTL mismatch via ConfigureDialer")
+}
+
+// TestConfigureRetry_Deprecated verifies the deprecated ConfigureRetry still works.
+func TestConfigureRetry_Deprecated(t *testing.T) {
+	client := &fasthttp.Client{}
+	result := ConfigureRetry(client)
+
+	if result != client {
+		t.Error("ConfigureRetry should return the same client pointer")
+	}
+	if client.RetryIfErr == nil {
+		t.Fatal("ConfigureRetry should set RetryIfErr")
+	}
+
+	// Verify it uses the same StaleConnectionRetryIfErr
+	reset, retry := client.RetryIfErr(nil, 1, fmt.Errorf("cannot find whitespace"))
+	if !reset || !retry {
+		t.Error("ConfigureRetry should install StaleConnectionRetryIfErr")
+	}
+}
+
+// TestConfigureDialer_SSRFProtection verifies that the default (no-proxy) dial
+// path rejects connections to private, loopback, and link-local addresses before
+// any TCP socket is opened.
+func TestConfigureDialer_SSRFProtection(t *testing.T) {
+	tests := []struct {
+		name    string
+		addr    string
+		wantErr string
+	}{
+		// Unspecified addresses — IsPrivateIP rejects them via IsUnspecified()
+		{"0.0.0.0 all-zeros", "0.0.0.0:80", "unspecified IP"},
+
+		// RFC 1918 private ranges — LookupIP returns the literal IP, IsPrivateIP rejects it
+		{"10.x.x.x", "10.0.0.1:80", "private IP"},
+		{"172.16.x.x", "172.16.0.1:80", "private IP"},
+		{"192.168.x.x", "192.168.1.1:80", "private IP"},
+
+		// Link-local / cloud metadata
+		{"169.254.169.254 AWS metadata", "169.254.169.254:80", "link-local IP"},
+		{"169.254.x.x link-local", "169.254.1.1:80", "link-local IP"},
+
+		// IPv6 private
+		{"[fc00::1] unique-local", "[fc00::1]:80", "private IP"},
+		{"[fd00::1] unique-local", "[fd00::1]:80", "private IP"},
+
+		// Unspecified IPv6 long form — regression for bypass via 0:0:0:0:0:0:0:0
+		{"[0:0:0:0:0:0:0:0] unspecified long form", "[0:0:0:0:0:0:0:0]:80", "unspecified IP"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &fasthttp.Client{ReadTimeout: time.Second}
+			ConfigureDialer(client, false)
+			_, err := client.Dial(tt.addr)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("expected error containing %q, got %q", tt.wantErr, err.Error())
+			}
+		})
+	}
+}
+
+// TestConfigureDialer_SSRFProxyBypass verifies that when an existingDial is set
+// (proxy path), SSRF checks are intentionally skipped — the proxy owns routing.
+func TestConfigureDialer_SSRFProxyBypass(t *testing.T) {
+	var proxyCalled bool
+	client := &fasthttp.Client{}
+	client.Dial = func(addr string) (net.Conn, error) {
+		proxyCalled = true
+		return nil, fmt.Errorf("proxy handled: %s", addr)
+	}
+	ConfigureDialer(client, false)
+
+	_, err := client.Dial("10.0.0.1:80")
+	if !proxyCalled {
+		t.Error("expected proxy dial to be called for private IP")
+	}
+	if err == nil || !strings.Contains(err.Error(), "proxy handled") {
+		t.Errorf("expected proxy error, got %v", err)
+	}
+}
+
+// TestConfigureDialer_ProxyBypassSkipsDialTimeoutCallback pins that a no_proxy bypass
+// (errBypassProxy from the proxy dialer) connects through the checked direct-dial path,
+// even when the client also has a DialTimeout callback. The callback carries no IP
+// checks, so taking it would let a bypassed target reach private, link-local or
+// unspecified addresses.
+func TestConfigureDialer_ProxyBypassSkipsDialTimeoutCallback(t *testing.T) {
+	for _, addr := range []string{"10.0.0.1:80", "169.254.169.254:80", "0.0.0.0:80"} {
+		t.Run(addr, func(t *testing.T) {
+			var timeoutCalls atomic.Int32
+			client := &fasthttp.Client{ReadTimeout: time.Second}
+			client.Dial = func(string) (net.Conn, error) { return nil, errBypassProxy }
+			client.DialTimeout = func(addr string, _ time.Duration) (net.Conn, error) {
+				timeoutCalls.Add(1)
+				return nil, fmt.Errorf("unchecked dial to %s", addr)
+			}
+			ConfigureDialer(client, false)
+
+			_, err := client.Dial(addr)
+			if err == nil || !strings.Contains(err.Error(), "is not allowed") {
+				t.Fatalf("expected the bypassed target to be refused by the IP checks, got %v", err)
+			}
+			if n := timeoutCalls.Load(); n != 0 {
+				t.Fatalf("the DialTimeout callback was used %d times for a bypassed target", n)
+			}
+		})
+	}
+}
+
+// TestConfigureDialer_SSRFZeroTimeout verifies that SSRF protection is active
+// even when ReadTimeout is 0 (context.Background() is used instead of WithTimeout).
+func TestConfigureDialer_SSRFZeroTimeout(t *testing.T) {
+	client := &fasthttp.Client{ReadTimeout: 0}
+	ConfigureDialer(client, false)
+
+	_, err := client.Dial("169.254.169.254:80")
+	if err == nil {
+		t.Fatal("expected SSRF rejection with zero ReadTimeout, got nil")
+	}
+	if !strings.Contains(err.Error(), "link-local IP") {
+		t.Errorf("expected 'link-local IP' error, got %q", err.Error())
+	}
+}
+
+// TestConfigureDialer_SSRFMultiIPAllFail verifies that when all resolved IPs
+// fail to connect, the last dial error is returned (not a generic message).
+func TestConfigureDialer_SSRFMultiIPAllFail(t *testing.T) {
+	t.Parallel()
+
+	wantAddrs := []string{"192.0.2.1:9", "192.0.2.2:9"}
+	dialErrors := []error{errors.New("first address refused"), errors.New("second address refused")}
+	var attemptedAddrs []string
+	var lookupCalls int
+	lookupIP := func(_ context.Context, network, host string) ([]net.IP, error) {
+		lookupCalls++
+		if network != "ip" || host != "provider.example" {
+			t.Fatalf("unexpected lookup: network=%q host=%q", network, host)
+		}
+		return []net.IP{net.ParseIP("192.0.2.1"), net.ParseIP("192.0.2.2")}, nil
+	}
+	dial := func(_ *net.Dialer, network, addr string) (net.Conn, error) {
+		if network != "tcp" {
+			t.Fatalf("expected TCP dial, got %q", network)
+		}
+		attemptedAddrs = append(attemptedAddrs, addr)
+		if len(attemptedAddrs) > len(dialErrors) {
+			t.Fatalf("unexpected extra dial attempt: %q", addr)
+		}
+		return nil, dialErrors[len(attemptedAddrs)-1]
+	}
+	client := &fasthttp.Client{ReadTimeout: time.Second}
+	configureDialer(client, false, lookupIP, dial)
+
+	conn, err := client.Dial("provider.example:9")
+	if conn != nil {
+		t.Error("expected no connection when all addresses fail")
+	}
+	if lookupCalls != 1 {
+		t.Errorf("expected one lookup, got %d", lookupCalls)
+	}
+	if !slices.Equal(attemptedAddrs, wantAddrs) {
+		t.Errorf("expected dial attempts %v, got %v", wantAddrs, attemptedAddrs)
+	}
+	if err != dialErrors[1] {
+		t.Errorf("expected the last dial error %v, got %v", dialErrors[1], err)
+	}
+}
+
+// TestConfigureDialer_DialError verifies that dial errors from the existing
+// dial function are properly propagated (not swallowed).
+func TestConfigureDialer_DialError(t *testing.T) {
+	expectedErr := fmt.Errorf("proxy connection refused")
+	client := &fasthttp.Client{}
+	client.Dial = func(addr string) (net.Conn, error) {
+		return nil, expectedErr
+	}
+
+	ConfigureDialer(client, false)
+
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
+
+	req.SetRequestURI("http://localhost:1/test")
+	req.Header.SetMethod(http.MethodPost)
+
+	err := client.Do(req, resp)
+	if err == nil {
+		t.Fatal("expected error from failed proxy dial")
+	}
+	t.Logf("Got expected error: %v", err)
+}
+
+// TestStaleConnectionRetryIfErr_WrappedErrors verifies behavior with wrapped errors.
+func TestStaleConnectionRetryIfErr_WrappedErrors(t *testing.T) {
+	tests := []struct {
+		name      string
+		err       error
+		wantRetry bool
+	}{
+		{
+			name:      "wrapped whitespace error",
+			err:       fmt.Errorf("fasthttp: %w", fmt.Errorf("cannot find whitespace in header")),
+			wantRetry: true,
+		},
+		{
+			name:      "wrapped connection reset",
+			err:       fmt.Errorf("during POST: connection reset by peer"),
+			wantRetry: true,
+		},
+		{
+			name:      "wrapped broken pipe",
+			err:       fmt.Errorf("during POST: %w", fmt.Errorf("write tcp 10.0.0.1:53374->10.0.0.2:30000: write: broken pipe")),
+			wantRetry: true,
+		},
+		{
+			name:      "ErrConnectionClosed from fasthttp",
+			err:       fasthttp.ErrConnectionClosed,
+			wantRetry: true, // Explicitly matched to stay correct if future fasthttp versions surface it inside the retry loop
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, retry := network.StaleConnectionRetryIfErr(nil, 1, tt.err)
+			if retry != tt.wantRetry {
+				t.Errorf("retry = %v, want %v", retry, tt.wantRetry)
+			}
+		})
+	}
+}
+
+// fakeNetHTTPDialer wires configureNetHTTPDialer to a fake resolver and dialer and records
+// every lookup and dial address.
+type fakeNetHTTPDialer struct {
+	answers map[string][]net.IP
+	lookups []string
+	dials   []string
+}
+
+func (f *fakeNetHTTPDialer) install(transport *http.Transport, allowPrivate bool) {
+	configureNetHTTPDialer(transport, allowPrivate,
+		func(_ context.Context, _, host string) ([]net.IP, error) {
+			f.lookups = append(f.lookups, host)
+			if ips, ok := f.answers[host]; ok {
+				return ips, nil
+			}
+			return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+		},
+		func(_ context.Context, _, addr string) (net.Conn, error) {
+			f.dials = append(f.dials, addr)
+			client, server := net.Pipe()
+			_ = server.Close()
+			return client, nil
+		})
+}
+
+func TestConfigureNetHTTPDialer_AddressPolicy(t *testing.T) {
+	cases := []struct {
+		name         string
+		ips          []string
+		allowPrivate bool
+		reason       string // empty means the dial goes through
+		wantDial     string
+	}{
+		{"public", []string{"52.94.0.10"}, false, "", "52.94.0.10:443"},
+		{"loopback always allowed", []string{"127.0.0.1"}, false, "", "127.0.0.1:443"},
+		{"private refused by default", []string{"10.0.1.5"}, false, DialBlockedPrivate, ""},
+		{"private allowed when opted in", []string{"10.0.1.5"}, true, "", "10.0.1.5:443"},
+		{"ipv6 unique-local refused by default", []string{"fd00::5"}, false, DialBlockedPrivate, ""},
+		{"cloud metadata always refused", []string{"169.254.169.254"}, true, DialBlockedLinkLocal, ""},
+		{"nat64-embedded metadata always refused", []string{"64:ff9b::a9fe:a9fe"}, true, DialBlockedLinkLocal, ""},
+		{"unspecified always refused", []string{"0.0.0.0"}, true, DialBlockedUnspecified, ""},
+		// Every resolved address is checked before any dial: a public first answer does not
+		// let a private one through on fallback.
+		{"mixed answer refused", []string{"52.94.0.10", "10.0.1.5"}, false, DialBlockedPrivate, ""},
+		// IPv4 is tried first since dialing literals loses dual-stack racing.
+		{"ipv4 before ipv6", []string{"2600:1f18::1", "52.94.0.10"}, false, "", "52.94.0.10:443"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var ips []net.IP
+			for _, ip := range tc.ips {
+				ips = append(ips, net.ParseIP(ip))
+			}
+			f := &fakeNetHTTPDialer{answers: map[string][]net.IP{"bedrock.example": ips}}
+			transport := &http.Transport{}
+			f.install(transport, tc.allowPrivate)
+
+			conn, err := transport.DialContext(context.Background(), "tcp", "bedrock.example:443")
+			if tc.reason == "" {
+				if err != nil {
+					t.Fatalf("dial: %v", err)
+				}
+				_ = conn.Close()
+				if len(f.dials) == 0 || f.dials[0] != tc.wantDial {
+					t.Fatalf("dials = %v, want first %q", f.dials, tc.wantDial)
+				}
+				return
+			}
+			var blocked *DialBlockedError
+			if !errors.As(err, &blocked) || blocked.Reason != tc.reason {
+				t.Fatalf("err = %v, want DialBlockedError with reason %q", err, tc.reason)
+			}
+			if len(f.dials) != 0 {
+				t.Fatalf("a refused address must never be dialed, dials = %v", f.dials)
+			}
+		})
+	}
+}
+
+// A proxy picked by transport.Proxy is dialed as is, even on a private address: the proxy is
+// operator configuration and it, not Bifrost, connects to the target (as with ConfigureDialer).
+func TestConfigureNetHTTPDialer_ProxyHopIsNotChecked(t *testing.T) {
+	proxyURL, _ := url.Parse("http://10.0.0.9")
+	f := &fakeNetHTTPDialer{}
+	transport := &http.Transport{Proxy: http.ProxyURL(proxyURL)}
+	f.install(transport, false)
+
+	req := httptest.NewRequest(http.MethodPost, "https://bedrock-runtime.us-east-1.amazonaws.com/model/x/converse", nil)
+	got, err := transport.Proxy(req)
+	if err != nil || got == nil {
+		t.Fatalf("proxy = %v, %v", got, err)
+	}
+	conn, err := transport.DialContext(context.Background(), "tcp", "10.0.0.9:80")
+	if err != nil {
+		t.Fatalf("dial to the configured proxy must not be checked: %v", err)
+	}
+	_ = conn.Close()
+	if len(f.lookups) != 0 || len(f.dials) != 1 || f.dials[0] != "10.0.0.9:80" {
+		t.Fatalf("lookups = %v, dials = %v", f.lookups, f.dials)
+	}
+
+	// Any other private address is still checked.
+	if _, err := transport.DialContext(context.Background(), "tcp", "10.0.0.10:80"); err == nil {
+		t.Fatal("a non-proxy private address must be refused")
+	}
+}
+
+func TestNetHTTPProxyAddr(t *testing.T) {
+	cases := map[string]string{
+		"http://proxy.internal":         "proxy.internal:80",
+		"https://proxy.internal":        "proxy.internal:443",
+		"socks5://proxy.internal":       "proxy.internal:1080",
+		"http://proxy.internal:3128":    "proxy.internal:3128",
+		"http://user:pw@[fd00::1]:8080": "[fd00::1]:8080",
+	}
+	for raw, want := range cases {
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := netHTTPProxyAddr(u); got != want {
+			t.Errorf("netHTTPProxyAddr(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
+// A refused dial reaches the client with a message that names the fix, even wrapped by
+// net/http's *url.Error, while other connection failures keep the caller's message.
+func TestNewBifrostUpstreamConnectionError_DialBlockedMessage(t *testing.T) {
+	blocked := &url.Error{Op: "Post", URL: "https://10.0.1.5/model/x/converse", Err: &DialBlockedError{IP: net.ParseIP("10.0.1.5"), Reason: DialBlockedPrivate}}
+	bifrostErr := NewBifrostUpstreamConnectionError("network error", blocked)
+	if !strings.Contains(bifrostErr.Error.Message, "allow_private_network") {
+		t.Fatalf("message = %q, want it to name allow_private_network", bifrostErr.Error.Message)
+	}
+	if bifrostErr.StatusCode == nil || *bifrostErr.StatusCode != 502 {
+		t.Fatalf("status = %v, want 502", bifrostErr.StatusCode)
+	}
+
+	other := NewBifrostUpstreamConnectionError("network error", errors.New("connection refused"))
+	if other.Error.Message != "network error" {
+		t.Fatalf("message = %q, want the caller's message", other.Error.Message)
+	}
+}
+
+func BenchmarkConfigureNetHTTPDialer(b *testing.B) {
+	f := &fakeNetHTTPDialer{answers: map[string][]net.IP{"bedrock.example": {net.ParseIP("52.94.0.10")}}}
+	transport := &http.Transport{}
+	f.install(transport, false)
+	b.ReportAllocs()
+	for b.Loop() {
+		f.lookups, f.dials = f.lookups[:0], f.dials[:0]
+		conn, err := transport.DialContext(context.Background(), "tcp", "bedrock.example:443")
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = conn.Close()
+	}
+}

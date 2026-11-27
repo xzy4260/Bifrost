@@ -1,0 +1,324 @@
+import { ColumnConfigDropdown, type ColumnConfigEntry } from "@/components/table";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { DateTimePickerWithRange } from "@/components/ui/datePickerWithRange";
+import {
+	DropdownMenu,
+	DropdownMenuContent,
+	DropdownMenuItem,
+	DropdownMenuRadioGroup,
+	DropdownMenuRadioItem,
+	DropdownMenuTrigger,
+} from "@/components/ui/dropdownMenu";
+import { Input } from "@/components/ui/input";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useTimezonePreference } from "@/lib/hooks/useTimezonePreference";
+import type { LogEntry, LogFilters as LogFiltersType } from "@/lib/types/logs";
+import { formatLogSearchInput, isLogIdSearch, type LogSearchMode, parseLogSearchInput } from "@/lib/utils/logSearch";
+import { getRangeForPeriod, TIME_PERIODS } from "@/lib/utils/timeRange";
+import { ChevronDown, Download, ListTree, MoreVertical, Radio, RefreshCw, Search } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { LogsExportDialog } from "./logsExportDialog";
+import { useTranslation } from "react-i18next";
+
+interface LogsHeaderViewProps {
+	filters: LogFiltersType;
+	onFiltersChange: (filters: LogFiltersType) => void;
+	fetchLogs: () => Promise<void>;
+	fetchStats: () => Promise<void>;
+	fetchHistogram: () => Promise<void>;
+	loading?: boolean;
+	polling: boolean;
+	onPollToggle: (enabled: boolean) => void;
+	/** Grouped view: collapse fallback chains into their root request */
+	grouped: boolean;
+	onGroupedToggle: (enabled: boolean) => void;
+	period: string;
+	onPeriodChange: (period?: string, from?: Date, to?: Date) => void;
+	/** Total logs matching the current filters/time window (stats.total_requests) */
+	totalLogs: number;
+	/** Column config for the ColumnConfigDropdown */
+	columnEntries: ColumnConfigEntry[];
+	columnLabels: Record<string, string>;
+	onToggleColumnVisibility: (id: string) => void;
+	onResetColumns: () => void;
+	currentPageLogs?: LogEntry[];
+	sortBy?: string;
+	order?: string;
+}
+
+export function LogsHeaderView({
+	filters,
+	onFiltersChange,
+	fetchLogs,
+	fetchStats,
+	fetchHistogram,
+	loading = false,
+	polling,
+	onPollToggle,
+	grouped,
+	onGroupedToggle,
+	period,
+	onPeriodChange,
+	totalLogs,
+	columnEntries,
+	columnLabels,
+	onToggleColumnVisibility,
+	onResetColumns,
+	currentPageLogs = [],
+	sortBy = "timestamp",
+	order = "desc",
+}: LogsHeaderViewProps) {
+	const { t } = useTranslation("observability");
+	const [exportDialogOpen, setExportDialogOpen] = useState(false);
+	// Which search the box runs. "auto" keeps the sniffing behaviour (a pasted UUID
+	// becomes an exact id lookup); the other two pin it, for ids that aren't
+	// UUID-shaped and for content that happens to look like one.
+	const [searchMode, setSearchMode] = useState<LogSearchMode>("auto");
+	const searchModeRef = useRef<LogSearchMode>(searchMode);
+	useEffect(() => {
+		searchModeRef.current = searchMode;
+	}, [searchMode]);
+	const [localSearch, setLocalSearch] = useState(() => formatLogSearchInput(filters));
+	const searchTimeoutRef = useRef<NodeJS.Timeout | undefined>(undefined);
+	const filtersRef = useRef<LogFiltersType>(filters);
+
+	const [timezone, setTimezone] = useTimezonePreference();
+
+	const [startTime, setStartTime] = useState<Date | undefined>(filters.start_time ? new Date(filters.start_time) : undefined);
+	const [endTime, setEndTime] = useState<Date | undefined>(filters.end_time ? new Date(filters.end_time) : undefined);
+
+	useEffect(() => {
+		setStartTime(filters.start_time ? new Date(filters.start_time) : undefined);
+		setEndTime(filters.end_time ? new Date(filters.end_time) : undefined);
+	}, [filters.start_time, filters.end_time]);
+
+	useEffect(() => {
+		filtersRef.current = filters;
+	}, [filters]);
+
+	const { content_search: contentSearchFilter, request_id: requestIDFilter } = filters;
+	useEffect(() => {
+		// Deliberately not keyed on the mode: switching it re-runs the search with
+		// what is already typed, and re-syncing here would blank the box against
+		// the pre-switch filters before that round trip lands.
+		setLocalSearch(formatLogSearchInput({ content_search: contentSearchFilter, request_id: requestIDFilter }, searchModeRef.current));
+	}, [contentSearchFilter, requestIDFilter]);
+
+	useEffect(() => {
+		return () => {
+			if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
+		};
+	}, []);
+
+	const handleSearchChange = useCallback(
+		(value: string, mode: LogSearchMode) => {
+			setLocalSearch(value);
+			if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
+			// A pasted request ID resolves to an exact primary-key lookup; there is
+			// nothing to debounce for it, so only free text waits for the typist.
+			const { request_id = "", content_search = "" } = parseLogSearchInput(value, mode);
+			searchTimeoutRef.current = setTimeout(
+				() => {
+					onFiltersChange({ ...filtersRef.current, request_id, content_search });
+				},
+				request_id ? 0 : 500,
+			);
+		},
+		[onFiltersChange],
+	);
+
+	// Switching the mode re-runs whatever is already typed, so the results follow
+	// the new mode without the user having to retype or re-submit.
+	const handleSearchModeChange = useCallback(
+		(mode: LogSearchMode) => {
+			setSearchMode(mode);
+			handleSearchChange(localSearch, mode);
+		},
+		[handleSearchChange, localSearch],
+	);
+
+	// Derived from the live input rather than the filters, so the badge appears as
+	// soon as an ID is pasted instead of after the round trip. Only "auto" needs it:
+	// a pinned mode already says what it is on the dropdown trigger.
+	const isIdSearch = searchMode === "auto" && isLogIdSearch(localSearch);
+
+	return (
+		// justify-between only once the row can hold everything: while the controls
+		// wrap, spreading them pushes the last row's two icon buttons to opposite
+		// edges of the card and burns a whole row on two buttons. While wrapped, the
+		// text buttons and the date picker grow instead, so each row fills evenly.
+		<div className="flex grow flex-wrap items-center justify-start gap-2 @4xl/logs-header:flex-nowrap @4xl/logs-header:justify-between">
+			<Button
+				data-testid="logs-refresh-btn"
+				variant="outline"
+				size="sm"
+				className="h-7.5 flex-1 disabled:opacity-100 @4xl/logs-header:flex-none"
+				onClick={() => {
+					fetchLogs();
+					fetchStats();
+					fetchHistogram();
+				}}
+				disabled={loading}
+			>
+				<RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
+				{t("labels.refresh")}
+			</Button>
+			<Button
+				data-testid="logs-live-btn"
+				variant={polling ? "default" : "outline"}
+				size="sm"
+				className="h-7.5 flex-1 @4xl/logs-header:flex-none"
+				onClick={() => onPollToggle(!polling)}
+			>
+				{polling ? <Radio className="h-4 w-4 animate-pulse" /> : <Radio className="h-4 w-4" />}
+				{t("labels.live")}
+			</Button>
+			<Tooltip>
+				<TooltipTrigger asChild>
+					<Button
+						data-testid="logs-group-chains-btn"
+						variant={grouped ? "default" : "outline"}
+						size="sm"
+						className="h-7.5 flex-1 @4xl/logs-header:flex-none"
+						onClick={() => onGroupedToggle(!grouped)}
+					>
+						<ListTree className="h-4 w-4" />
+						{t("labels.group")}
+					</Button>
+				</TooltipTrigger>
+				<TooltipContent sideOffset={6} className="max-w-64">
+					{t("logs.groupTooltip")
+						.split("\n\n")
+						.map((part, i, arr) => (
+							<span key={i}>
+								{part}
+								{i < arr.length - 1 ? (
+									<>
+										<br />
+										<br />
+									</>
+								) : null}
+							</span>
+						))}
+				</TooltipContent>
+			</Tooltip>
+			{/* Full width while the row wraps, so the search field owns its own line
+			    instead of squeezing to its 12rem minimum beside the date picker. */}
+			<div className="border-input flex h-7.5 min-w-[12rem] flex-1 basis-full items-center overflow-hidden rounded-sm border @4xl/logs-header:basis-auto">
+				<Search className="mr-2 ml-2 size-4 shrink-0" />
+				<Input
+					type="text"
+					data-testid="logs-search-input"
+					className="!h-7 rounded-tl-none rounded-tr-sm rounded-br-sm rounded-bl-none border-none bg-slate-50 shadow-none outline-none focus-visible:ring-0"
+					placeholder={t(`logs.searchPlaceholders.${searchMode}`)}
+					value={localSearch}
+					onChange={(e) => handleSearchChange(e.target.value, searchMode)}
+				/>
+				{isIdSearch && (
+					<Tooltip>
+						<TooltipTrigger asChild>
+							<Badge variant="secondary" className="mr-2 shrink-0 px-1.5 py-0 text-[10px]" data-testid="logs-search-id-badge">
+								ID
+							</Badge>
+						</TooltipTrigger>
+						<TooltipContent sideOffset={6} className="max-w-64">
+							{t("logs.exactIdSearchHint")}
+						</TooltipContent>
+					</Tooltip>
+				)}
+				<DropdownMenu>
+					<DropdownMenuTrigger asChild>
+						<Button
+							variant="ghost"
+							size="sm"
+							className="text-muted-foreground h-7 shrink-0 rounded-none text-xs"
+							title={t("logs.searchModeHint")}
+							data-testid="logs-search-mode-trigger"
+						>
+							{t(`logs.searchModes.${searchMode}`)}
+							<ChevronDown className="size-3" />
+						</Button>
+					</DropdownMenuTrigger>
+					<DropdownMenuContent align="end" className="w-44">
+						<DropdownMenuRadioGroup value={searchMode} onValueChange={(value) => handleSearchModeChange(value as LogSearchMode)}>
+							<DropdownMenuRadioItem value="auto" className="text-xs" data-testid="logs-search-mode-auto">
+								{t("logs.searchModeOptions.auto")}
+							</DropdownMenuRadioItem>
+							<DropdownMenuRadioItem value="content" className="text-xs" data-testid="logs-search-mode-content">
+								{t("logs.searchModeOptions.content")}
+							</DropdownMenuRadioItem>
+							<DropdownMenuRadioItem value="request_id" className="text-xs" data-testid="logs-search-mode-request-id">
+								{t("logs.searchModeOptions.request_id")}
+							</DropdownMenuRadioItem>
+						</DropdownMenuRadioGroup>
+					</DropdownMenuContent>
+				</DropdownMenu>
+			</div>
+
+			<DateTimePickerWithRange
+				className="flex-1 @4xl/logs-header:flex-none"
+				buttonClassName="w-full @4xl/logs-header:w-auto"
+				triggerTestId="filter-date-range"
+				dateTime={{ from: startTime, to: endTime }}
+				predefinedPeriod={period || undefined}
+				showTimezone
+				timezone={timezone}
+				onTimezoneChange={setTimezone}
+				onDateTimeUpdate={(p) => {
+					setStartTime(p.from);
+					setEndTime(p.to);
+					onPeriodChange(undefined, p.from, p.to);
+				}}
+				preDefinedPeriods={TIME_PERIODS}
+				onPredefinedPeriodChange={(periodValue) => {
+					if (!periodValue) return;
+					const { from, to } = getRangeForPeriod(periodValue);
+					setStartTime(from);
+					setEndTime(to);
+					// Relative period: store it in URL and update timestamps via parent
+					onPeriodChange(periodValue, from, to);
+				}}
+			/>
+			<DropdownMenu>
+				<DropdownMenuTrigger asChild>
+					<Button
+						variant="outline"
+						size="sm"
+						className="h-7.5 w-7.5"
+						aria-label={t("logs.moreActions")}
+						data-testid="logs-more-actions-btn"
+					>
+						<MoreVertical className="h-4 w-4" aria-hidden="true" />
+					</Button>
+				</DropdownMenuTrigger>
+				<DropdownMenuContent align="end" className="w-64">
+					<DropdownMenuItem className="cursor-pointer items-start" onSelect={() => setExportDialogOpen(true)} data-testid="logs-export-btn">
+						<Download className="mt-0.5" />
+						<div className="flex flex-col">
+							<span>{t("logs.export.exportCsv")}</span>
+							<span className="text-muted-foreground text-xs">{t("logs.export.menuDescription")}</span>
+						</div>
+					</DropdownMenuItem>
+				</DropdownMenuContent>
+			</DropdownMenu>
+			<ColumnConfigDropdown
+				entries={columnEntries}
+				labels={columnLabels}
+				onToggleVisibility={onToggleColumnVisibility}
+				onReset={onResetColumns}
+			/>
+
+			<LogsExportDialog
+				open={exportDialogOpen}
+				onOpenChange={setExportDialogOpen}
+				filters={filters}
+				currentPageLogs={currentPageLogs}
+				totalLogs={totalLogs}
+				sortBy={sortBy}
+				order={order}
+				grouped={grouped}
+			/>
+		</div>
+	);
+}

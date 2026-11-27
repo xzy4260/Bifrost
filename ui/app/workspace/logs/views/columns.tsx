@@ -1,0 +1,995 @@
+import { dateFnsLocale } from "@/lib/i18n/dateLocale";
+import { formatCost, formatLatency } from "@/app/workspace/dashboard/utils/chartUtils";
+import { AttributionCell } from "@/components/logAttributionCell";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdownMenu";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { TruncatedLabel } from "@/components/ui/truncatedLabel";
+import { ProviderIconType, RenderProviderIcon } from "@/lib/constants/icons";
+import {
+	getProviderLabel,
+	logAppDisplayName,
+	mapAppToClientApp,
+	mapUserAgentToApp,
+	ProviderName,
+	RequestTypeColors,
+	getRequestTypeLabel,
+	Status,
+	StatusBarColors,
+} from "@/lib/constants/logs";
+import {
+	ChatMessage,
+	ChatMessageContent,
+	DisplayLogEntry,
+	LLMUsage,
+	LogEntry,
+	ResponsesMessage,
+	ResponsesMessageContentBlock,
+} from "@/lib/types/logs";
+import { cn } from "@/lib/utils";
+import { formatCompactNumber } from "@/lib/utils/numbers";
+import { ColumnDef } from "@tanstack/react-table";
+import { showsPassthroughTag } from "../sheets/logDetailView.utils";
+import { PassthroughIcon } from "./passthroughTag";
+import { format, formatDistanceToNow } from "date-fns";
+import { ArrowUpDown, ChevronRight, Loader2, MoreHorizontal, Trash2 } from "lucide-react";
+import { type ReactNode, useState } from "react";
+import type { TFunction } from "i18next";
+import { useTranslation } from "react-i18next";
+import i18n from "@/lib/i18n";
+
+// Passed to useReactTable({ meta }) by the logs page so the expander column can
+// read/toggle chain expansion without threading props through column factories.
+export interface LogsTableMeta {
+	expandedChainIds: Set<string>;
+	loadingChainIds: Set<string>;
+	onToggleChain: (log: LogEntry) => void;
+	expandedSessionIds: Set<string>;
+	loadingSessionIds: Set<string>;
+	onToggleSession: (log: LogEntry) => void;
+}
+
+function batchAccountingDisplay(log: LogEntry): { model: string; usage: LLMUsage } | null {
+	const breakdowns = log.batch_debug?.accounting?.model_breakdowns;
+	if (!breakdowns) {
+		return null;
+	}
+	const entries = Object.values(breakdowns);
+	if (entries.length === 0) {
+		return null;
+	}
+	const model = entries.length === 1 ? entries[0].model : i18n.t("logs.batchMixedModel", { ns: "observability" });
+	const usage: LLMUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+	for (const entry of entries) {
+		usage.prompt_tokens = (usage.prompt_tokens ?? 0) + (entry.usage?.prompt_tokens ?? 0);
+		usage.completion_tokens = (usage.completion_tokens ?? 0) + (entry.usage?.completion_tokens ?? 0);
+		usage.total_tokens = (usage.total_tokens ?? 0) + (entry.usage?.total_tokens ?? 0);
+	}
+	if ((usage.total_tokens ?? 0) === 0) {
+		return null;
+	}
+	return { model, usage };
+}
+
+function LogActionsMenu({ log, onDelete }: { log: LogEntry; onDelete: (log: LogEntry) => void }) {
+	const { t } = useTranslation("observability");
+	const [isOpen, setIsOpen] = useState(false);
+
+	return (
+		<DropdownMenu open={isOpen} onOpenChange={setIsOpen}>
+			<DropdownMenuTrigger asChild onClick={(event) => event.stopPropagation()}>
+				<Button variant="ghost" size="icon" data-testid="log-actions-btn" aria-label={t("logs.logActions")} className="h-7 w-7">
+					<MoreHorizontal className="h-4 w-4" />
+				</Button>
+			</DropdownMenuTrigger>
+			<DropdownMenuContent align="end">
+				<DropdownMenuItem
+					variant="destructive"
+					className="cursor-pointer"
+					data-testid="log-delete-btn"
+					onSelect={(e) => {
+						e.preventDefault();
+						onDelete(log);
+						setIsOpen(false);
+					}}
+				>
+					<Trash2 className="h-4 w-4" />
+					{t("labels.delete")}
+				</DropdownMenuItem>
+			</DropdownMenuContent>
+		</DropdownMenu>
+	);
+}
+
+function formatToolCall(name?: string, args?: string): string {
+	if (!name) {
+		return "";
+	}
+	const argumentsText = args?.trim();
+	return argumentsText ? `${name}(${argumentsText})` : name;
+}
+
+function formatToolCalls(toolCalls?: ChatMessage["tool_calls"]): string {
+	return (toolCalls || [])
+		.map((toolCall) =>
+			toolCall?.function?.name
+				? formatToolCall(toolCall.function.name, toolCall.function.arguments)
+				: formatToolCall(toolCall?.custom?.name, toolCall?.custom?.input),
+		)
+		.filter(Boolean)
+		.join("\n");
+}
+
+function getAssistantToolCallSummary(log?: LogEntry): string {
+	const toolCalls = log?.output_message?.tool_calls || [];
+	if (toolCalls.length === 0) {
+		// Hybrid list rows carry only the denormalized names; the full calls live in the offloaded payload.
+		return (log?.tool_call_names || []).join("\n");
+	}
+	return formatToolCalls(toolCalls);
+}
+
+function getMessageFromContent(content?: ChatMessageContent): string {
+	if (content == undefined) {
+		return "";
+	}
+	if (typeof content === "string") {
+		return content;
+	}
+	let lastTextContentBlock = "";
+	for (const block of content) {
+		if ((block.type === "text" || block.type === "input_text" || block.type === "output_text") && block.text) {
+			lastTextContentBlock = block.text;
+		}
+	}
+	return lastTextContentBlock;
+}
+
+// The helpers below mirror BuildInputContentSummary in
+// framework/logstore/payload.go. Hybrid list rows arrive without history and
+// show its stored content_summary; full rows compute the preview here. Both
+// must use the same precedence: last user text, then the latest tool result or
+// tool call. Keep the two in sync.
+
+function getLastUserChatText(history: ChatMessage[]): string {
+	for (let i = history.length - 1; i >= 0; i--) {
+		if (history[i]?.role === "user") {
+			// Like findLastUserMessageIndex, only the last user message counts.
+			return getMessageFromContent(history[i].content);
+		}
+	}
+	return "";
+}
+
+function getLastChatToolSummary(history: ChatMessage[]): string {
+	for (let i = history.length - 1; i >= 0; i--) {
+		const message = history[i];
+		if (message?.role === "tool") {
+			const text = getMessageFromContent(message.content);
+			if (text) {
+				return text;
+			}
+			continue;
+		}
+		if (message?.role === "assistant") {
+			const calls = formatToolCalls(message.tool_calls);
+			if (calls) {
+				return calls;
+			}
+		}
+	}
+	return "";
+}
+
+// Returns string content, or the last non-empty text block.
+function getLastResponsesText(content?: string | ResponsesMessageContentBlock[]): string {
+	if (typeof content === "string") {
+		return content;
+	}
+	let lastText = "";
+	for (const block of content ?? []) {
+		if (block.text) {
+			lastText = block.text;
+		}
+	}
+	return lastText;
+}
+
+function getLastUserResponsesText(history: ResponsesMessage[]): string {
+	for (let i = history.length - 1; i >= 0; i--) {
+		if (history[i]?.role === "user") {
+			const text = getLastResponsesText(history[i].content);
+			if (text) {
+				return text;
+			}
+		}
+	}
+	return "";
+}
+
+function getLastResponsesToolSummary(history: ResponsesMessage[]): string {
+	for (let i = history.length - 1; i >= 0; i--) {
+		const message = history[i];
+		if (message?.type === "function_call_output") {
+			const output = Array.isArray(message.output) || typeof message.output === "string" ? message.output : undefined;
+			const text = getLastResponsesText(output);
+			if (text) {
+				return text;
+			}
+		} else if (message?.type === "function_call") {
+			const call = formatToolCall(message.name, message.arguments);
+			if (call) {
+				return call;
+			}
+		}
+	}
+	return "";
+}
+
+export function getRealtimeTurnMessages(log?: LogEntry): {
+	tool?: string;
+	user?: string;
+	assistant?: string;
+	assistantToolCall?: string;
+} {
+	const toolMessages = log?.input_history?.filter((message) => message.role === "tool") || [];
+	const userMessages = log?.input_history?.filter((message) => message.role === "user") || [];
+	return {
+		tool:
+			toolMessages
+				.map((m) => getMessageFromContent(m.content))
+				.filter(Boolean)
+				.join("\n") || "",
+		user:
+			userMessages
+				.map((m) => getMessageFromContent(m.content))
+				.filter(Boolean)
+				.join("\n") || "",
+		assistant: log?.output_message ? getMessageFromContent(log.output_message.content) : "",
+		assistantToolCall: getAssistantToolCallSummary(log),
+	};
+}
+
+export function getMessage(log?: LogEntry) {
+	if (log?.object === "list_models") {
+		return i18n.t("labels.nA", { ns: "observability" });
+	}
+	// A metadata lookup has no message body; keep the error summary when it failed.
+	if (log?.object === "model_retrieve") {
+		return log.content_summary || "N/A";
+	}
+	if (log?.object === "realtime.turn") {
+		const messages = getRealtimeTurnMessages(log);
+		const parts = [
+			messages.tool ? i18n.t("logs.realtime.toolResult", { ns: "observability", message: messages.tool }) : "",
+			messages.user ? i18n.t("logs.realtime.user", { ns: "observability", message: messages.user }) : "",
+			messages.assistantToolCall
+				? i18n.t("logs.realtime.assistantToolCall", { ns: "observability", message: messages.assistantToolCall })
+				: "",
+			messages.assistant ? i18n.t("logs.realtime.assistant", { ns: "observability", message: messages.assistant }) : "",
+		].filter(Boolean);
+		if (parts.length > 0) {
+			return parts.join("\n");
+		}
+		return "";
+	}
+	if (log?.input_history && log.input_history.length > 0) {
+		const history = log.input_history;
+		// The latest message's own text is only a last resort, for histories the
+		// stored summary leaves blank (no user text and no tool activity).
+		return (
+			getLastUserChatText(history) ||
+			getLastChatToolSummary(history) ||
+			getMessageFromContent(history[history.length - 1]?.content) ||
+			log.content_summary ||
+			""
+		);
+	} else if (log?.responses_input_history && log.responses_input_history.length > 0) {
+		const history = log.responses_input_history;
+		const summary = getLastUserResponsesText(history) || getLastResponsesToolSummary(history);
+		if (summary) {
+			return summary;
+		}
+		// Last resort, as for chat: the latest item's own text or screenshot.
+		const lastMessage = history[history.length - 1];
+		const lastText = getLastResponsesText(lastMessage?.content);
+		if (lastText) {
+			return lastText;
+		}
+		const output = lastMessage?.output;
+		if (output && typeof output === "object" && !Array.isArray(output) && output.type === "computer_screenshot" && output.image_url) {
+			return output.image_url;
+		}
+		return log.content_summary || "";
+	} else if (log?.output_message) {
+		return getMessageFromContent(log.output_message.content);
+	} else if (log?.speech_input) {
+		return log.speech_input.input;
+	} else if (log?.transcription_input) {
+		return i18n.t("logs.audioFile", { ns: "observability" });
+	} else if (log?.image_generation_input?.prompt) {
+		return log.image_generation_input.prompt;
+	}
+	const obj = log?.object as string | undefined;
+	if (obj === "image_edit" || obj === "image_edit_stream" || obj === "image_variation") {
+		return i18n.t("logs.imageFile", { ns: "observability" });
+	}
+	if (log?.content_summary) {
+		return log.content_summary;
+	}
+	return "";
+}
+
+export function LogMessageCell({
+	log,
+	contentClassName = "max-w-full",
+	compact = false,
+}: {
+	log: LogEntry;
+	contentClassName?: string;
+	/** Table rows are a fixed height, so a realtime turn's lines tighten to fit two of them instead of being cut mid-line. */
+	compact?: boolean;
+}) {
+	const { t } = useTranslation("observability");
+	const input = getMessage(log);
+	const isLargePayload = log.is_large_payload_request || log.is_large_payload_response;
+	const realtimeMessages = log.object === "realtime.turn" ? getRealtimeTurnMessages(log) : null;
+
+	return (
+		<div className="flex items-center gap-1.5">
+			{isLargePayload && (
+				<span
+					className="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-900/50 dark:text-amber-400"
+					title={t("logs.largePayloadTitle")}
+				>
+					LP
+				</span>
+			)}
+			{realtimeMessages &&
+			(realtimeMessages.tool || realtimeMessages.user || realtimeMessages.assistantToolCall || realtimeMessages.assistant) ? (
+				<div
+					className={cn(
+						contentClassName,
+						"font-mono font-normal",
+						compact ? "max-h-[30px] overflow-hidden text-[11px] leading-[15px]" : "text-sm leading-5",
+					)}
+				>
+					{realtimeMessages.tool ? (
+						<div className="truncate">{t("logs.realtime.toolResult", { message: realtimeMessages.tool })}</div>
+					) : null}
+					{realtimeMessages.user ? <div className="truncate">{t("logs.realtime.user", { message: realtimeMessages.user })}</div> : null}
+					{realtimeMessages.assistantToolCall ? (
+						<div className="truncate">{t("logs.realtime.assistantToolCall", { message: realtimeMessages.assistantToolCall })}</div>
+					) : null}
+					{realtimeMessages.assistant ? (
+						<div className="truncate">{t("logs.realtime.assistant", { message: realtimeMessages.assistant })}</div>
+					) : null}
+				</div>
+			) : (
+				<div className={cn(contentClassName, "truncate font-mono text-[12px] font-normal")}>
+					{input ||
+						(isLargePayload
+							? log.is_large_payload_request && log.is_large_payload_response
+								? t("logs.largePayloadRequestResponse")
+								: log.is_large_payload_request
+									? t("logs.largePayloadRequest")
+									: t("logs.largePayloadResponse")
+							: "-")}
+				</div>
+			)}
+		</div>
+	);
+}
+
+// The grouped view's first column says what each group is in words, since the
+// two groupings look alike but mean different things: a session is separate
+// requests sharing a session_id (counted as turns), a chain is one request's
+// fallback attempts linked by parent_request_id. A settled batch or video nests
+// its cost row the same way, so a chain under one is "linked", not "fallbacks".
+function chainSummary(log: LogEntry, count: number, t: TFunction<"observability">): string {
+	if (log.batch_debug || log.video_debug) return t("logs.tree.linkedCount", { count });
+	return t("logs.tree.fallbackCount", { count });
+}
+
+function nestedRowLabel(log: DisplayLogEntry, t: TFunction<"observability">): string {
+	if (log.__rowKind === "session-member") {
+		return log.__turn != null ? t("logs.tree.turnNumber", { turn: log.__turn }) : t("logs.tree.turn");
+	}
+	if (log.batch_debug?.accounting || log.video_debug?.accounting) return t("logs.tree.settledCostRow");
+	return log.fallback_index > 0 ? t("logs.tree.fallbackIndex", { index: log.fallback_index }) : t("logs.tree.linked");
+}
+
+// Tree geometry, in px from the cell's left edge. The trunk sits under the
+// top-level chevron; a session member's own chain hangs from a second trunk
+// under that member's chevron.
+const TREE_TRUNK_X = [11, 22] as const;
+
+// Draws the branch for a nested row: the trunk at its depth (cut at the middle
+// on the last sibling), a tick out to the label, and, under a session member
+// that is not last, the outer trunk carried through. Positioned against the
+// cell, which the logs table makes relative, so lines meet across rows.
+function TreeBranch({ log, opensChildren }: { log: DisplayLogEntry; opensChildren: boolean }) {
+	const depth = log.__depth ?? 1;
+	const x = TREE_TRUNK_X[depth - 1];
+	const line = "bg-border absolute";
+	return (
+		<>
+			{depth === 2 && !log.__parentIsLast && <span className={cn(line, "inset-y-0 w-px")} style={{ left: TREE_TRUNK_X[0] }} />}
+			<span className={cn(line, "top-0 w-px", log.__isLast ? "h-1/2" : "bottom-0")} style={{ left: x }} />
+			<span className={cn(line, "top-1/2 h-px w-1.5")} style={{ left: x }} />
+			{opensChildren && <span className={cn(line, "bottom-0 w-px")} style={{ left: TREE_TRUNK_X[1], top: "calc(50% + 9px)" }} />}
+		</>
+	);
+}
+
+function GroupToggle({
+	testId,
+	label,
+	ariaLabel,
+	tooltip,
+	isExpanded,
+	isLoading,
+	onToggle,
+	className,
+	stubX,
+}: {
+	stubX?: number;
+	testId: string;
+	label: ReactNode;
+	ariaLabel: string;
+	tooltip: string;
+	isExpanded: boolean;
+	isLoading: boolean;
+	onToggle: () => void;
+	className?: string;
+}) {
+	return (
+		<>
+			{/* Stub from under a top-level chevron down to its first child's branch. */}
+			{stubX != null && isExpanded && !isLoading && (
+				<span className="bg-border absolute bottom-0 w-px" style={{ left: stubX, top: "calc(50% + 9px)" }} />
+			)}
+			<Tooltip>
+				<TooltipTrigger asChild>
+					<button
+						type="button"
+						data-testid={testId}
+						aria-label={ariaLabel}
+						aria-expanded={isExpanded}
+						className={cn(
+							"hover:text-foreground relative flex h-full w-full cursor-pointer items-center gap-1 overflow-hidden text-[11px] whitespace-nowrap transition-colors",
+							isExpanded ? "text-foreground" : "text-muted-foreground",
+							className,
+						)}
+						onClick={(event) => {
+							event.stopPropagation();
+							onToggle();
+						}}
+					>
+						{isLoading ? (
+							<Loader2 className="size-3.5 shrink-0 animate-spin" />
+						) : (
+							<ChevronRight className={cn("size-3.5 shrink-0 transition-transform duration-150", isExpanded && "rotate-90")} />
+						)}
+						{label}
+					</button>
+				</TooltipTrigger>
+				<TooltipContent>{tooltip}</TooltipContent>
+			</Tooltip>
+		</>
+	);
+}
+
+// Cells shared with the other log tables (relay, MCP) so a latency, cost, time or
+// app value reads the same wherever it appears. Keep them pure presentational.
+
+export function LogTimeCell({ timestamp, testId = "logs-row-open-btn" }: { timestamp?: string | null; testId?: string }) {
+	const { t } = useTranslation("observability");
+	const date = timestamp ? new Date(timestamp) : null;
+	const isValid = date && date.toString() !== "Invalid Date";
+	if (!isValid) {
+		return <div className="truncate text-xs">{t("labels.nA")}</div>;
+	}
+	// The row opens the detail sheet on click, which a keyboard can't do. This
+	// button is that entry point: it has no handler of its own, so Enter and
+	// Space fire a click that bubbles to the cell's onRowClick.
+	return (
+		<button
+			type="button"
+			data-testid={testId}
+			aria-label={t("logs.tree.openLogDetails", {
+				time: format(date, "MMM dd HH:mm:ss", { locale: dateFnsLocale(i18n.resolvedLanguage) }),
+				relative: formatDistanceToNow(date, { addSuffix: true, locale: dateFnsLocale(i18n.resolvedLanguage) }),
+			})}
+			className="focus-visible:ring-ring flex cursor-pointer flex-col rounded-sm text-left leading-tight focus-visible:ring-2 focus-visible:outline-none"
+		>
+			<span className="font-mono text-xs tabular-nums">
+				{format(date, "MMM dd  HH:mm:ss", { locale: dateFnsLocale(i18n.resolvedLanguage) })}
+			</span>
+			<span className="text-muted-foreground text-[10.5px] tabular-nums">
+				{formatDistanceToNow(date, { addSuffix: true, locale: dateFnsLocale(i18n.resolvedLanguage) })}
+			</span>
+		</button>
+	);
+}
+
+export function LogLatencyCell({ latency }: { latency?: number | null }) {
+	const { t } = useTranslation("observability");
+	if (latency === undefined || latency === null) {
+		return <div className="pl-4 font-mono text-xs">{t("labels.nA")}</div>;
+	}
+	const tone = latency >= 5000 ? "bg-chart-error" : latency >= 2000 ? "bg-chart-warning" : "bg-chart-success";
+	const pct = Math.min(100, (latency / 5000) * 100);
+	return (
+		<div className="flex items-center gap-2 pl-4">
+			<span className="font-mono text-[12px] tabular-nums">{formatLatency(latency)}</span>
+			<div className="relative h-1.5 w-[56px] overflow-hidden rounded-sm bg-zinc-200 dark:bg-zinc-700">
+				<div className={cn("absolute inset-y-0 left-0 rounded-sm opacity-85", tone)} style={{ width: `${pct}%` }} />
+			</div>
+		</div>
+	);
+}
+
+export function LogCostCell({ cost, format = formatCost }: { cost?: number | null; format?: (cost: number) => string }) {
+	const { t } = useTranslation("observability");
+	if (cost == null) {
+		return <div className="pl-4 font-mono text-[12px]">{t("labels.nA")}</div>;
+	}
+	return <div className="pl-4 font-mono text-sm tabular-nums">{format(cost)}</div>;
+}
+
+export function LogAppCell({
+	app,
+	userAgent,
+	customAppIcons,
+}: {
+	app?: string | null;
+	userAgent?: string | null;
+	customAppIcons: Record<string, string>;
+}) {
+	const clientApp = app ? mapAppToClientApp(app) : mapUserAgentToApp(userAgent ?? undefined);
+	const icon = app ? customAppIcons[app] || clientApp.icon : clientApp.icon;
+	const label = logAppDisplayName(clientApp, userAgent ?? undefined);
+	return (
+		<div className="flex min-w-0 items-center gap-2" title={userAgent || undefined}>
+			{icon ? <img className="rounded-sm" src={icon} alt={label} width={20} height={20} loading="lazy" decoding="async" /> : null}
+			<span className="truncate text-[12px]">{label}</span>
+		</div>
+	);
+}
+
+export const createColumns = (
+	onDelete: (log: LogEntry) => void,
+	hasDeleteAccess = true,
+	metadataKeys: string[] = [],
+	customAppIcons: Record<string, string> = {},
+	groupedView = false,
+	onFilterBySessionId?: (sessionId: string) => void,
+	t: TFunction<"observability"> = i18n.getFixedT(null, "observability"),
+): ColumnDef<LogEntry>[] => {
+	// Expander for the grouped view. The control fills the cell, and the cell
+	// itself toggles rather than opening the sheet (see the logs page's
+	// onRowClick), so the whole column reads as one hit target.
+	const expandColumn: ColumnDef<LogEntry>[] = groupedView
+		? [
+				{
+					id: "expand",
+					header: "",
+					size: 90,
+					cell: ({ row, table }) => {
+						const meta = table.options.meta as LogsTableMeta | undefined;
+						const log = row.original as DisplayLogEntry;
+						if (log.__chainChild) {
+							const isSessionMember = log.__rowKind === "session-member";
+							const kindTestId = isSessionMember ? "log-row-kind-session" : "log-row-kind-chain";
+							const childCount = log.child_count ?? 0;
+							// A session member keeps its own chain toggle, so the tree can be
+							// walked a level deeper. Every other nested row is a leaf.
+							if (isSessionMember && childCount > 0 && meta) {
+								const isExpanded = meta.expandedChainIds.has(log.id);
+								return (
+									<div data-testid={kindTestId} className="h-full w-full">
+										<TreeBranch log={log} opensChildren={isExpanded && !meta.loadingChainIds.has(log.id)} />
+										<GroupToggle
+											testId="log-chain-expand-btn"
+											className="pl-[15px]"
+											label={
+												<span className="truncate">
+													{nestedRowLabel(log, t)}
+													<span className="text-muted-foreground/70 ml-1 tabular-nums">+{childCount}</span>
+												</span>
+											}
+											ariaLabel={
+												isExpanded
+													? t("logs.collapseFallbackChain")
+													: t("logs.tree.expandTurnChain", { summary: chainSummary(log, childCount, t) })
+											}
+											tooltip={t("logs.tree.turnChainTooltip", {
+												label: nestedRowLabel(log, t),
+												summary: chainSummary(log, childCount, t),
+											})}
+											isExpanded={isExpanded}
+											isLoading={meta.loadingChainIds.has(log.id)}
+											onToggle={() => meta.onToggleChain(log)}
+										/>
+									</div>
+								);
+							}
+							const depth = log.__depth ?? 1;
+							return (
+								<div
+									data-testid={kindTestId}
+									className="text-muted-foreground flex h-full w-full items-center overflow-hidden text-[11px] whitespace-nowrap"
+									style={{ paddingLeft: TREE_TRUNK_X[depth - 1] + 8 }}
+								>
+									<TreeBranch log={log} opensChildren={false} />
+									<span className="truncate">{nestedRowLabel(log, t)}</span>
+								</div>
+							);
+						}
+						if (!meta) return null;
+						// Session grouping wins on a top-level row: the session toggle
+						// lists the session's other requests and this row's own attempts
+						// together, so nothing becomes unreachable by taking this branch.
+						const sessionCount = log.session_child_count ?? 0;
+						if (sessionCount > 0) {
+							const isExpanded = meta.expandedSessionIds.has(log.id);
+							const others = t("logs.tree.moreRequests", { count: sessionCount });
+							return (
+								<GroupToggle
+									testId="log-session-expand-btn"
+									className="pl-1"
+									stubX={TREE_TRUNK_X[0]}
+									label={<span className="truncate tabular-nums">{t("logs.tree.sessionTurns", { count: sessionCount + 1 })}</span>}
+									ariaLabel={isExpanded ? t("logs.tree.collapseSession") : t("logs.tree.expandSession", { others })}
+									tooltip={t("logs.tree.sessionTooltip", {
+										total: sessionCount + 1,
+										others: t("logs.tree.otherRequests", { count: sessionCount }),
+									})}
+									isExpanded={isExpanded}
+									isLoading={meta.loadingSessionIds.has(log.id) || meta.loadingChainIds.has(log.id)}
+									onToggle={() => meta.onToggleSession(log)}
+								/>
+							);
+						}
+						const childCount = log.child_count ?? 0;
+						if (!childCount) return null;
+						const isExpanded = meta.expandedChainIds.has(log.id);
+						const summary = chainSummary(log, childCount, t);
+						return (
+							<GroupToggle
+								testId="log-chain-expand-btn"
+								className="pl-1"
+								stubX={TREE_TRUNK_X[0]}
+								label={<span className="truncate tabular-nums">{summary}</span>}
+								ariaLabel={isExpanded ? t("logs.collapseFallbackChain") : t("logs.tree.expandSummary", { summary })}
+								tooltip={
+									log.batch_debug || log.video_debug
+										? t("logs.tree.settledRowTooltip", { summary, count: childCount })
+										: t("logs.tree.chainTooltip", { summary })
+								}
+								isExpanded={isExpanded}
+								isLoading={meta.loadingChainIds.has(log.id)}
+								onToggle={() => meta.onToggleChain(log)}
+							/>
+						);
+					},
+				},
+			]
+		: [];
+
+	const baseColumns: ColumnDef<LogEntry>[] = [
+		{
+			accessorKey: "status",
+			header: "",
+			size: 8,
+			maxSize: 8,
+			cell: ({ row }) => {
+				const status = row.original.status as Status;
+				return <div className={`h-full min-h-[24px] w-1 rounded-sm ${StatusBarColors[status]}`} />;
+			},
+		},
+		{
+			accessorKey: "timestamp",
+			header: ({ column }) => (
+				<Button variant="ghost" data-testid="logs-time-sort-btn" onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}>
+					{t("labels.time")}
+					<ArrowUpDown className="ml-2 h-4 w-4" />
+				</Button>
+			),
+			size: 150,
+			cell: ({ row }) => <LogTimeCell timestamp={row.original.timestamp} />,
+		},
+		{
+			id: "request_type",
+			header: t("labels.type"),
+			size: 180,
+			cell: ({ row }) => {
+				return (
+					<Badge
+						variant="outline"
+						className={cn(
+							"font-mono text-[11px] py-0.5 px-1.5 uppercase",
+							RequestTypeColors[row.original.object as keyof typeof RequestTypeColors],
+						)}
+					>
+						{showsPassthroughTag(row.original) && <PassthroughIcon testId="logs-table-passthrough-tag" />}
+						{getRequestTypeLabel(row.original.object, t)}
+					</Badge>
+				);
+			},
+		},
+		{
+			id: "stop_reason",
+			header: t("logs.detail.stopReason"),
+			size: 150,
+			cell: ({ row }) => (
+				<TruncatedLabel className="font-mono text-xs" data-testid="logs-stop-reason-cell">
+					{row.original.stop_reason || "-"}
+				</TruncatedLabel>
+			),
+		},
+		{
+			accessorKey: "input",
+			header: t("labels.message"),
+			size: 350,
+			cell: ({ row }) => <LogMessageCell log={row.original} compact />,
+		},
+		{
+			accessorKey: "model",
+			header: t("labels.model"),
+			size: 280,
+			cell: ({ row }) => {
+				const provider = row.original.provider as ProviderName | undefined;
+				const model = row.original.model || batchAccountingDisplay(row.original)?.model;
+				const canonicalModel = row.original.canonical_model_name;
+				const modelLabel = canonicalModel && canonicalModel !== model ? `${canonicalModel} (${model})` : model;
+				return (
+					<div className="flex min-w-0 items-center gap-2">
+						{provider ? <RenderProviderIcon provider={provider as ProviderIconType} size="xs" /> : null}
+						<div className="flex min-w-0 flex-col leading-tight">
+							<TruncatedLabel truncateFrom="start" className="font-mono text-[12px]">
+								{modelLabel || t("labels.nA")}
+							</TruncatedLabel>
+							<span className="text-muted-foreground truncate text-[10.5px]">{provider ? getProviderLabel(provider) : t("labels.nA")}</span>
+						</div>
+					</div>
+				);
+			},
+		},
+		{
+			id: "app",
+			accessorKey: "app",
+			header: t("labels.app"),
+			size: 140,
+			cell: ({ row }) => <LogAppCell app={row.original.app} userAgent={row.original.user_agent} customAppIcons={customAppIcons} />,
+		},
+		{
+			id: "client_ip",
+			header: t("labels.clientIp"),
+			size: 150,
+			cell: ({ row }) => {
+				const clientIp = row.original.client_ip;
+				if (!clientIp) return <div className="font-mono text-xs">-</div>;
+				return (
+					<TruncatedLabel className="font-mono text-xs" data-testid="logs-client-ip-cell">
+						{clientIp}
+					</TruncatedLabel>
+				);
+			},
+		},
+		{
+			accessorKey: "latency",
+			header: ({ column }) => (
+				<Button variant="ghost" data-testid="logs-latency-sort-btn" onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}>
+					{t("labels.latency")}
+					<ArrowUpDown className="ml-2 h-4 w-4" />
+				</Button>
+			),
+			size: 170,
+			cell: ({ row }) => <LogLatencyCell latency={row.original.latency} />,
+		},
+		{
+			accessorKey: "tokens",
+			header: ({ column }) => (
+				<Button variant="ghost" data-testid="logs-tokens-sort-btn" onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}>
+					{t("labels.tokens")}
+					<ArrowUpDown className="ml-2 h-4 w-4" />
+				</Button>
+			),
+			size: 190,
+			cell: ({ row }) => {
+				const sessionCount = row.original.session_child_count ?? 0;
+				if (sessionCount > 0 && !(row.original as DisplayLogEntry).__chainChild) {
+					// Same two-line shape as a normal token cell: a collapsed session row
+					// has to be exactly as tall as the rows it expands into, or the table
+					// jumps every time one is opened.
+					return (
+						<Tooltip>
+							<TooltipTrigger asChild>
+								<div className="flex flex-col items-start gap-0.5 pl-4 leading-tight">
+									<span className="font-mono text-[12px] tabular-nums">{formatCompactNumber(row.original.session_total_tokens ?? 0)}</span>
+									<span className="text-muted-foreground font-mono text-[10.5px] tabular-nums">
+										{t("logs.tree.sessionRequests", { count: sessionCount + 1 })}
+									</span>
+								</div>
+							</TooltipTrigger>
+							<TooltipContent>{t("logs.tree.sessionTotalTooltip", { count: sessionCount + 1 })}</TooltipContent>
+						</Tooltip>
+					);
+				}
+				const tokenUsage = row.original.token_usage ?? batchAccountingDisplay(row.original)?.usage;
+				if (!tokenUsage) {
+					return <div className="pl-4 font-mono text-xs">{t("labels.nA")}</div>;
+				}
+				const prompt = tokenUsage.prompt_tokens ?? 0;
+				const completion = tokenUsage.completion_tokens ?? 0;
+				const total = tokenUsage.total_tokens ?? 0;
+				const hasSplit = tokenUsage.completion_tokens != null && tokenUsage.prompt_tokens != null;
+				const splitBase = prompt + completion || 1;
+				const inPct = (prompt / splitBase) * 100;
+				return (
+					<div className="flex flex-col items-start gap-0.5 pl-4 leading-tight">
+						<div className="flex items-center gap-2">
+							<span className="font-mono text-[12px] tabular-nums">{formatCompactNumber(total)}</span>
+							{hasSplit && (
+								<div className="flex h-1.5 w-[64px] overflow-hidden rounded-sm">
+									<div className="bg-blue-400" style={{ width: `${inPct}%` }} />
+									<div className="flex-1 bg-violet-400" />
+								</div>
+							)}
+						</div>
+						{hasSplit && (
+							<div className="text-muted-foreground font-mono text-[10.5px] tabular-nums">
+								<span className="text-blue-500">{formatCompactNumber(prompt)}</span>
+								<span> / </span>
+								<span className="text-violet-500">{formatCompactNumber(completion)}</span>
+							</div>
+						)}
+					</div>
+				);
+			},
+		},
+	];
+
+	const attributionColumns: ColumnDef<LogEntry>[] = [
+		{
+			id: "session",
+			header: t("labels.session"),
+			size: 170,
+			cell: ({ row }) => {
+				const sessionId = row.original.session_id;
+				if (!sessionId) return <div className="font-mono text-xs">-</div>;
+				if (!onFilterBySessionId) {
+					return <TruncatedLabel className="font-mono text-xs">{sessionId}</TruncatedLabel>;
+				}
+				return (
+					<button
+						type="button"
+						data-testid="log-session-filter-btn"
+						className="hover:text-foreground cursor-pointer text-left"
+						onClick={(event) => {
+							event.stopPropagation();
+							onFilterBySessionId(sessionId);
+						}}
+					>
+						<TruncatedLabel className="font-mono text-xs">{sessionId}</TruncatedLabel>
+					</button>
+				);
+			},
+		},
+		{
+			id: "service_tier",
+			header: t("labels.serviceTier"),
+			size: 130,
+			cell: ({ row }) => {
+				const tier = row.original.service_tier;
+				if (!tier) {
+					return <div className="font-mono text-xs">-</div>;
+				}
+				return (
+					<Badge variant="outline" className="px-1.5 py-0.5 font-mono text-[11px] uppercase">
+						{tier}
+					</Badge>
+				);
+			},
+		},
+		{
+			id: "virtual_key",
+			header: t("labels.virtualKey"),
+			size: 170,
+			cell: ({ row }) => <AttributionCell name={row.original.virtual_key_name} id={row.original.virtual_key_id} />,
+		},
+		{
+			id: "routing_rule",
+			header: t("labels.routingRule"),
+			size: 170,
+			cell: ({ row }) => <AttributionCell name={row.original.routing_rule_name} id={row.original.routing_rule_id} />,
+		},
+		{
+			id: "team",
+			header: t("labels.team"),
+			size: 150,
+			cell: ({ row }) => (
+				<AttributionCell
+					names={row.original.team_names}
+					name={row.original.team_name}
+					ids={row.original.team_ids}
+					id={row.original.team_id}
+				/>
+			),
+		},
+		{
+			id: "customer",
+			header: t("labels.customer"),
+			size: 150,
+			cell: ({ row }) => (
+				<AttributionCell
+					names={row.original.customer_names}
+					name={row.original.customer_name}
+					ids={row.original.customer_ids}
+					id={row.original.customer_id}
+				/>
+			),
+		},
+		{
+			id: "user",
+			header: t("labels.user"),
+			size: 150,
+			cell: ({ row }) => <AttributionCell name={row.original.user_name} id={row.original.user_id} />,
+		},
+		{
+			id: "business_unit",
+			header: t("labels.businessUnit"),
+			size: 150,
+			cell: ({ row }) => (
+				<AttributionCell
+					names={row.original.business_unit_names}
+					name={row.original.business_unit_name}
+					ids={row.original.business_unit_ids}
+					id={row.original.business_unit_id}
+				/>
+			),
+		},
+		{
+			id: "project",
+			header: t("labels.project"),
+			size: 150,
+			cell: ({ row }) => <AttributionCell name={row.original.project_name} id={row.original.project_id} />,
+		},
+	];
+
+	const metadataColumns: ColumnDef<LogEntry>[] = metadataKeys.map((key) => ({
+		id: `metadata_${key}`,
+		header: key.charAt(0).toUpperCase() + key.slice(1),
+		// Fit the header text, since keys like warp-conversation-id overflow a fixed width.
+		size: Math.min(280, Math.max(160, key.length * 8 + 48)),
+		cell: ({ row }) => {
+			const value = row.original.metadata?.[key];
+			// Metadata can contain nested JSON, including realtime input associations.
+			const label = value == null ? "-" : typeof value === "object" ? JSON.stringify(value) : String(value);
+			return <TruncatedLabel className="block font-mono text-xs">{label}</TruncatedLabel>;
+		},
+	}));
+
+	const actionsColumn: ColumnDef<LogEntry>[] = hasDeleteAccess
+		? [
+				{
+					id: "actions",
+					header: "",
+					size: 56,
+					cell: ({ row }) => {
+						const log = row.original;
+						return (
+							<div className="flex justify-center">
+								<LogActionsMenu log={log} onDelete={onDelete} />
+							</div>
+						);
+					},
+				},
+			]
+		: [];
+
+	return [...expandColumn, ...baseColumns, ...attributionColumns, ...metadataColumns, ...actionsColumn];
+};

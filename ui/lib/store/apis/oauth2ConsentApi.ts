@@ -1,0 +1,44 @@
+import { baseApi } from "./baseApi";
+
+export interface OAuth2ConsentFlowDetail {
+	redirect_uri: string;
+	redirect_host: string;
+	client_name: string;
+	// CIMD clients only.
+	client_host?: string;
+	localhost_only_redirect?: boolean;
+	available_modes: Array<"vk" | "session" | "user">;
+	logged_in_user?: { id: string; name?: string };
+	expires_at: string;
+}
+
+export type OAuth2ConsentSubmitRequest =
+	| {
+			mode: "vk" | "session" | "user";
+			value?: string; // VK plaintext for mode=vk; absent for session/user
+			user_code?: string; // the terminal's code; required to approve a device sign-in
+	  }
+	| { deny: true }; // refuse a device sign-in instead of approving it
+
+export interface OAuth2ConsentSubmitResponse {
+	redirect_url: string;
+}
+
+export const oauth2ConsentApi = baseApi.injectEndpoints({
+	endpoints: (builder) => ({
+		getOAuth2ConsentFlow: builder.query<OAuth2ConsentFlowDetail, string>({
+			query: (flowId) => ({
+				url: `/oauth2/consent/flows/${encodeURIComponent(flowId)}`,
+			}),
+		}),
+		submitOAuth2ConsentFlow: builder.mutation<OAuth2ConsentSubmitResponse, { flowId: string; body: OAuth2ConsentSubmitRequest }>({
+			query: ({ flowId, body }) => ({
+				url: `/oauth2/consent/flows/${encodeURIComponent(flowId)}`,
+				method: "PUT",
+				body,
+			}),
+		}),
+	}),
+});
+
+export const { useGetOAuth2ConsentFlowQuery, useSubmitOAuth2ConsentFlowMutation } = oauth2ConsentApi;

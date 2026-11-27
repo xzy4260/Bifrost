@@ -1,0 +1,382 @@
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { DottedSeparator } from "@/components/ui/separator";
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { Textarea } from "@/components/ui/textarea";
+import { RenderProviderIcon } from "@/lib/constants/icons";
+import { ProviderLabels, ProviderName } from "@/lib/constants/logs";
+import { getErrorMessage, ModelDetails, useUpsertModelCatalogEntriesMutation } from "@/lib/store";
+import { KnownProvider } from "@/lib/types/config";
+import { RbacOperation, RbacResource, useRbac } from "@enterprise/lib";
+import { Plus, RotateCcw, Trash2 } from "lucide-react";
+import { useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
+
+// Attributes the sheet owns as first-class fields, so they never appear as
+// generic rows.
+const RESERVED_ATTRIBUTES = new Set(["description", "context_window", "max_output_tokens"]);
+
+interface AttributeSheetProps {
+	model: ModelDetails;
+	onClose: () => void;
+}
+
+// Local row type for the extra-attributes editor. We keep these outside any
+// schema because empty rows are valid during editing — we filter them at
+// submit time. The id is a render-stable identifier (not persisted) so React
+// keeps DOM nodes pinned to the right row across add/remove.
+interface AttributeRow {
+	id: string;
+	key: string;
+	value: string;
+}
+
+let rowIdCounter = 0;
+function newRowId(): string {
+	if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+		return crypto.randomUUID();
+	}
+	rowIdCounter += 1;
+	return `row-${rowIdCounter}`;
+}
+
+function rowsFromAttributes(attrs?: Record<string, string>): AttributeRow[] {
+	if (!attrs) return [];
+	return Object.entries(attrs)
+		.filter(([k]) => !RESERVED_ATTRIBUTES.has(k))
+		.map(([key, value]) => ({ id: newRowId(), key, value }));
+}
+
+/** Renders a token count as a plain string for an input, blank when unset. */
+function countToInput(value?: number): string {
+	return value === undefined || value === null ? "" : String(value);
+}
+
+/**
+ * Parses an input back into a token count. Blank means "no override", and a
+ * non-numeric entry is kept as the raw string so the input still shows what the
+ * user typed until they fix it.
+ */
+function inputToCount(raw: string): number | undefined {
+	const trimmed = raw.trim();
+	if (trimmed === "") return undefined;
+	const parsed = Number(trimmed);
+	if (!Number.isFinite(parsed) || parsed < 0) return undefined;
+	return Math.round(parsed);
+}
+
+export default function AttributeSheet({ model, onClose }: AttributeSheetProps) {
+	const { t } = useTranslation("models");
+	const { t: tc } = useTranslation("common");
+	const [isOpen, setIsOpen] = useState(true);
+	const hasUpdateAccess = useRbac(RbacResource.ModelProvider, RbacOperation.Update);
+
+	const [upsertEntries, { isLoading }] = useUpsertModelCatalogEntriesMutation();
+
+	const initialDescription = model.additional_attributes?.description ?? "";
+	const [description, setDescription] = useState(initialDescription);
+
+	// The provider's own last answer, which the restore action puts back.
+	const originalContextWindow = model.original_context_length;
+	const originalMaxOutput = model.original_max_output_tokens;
+
+	// Overrides already pinned on the row, sent back untouched when their box is
+	// left alone.
+	const storedContextOverride = model.additional_attributes?.context_window;
+	const storedMaxOutputOverride = model.additional_attributes?.max_output_tokens;
+
+	const [contextWindow, setContextWindow] = useState(countToInput(model.context_length));
+	const [maxOutput, setMaxOutput] = useState(countToInput(model.max_output_tokens));
+	const initialContextInput = countToInput(model.context_length);
+	const initialMaxOutputInput = countToInput(model.max_output_tokens);
+
+	const initialRows = useMemo(() => rowsFromAttributes(model.additional_attributes), [model.additional_attributes]);
+	const stripIds = (rows: AttributeRow[]) => rows.map(({ key, value }) => ({ key, value }));
+	const [initialRowsKey] = useState(() => JSON.stringify(stripIds(initialRows)));
+	const [extraRows, setExtraRows] = useState<AttributeRow[]>(initialRows);
+
+	const rowsDirty = JSON.stringify(stripIds(extraRows)) !== initialRowsKey;
+
+	const contextValue = inputToCount(contextWindow);
+	const maxOutputValue = inputToCount(maxOutput);
+	const contextDirty = contextWindow !== initialContextInput;
+	const maxOutputDirty = maxOutput !== initialMaxOutputInput;
+	const isDirty = description !== initialDescription || rowsDirty || contextDirty || maxOutputDirty;
+
+	// Only offered when the provider reported a value and the current one is
+	// something else — restoring to a value we never got is meaningless.
+	const canRestoreContext = originalContextWindow !== undefined && contextValue !== originalContextWindow;
+	const canRestoreMaxOutput = originalMaxOutput !== undefined && maxOutputValue !== originalMaxOutput;
+
+	// Formatted once here so the sentence below takes plain strings.
+	const notProvided = t("modelCatalog.notProvided");
+	const reportedContext = originalContextWindow === undefined ? notProvided : originalContextWindow.toLocaleString();
+	const reportedOutput = originalMaxOutput === undefined ? notProvided : originalMaxOutput.toLocaleString();
+
+	const handleClose = () => {
+		setIsOpen(false);
+		setTimeout(() => onClose(), 150);
+	};
+
+	const handleAddRow = () => setExtraRows((prev) => [...prev, { id: newRowId(), key: "", value: "" }]);
+	const handleRowChange = (id: string, field: "key" | "value", val: string) =>
+		setExtraRows((prev) => prev.map((row) => (row.id === id ? { ...row, [field]: val } : row)));
+	const handleRemoveRow = (id: string) => setExtraRows((prev) => prev.filter((row) => row.id !== id));
+
+	const handleSubmit = async () => {
+		if (!hasUpdateAccess) {
+			toast.error(t("modelCatalog.noPermission"));
+			return;
+		}
+
+		// Validate that extra rows have non-empty keys when they have any value.
+		// Empty rows are fine — we drop them.
+		const cleaned = extraRows.map((r) => ({ key: r.key.trim(), value: r.value })).filter((r) => r.key !== "" || r.value !== "");
+		const missingKey = cleaned.find((r) => r.key === "");
+		if (missingKey) {
+			toast.error(t("modelCatalog.rowsNeedKey"));
+			return;
+		}
+		const dupKey = cleaned.find((r, i) => cleaned.findIndex((other) => other.key === r.key) !== i);
+		if (dupKey) {
+			toast.error(t("modelCatalog.duplicateKey", { key: dupKey.key }));
+			return;
+		}
+		// The first-class fields above own these keys.
+		const reservedClash = cleaned.find((r) => RESERVED_ATTRIBUTES.has(r.key));
+		if (reservedClash) {
+			toast.error(t("modelCatalog.descriptionReserved"));
+			return;
+		}
+
+		const attributes: Record<string, string> = {};
+		const desc = description.trim();
+		if (desc !== "") attributes.description = desc;
+		for (const r of cleaned) attributes[r.key] = r.value;
+
+		// An override is stored only while it differs from what the row showed on
+		// open. Leaving a box untouched keeps whatever was stored, so a value
+		// pinned earlier survives the next list refresh; clearing the box drops
+		// the override and lets the row fall back to the provider's number.
+		const untouchedContext = contextWindow === countToInput(model.context_length);
+		const untouchedMaxOutput = maxOutput === countToInput(model.max_output_tokens);
+		if (untouchedContext) {
+			if (storedContextOverride !== undefined) attributes.context_window = storedContextOverride;
+		} else if (contextValue !== undefined) {
+			attributes.context_window = String(contextValue);
+		}
+		if (untouchedMaxOutput) {
+			if (storedMaxOutputOverride !== undefined) attributes.max_output_tokens = storedMaxOutputOverride;
+		} else if (maxOutputValue !== undefined) {
+			attributes.max_output_tokens = String(maxOutputValue);
+		}
+
+		try {
+			await upsertEntries([
+				{
+					model: model.name,
+					provider: model.provider,
+					additional_attributes: Object.keys(attributes).length > 0 ? attributes : undefined,
+				},
+			]).unwrap();
+			toast.success(t("modelCatalog.attributesSaved"));
+			handleClose();
+		} catch (err) {
+			toast.error(getErrorMessage(err));
+		}
+	};
+
+	return (
+		<Sheet open={isOpen} onOpenChange={(open) => !open && handleClose()}>
+			<SheetContent
+				className="flex w-full flex-col overflow-x-hidden pt-4"
+				onInteractOutside={(e) => {
+					if (isDirty) e.preventDefault();
+				}}
+				onEscapeKeyDown={(e) => {
+					if (isDirty) e.preventDefault();
+				}}
+				data-testid="model-catalog-attribute-sheet"
+			>
+				<SheetHeader className="flex flex-col items-start p-0 py-4" headerClassName="mb-0 sticky -top-4 bg-card z-10 px-4 md:px-8">
+					<SheetTitle>{t("modelCatalog.editAttributes")}</SheetTitle>
+					<SheetDescription>{t("modelCatalog.sheetDescription")}</SheetDescription>
+				</SheetHeader>
+
+				<div className="flex h-full flex-col gap-6">
+					<div className="grow space-y-4 px-4 md:px-8">
+						{/* Read-only provider / model header */}
+						<div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+							<div>
+								<Label className="text-sm font-medium">{t("modelCatalog.provider")}</Label>
+								<div className="bg-muted/30 mt-2 flex items-center gap-2 rounded-sm border px-3 py-2 text-sm">
+									<RenderProviderIcon provider={model.provider as KnownProvider} size="sm" className="h-4 w-4" />
+									<span>{ProviderLabels[model.provider as ProviderName] || model.provider}</span>
+								</div>
+							</div>
+							<div>
+								<Label className="text-sm font-medium">{t("modelCatalog.model")}</Label>
+								<div className="bg-muted/30 mt-2 rounded-sm border px-3 py-2 font-mono text-sm">{model.name}</div>
+							</div>
+						</div>
+
+						<DottedSeparator />
+
+						{/* Context window / max output, with a restore to the provider's own value */}
+						<div className="space-y-3">
+							<Label className="text-sm font-medium">{t("modelCatalog.modelLimits")}</Label>
+							<div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+								<div>
+									<Label htmlFor="model-catalog-context-window" className="text-muted-foreground text-xs">
+										{t("modelCatalog.contextWindow")}
+									</Label>
+									<div className="mt-1 flex items-center gap-2">
+										<Input
+											id="model-catalog-context-window"
+											type="number"
+											min={0}
+											value={contextWindow}
+											onChange={(e) => setContextWindow(e.target.value)}
+											placeholder={t("modelCatalog.notProvided")}
+											data-testid="model-catalog-context-window-input"
+										/>
+										{canRestoreContext && (
+											<Button
+												type="button"
+												variant="outline"
+												size="sm"
+												onClick={() => setContextWindow(countToInput(originalContextWindow))}
+												title={t("modelCatalog.restoreTitle", { value: originalContextWindow })}
+												data-testid="model-catalog-context-window-restore"
+											>
+												<RotateCcw className="mr-1 h-3 w-3" />
+												{t("modelCatalog.restore")}
+											</Button>
+										)}
+									</div>
+								</div>
+								<div>
+									<Label htmlFor="model-catalog-max-output" className="text-muted-foreground text-xs">
+										{t("modelCatalog.maxOutputTokens")}
+									</Label>
+									<div className="mt-1 flex items-center gap-2">
+										<Input
+											id="model-catalog-max-output"
+											type="number"
+											min={0}
+											value={maxOutput}
+											onChange={(e) => setMaxOutput(e.target.value)}
+											placeholder={t("modelCatalog.notProvided")}
+											data-testid="model-catalog-max-output-input"
+										/>
+										{canRestoreMaxOutput && (
+											<Button
+												type="button"
+												variant="outline"
+												size="sm"
+												onClick={() => setMaxOutput(countToInput(originalMaxOutput))}
+												title={t("modelCatalog.restoreTitle", { value: originalMaxOutput })}
+												data-testid="model-catalog-max-output-restore"
+											>
+												<RotateCcw className="mr-1 h-3 w-3" />
+												{t("modelCatalog.restore")}
+											</Button>
+										)}
+									</div>
+								</div>
+							</div>
+							{(originalContextWindow !== undefined || originalMaxOutput !== undefined) && (
+								<p className="text-muted-foreground text-xs" data-testid="model-catalog-provider-reported">
+									{t("modelCatalog.providerReported", {
+										window: reportedContext,
+										output: reportedOutput,
+									})}
+								</p>
+							)}
+						</div>
+
+						<DottedSeparator />
+
+						{/* Description */}
+						<div>
+							<Label className="text-sm font-medium">{t("modelCatalog.description")}</Label>
+							<Textarea
+								className="mt-2"
+								value={description}
+								onChange={(e) => setDescription(e.target.value)}
+								rows={4}
+								placeholder={t("modelCatalog.descriptionPlaceholder")}
+								data-testid="model-catalog-description-textarea"
+							/>
+						</div>
+
+						<DottedSeparator />
+
+						{/* Other attributes */}
+						<div className="space-y-3">
+							<div className="flex items-center justify-between">
+								<Label className="text-sm font-medium">{t("modelCatalog.otherAttributes")}</Label>
+								<Button type="button" variant="outline" size="sm" onClick={handleAddRow} data-testid="model-catalog-add-attribute-row">
+									<Plus className="mr-1 h-3 w-3" />
+									{t("modelCatalog.add")}
+								</Button>
+							</div>
+							{extraRows.length === 0 ? (
+								<p className="text-muted-foreground text-xs">{t("modelCatalog.noExtraAttributes")}</p>
+							) : (
+								<div className="space-y-2">
+									{extraRows.map((row, i) => (
+										<div key={row.id} className="flex items-start gap-2">
+											<Input
+												value={row.key}
+												onChange={(e) => handleRowChange(row.id, "key", e.target.value)}
+												placeholder={t("modelCatalog.attributeKeyPlaceholder")}
+												className="flex-1"
+												data-testid={`model-catalog-attribute-key-${i}`}
+											/>
+											<Input
+												value={row.value}
+												onChange={(e) => handleRowChange(row.id, "value", e.target.value)}
+												placeholder={t("modelCatalog.attributeValuePlaceholder")}
+												className="flex-1"
+												data-testid={`model-catalog-attribute-value-${i}`}
+											/>
+											<Button
+												type="button"
+												variant="ghost"
+												size="icon"
+												onClick={() => handleRemoveRow(row.id)}
+												data-testid={`model-catalog-attribute-remove-${i}`}
+											>
+												<Trash2 className="h-4 w-4" />
+											</Button>
+										</div>
+									))}
+								</div>
+							)}
+						</div>
+					</div>
+
+					<div className="bg-card sticky bottom-0 shrink-0 border-t px-4 py-4 md:px-8">
+						<div className="flex items-center justify-end gap-3">
+							{!hasUpdateAccess && <p className="text-destructive text-sm">{t("modelCatalog.noPermission")}</p>}
+							<Button type="button" variant="outline" onClick={handleClose} data-testid="model-catalog-attribute-cancel">
+								{tc("cancel")}
+							</Button>
+							<Button
+								type="button"
+								onClick={handleSubmit}
+								disabled={isLoading || !isDirty || !hasUpdateAccess}
+								data-testid="model-catalog-attribute-submit"
+							>
+								{isLoading ? t("modelCatalog.saving") : t("modelCatalog.saveChanges")}
+							</Button>
+						</div>
+					</div>
+				</div>
+			</SheetContent>
+		</Sheet>
+	);
+}

@@ -1,0 +1,2175 @@
+package mcp
+
+import (
+	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"maps"
+	"net"
+	"net/url"
+	"regexp"
+	"slices"
+	"strings"
+	"time"
+	"unicode"
+
+	"github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/client/transport"
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
+)
+
+// computeDiscoveryHash hashes a discovery so an identical rediscovery does not re-fire the change
+// callback. json.Marshal sorts map keys, so the hash is deterministic; marshal errors never match.
+func computeDiscoveryHash(discovery *schemas.MCPDiscovery) string {
+	h := sha256.New()
+	if data, err := json.Marshal(discovery.Tools); err == nil {
+		h.Write(data)
+	}
+	h.Write([]byte{0})
+	// ChatTool's JSON leaves annotations and metadata out.
+	if data, err := json.Marshal(schemas.ToolDetails(discovery.Tools)); err == nil {
+		h.Write(data)
+	}
+	// Hashed too, so a change to only these still fires the callback.
+	h.Write([]byte{0})
+	h.Write([]byte(discovery.Instructions))
+	for _, list := range []any{discovery.Resources, discovery.ResourceTemplates, discovery.Prompts} {
+		h.Write([]byte{0})
+		if data, err := json.Marshal(list); err == nil {
+			h.Write(data)
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// RetryConfig defines the retry behavior with exponential backoff
+type RetryConfig struct {
+	MaxRetries     int           // Maximum number of retry attempts (not including the initial attempt)
+	InitialBackoff time.Duration // Initial backoff duration
+	MaxBackoff     time.Duration // Maximum backoff duration
+	// IsRetryable classifies an attempt's error as worth retrying or not.
+	// Nil defaults to isTransientError (connect-shaped: unrecognized errors
+	// default to retryable). ToolCallRetryConfig overrides this with
+	// isTransientToolCallError (the opposite default — see its doc comment).
+	IsRetryable func(error) bool
+}
+
+// ConnectRetryConfig backs every connection-establishment step — the shared
+// persistent dial (connectToMCPClient) and the ephemeral per-call connect
+// (AcquireClientConn's per-user/per-call branch) alike. Nothing user-facing
+// is blocked synchronously on this in the shared case, and in the per-call
+// case it's a one-time cost paid before the tool call runs — generous
+// retries are the right tradeoff here.
+var ConnectRetryConfig = RetryConfig{
+	MaxRetries:     5,
+	InitialBackoff: 1 * time.Second,
+	MaxBackoff:     30 * time.Second,
+}
+
+// PerCallConnectRetryConfig backs the ephemeral per-call connect+init steps
+// (AcquireClientConn's per-user/per-call branch) — distinct from both of the
+// other two configs, not a reuse of either. It runs synchronously in front
+// of a live tool call with no separate budget wrapper (unlike
+// ConnectRetryConfig's shared dial, mostly background/setup), so it can't
+// afford ConnectRetryConfig's full ~31s-worst-case schedule. But establishing
+// a connection has no side effects on the upstream — safe to retry harder
+// than the tool call that follows it, which might not be idempotent — so
+// it's more generous than ToolCallRetryConfig, not just a copy of it.
+var PerCallConnectRetryConfig = RetryConfig{
+	MaxRetries:     3,
+	InitialBackoff: 250 * time.Millisecond,
+	MaxBackoff:     1 * time.Second,
+}
+
+// ProbeRetryConfig backs the periodic connection checker's own
+// heartbeat/list_tools calls (ClientConnectionChecker). Nothing is waiting
+// synchronously on this — it's a background tick — but it now carries more
+// weight than it used to: with no outer consecutive-failure counter behind
+// it, a single check's own retry-with-backoff is what absorbs an ordinary
+// transient blip before the client is marked Unstable at all. Generous
+// enough for that, short of ConnectRetryConfig's full schedule.
+var ProbeRetryConfig = RetryConfig{
+	MaxRetries:     3,
+	InitialBackoff: 500 * time.Millisecond,
+	MaxBackoff:     4 * time.Second,
+	IsRetryable:    isTransientProbeError,
+}
+
+// ToolCallRetryConfig backs the live tool-call invocation itself
+// (executeToolInternal's CallTool). Deliberately the lightest of the three —
+// a caller is waiting synchronously on this, and unlike a bare connect, the
+// call itself may not be safe to retry blindly (non-idempotent tools), so it
+// trades retry depth for latency: a couple of quick attempts to ride out a
+// genuine blip, nothing more. Uses isTransientToolCallError, not the default
+// isTransientError, so an unrecognized (likely application-level) failure
+// is never retried — see that function's doc comment.
+var ToolCallRetryConfig = RetryConfig{
+	MaxRetries:     2,
+	InitialBackoff: 200 * time.Millisecond,
+	MaxBackoff:     200 * time.Millisecond,
+	IsRetryable:    isTransientToolCallError,
+}
+
+// GetClientForTool safely finds the client that serves the specified tool to
+// the caller on ctx. Every tool is named "<client>-<tool>" and a validated
+// client name has no hyphen, so the client is the one named by the text before
+// the first hyphen. A name that skipped validation and holds a hyphen falls
+// back to the longest name that, followed by the separator, starts the tool
+// name. The tool must then be in the discovery the caller sees for that client
+// (its own, for a client with per_user_discovery on).
+// Returns a copy of the client state together with the discovery the tool
+// was resolved from.
+// Callers should be aware that fields like Conn are still shared references
+// and may be modified by other goroutines, but the struct itself is safe
+// from concurrent modification.
+func (m *MCPManager) GetClientForTool(ctx context.Context, toolName string) (*schemas.MCPClientState, *schemas.MCPDiscovery) {
+	firstHyphen := strings.IndexByte(toolName, '-')
+	if firstHyphen <= 0 {
+		return nil, nil
+	}
+	m.mu.RLock()
+	var match *schemas.MCPClientState
+	for _, client := range m.clientMap {
+		if client.ExecutionConfig == nil {
+			continue
+		}
+		name := client.ExecutionConfig.Name
+		if len(name) == firstHyphen && toolName[:firstHyphen] == name {
+			match = client
+			break
+		}
+		if len(name) > firstHyphen && len(toolName) > len(name) && toolName[len(name)] == '-' && strings.HasPrefix(toolName, name) &&
+			(match == nil || len(name) > len(match.ExecutionConfig.Name)) {
+			match = client
+		}
+	}
+	var clientCopy *schemas.MCPClientState
+	if match != nil {
+		// Return a copy to prevent TOCTOU race conditions
+		snapshot := *match
+		clientCopy = &snapshot
+	}
+	m.mu.RUnlock()
+	if clientCopy == nil {
+		return nil, nil
+	}
+	// Read outside m.mu: a per-user store may read through to a database.
+	discovery := m.discoveryStore.GetDiscovery(ctx, clientCopy.ExecutionConfig)
+	if _, ok := discovery.GetTools()[toolName]; !ok {
+		return nil, nil
+	}
+	return clientCopy, discovery
+}
+
+// GetCallerDiscovery returns what the caller on ctx sees of the clients (see
+// CallerDiscovery), collecting the instructions only when withInstructions is set.
+// A request takes its tools, connect tools and instructions from one
+// CallerDiscovery, so each client's discovery is read once per request.
+func (m *MCPManager) GetCallerDiscovery(ctx context.Context, withInstructions bool) CallerDiscovery {
+	return m.resolveCallerDiscovery(ctx, true, withInstructions)
+}
+
+// GetToolPerClient returns all tools from connected MCP clients.
+// Applies client filtering if specified in the context.
+// Returns a map of client name to its available tools.
+// Parameters:
+//   - ctx: Execution context
+//
+// Returns:
+//   - map[string][]schemas.ChatTool: Map of client name to its available tools
+func (m *MCPManager) GetToolPerClient(ctx context.Context) map[string][]schemas.ChatTool {
+	return m.resolveCallerDiscovery(ctx, false, false).ToolsPerClient
+}
+
+// resolveCallerDiscovery builds the caller's CallerDiscovery, with its connect
+// tools when withConnect is set and its instructions when withInstructions is set.
+func (m *MCPManager) resolveCallerDiscovery(ctx context.Context, withConnect, withInstructions bool) CallerDiscovery {
+	var includeClients []string
+	appTools := listsAppTools(ctx)
+
+	// Extract client filtering from request context
+	if existingIncludeClients, ok := ctx.Value(schemas.MCPContextKeyIncludeClients).([]string); ok && existingIncludeClients != nil {
+		includeClients = existingIncludeClients
+	}
+
+	// Snapshot the clients under the lock, then resolve discoveries outside
+	// it: a ctx-aware discovery store may read through to slower backing, which
+	// must not run under m.mu.
+	m.mu.RLock()
+	m.logger.Debug("%s GetToolPerClient: Total clients in manager: %d, Filter: %v", MCPLogPrefix, len(m.clientMap), includeClients)
+
+	// Collect and sort client names for deterministic tool ordering
+	clientNames := make([]string, 0, len(m.clientMap))
+	clientsByName := make(map[string]*schemas.MCPClientState, len(m.clientMap))
+	for _, client := range m.clientMap {
+		name := client.ExecutionConfig.Name
+		clientNames = append(clientNames, name)
+		snapshot := *client
+		clientsByName[name] = &snapshot
+	}
+	m.mu.RUnlock()
+	slices.Sort(clientNames)
+
+	// A caller with no user or virtual-key identity is offered no connect tool
+	// (see connectCaller).
+	offerConnect := withConnect && connectCaller(ctx)
+	result := CallerDiscovery{ToolsPerClient: make(map[string][]schemas.ChatTool)}
+	for _, clientName := range clientNames {
+		client := clientsByName[clientName]
+		clientID := client.ExecutionConfig.ID
+
+		m.logger.Debug("%s Evaluating client %s (ID: %s) for tools", MCPLogPrefix, clientName, clientID)
+
+		// Skip intentionally disabled clients, and per-caller clients awaiting admin verification
+		if withheldFromCallers(client.State, client.ExecutionConfig) {
+			m.logger.Debug("%s Skipping MCP client %s: disabled or awaiting admin verification", MCPLogPrefix, clientName)
+			continue
+		}
+
+		// Apply client filtering logic - check both ID and Name for compatibility
+		if !shouldIncludeClient(clientName, includeClients, m.logger) {
+			m.logger.Debug("%s Skipping MCP client %s: not in include clients list", MCPLogPrefix, clientName)
+			continue
+		}
+
+		// The caller's discovery for this client, read once for its tools, its
+		// connect tool and its instructions, outside m.mu (see the snapshot
+		// comment above).
+		discovery := m.discoveryStore.GetDiscovery(ctx, client.ExecutionConfig)
+		toolMap := discovery.GetTools()
+
+		// Collect and sort tool names for deterministic ordering
+		toolNames := make([]string, 0, len(toolMap))
+		for toolName := range toolMap {
+			toolNames = append(toolNames, toolName)
+		}
+		slices.Sort(toolNames)
+
+		// FILTERING HIERARCHY (restrictive, not permissive):
+		// 1. Client-level configuration (ToolsToExecute) - Global allow-list, most restrictive
+		// 2. Request context (MCPContextKeyIncludeTools) - Can only further narrow, not expand
+		// 3. MCP Apps visibility - app-only tools only for callers AppToolsAllowed admits
+		// Context filtering CANNOT override client configuration - it can only be more restrictive.
+		// The names kept are gathered first, so the tools are copied once into a
+		// slice of exactly their count instead of being grown one by one.
+		kept := toolNames[:0]
+		for _, toolName := range toolNames {
+			// First check: Client configuration is the global allow-list
+			// If client config blocks a tool, it CANNOT be overridden by context
+			if shouldSkipToolForConfig(toolName, client.ExecutionConfig) {
+				continue
+			}
+
+			// Second check: Request context can further narrow the allowed tools
+			// Context can only restrict, not expand beyond client configuration
+			if shouldSkipToolForRequest(ctx, clientName, toolName) {
+				continue
+			}
+
+			// Third check: app-only MCP Apps tools need a caller AppToolsAllowed admits
+			if !appTools && !toolMap[toolName].MCP.ModelVisible() {
+				continue
+			}
+
+			kept = append(kept, toolName)
+		}
+		if len(kept) > 0 {
+			clientTools := make([]schemas.ChatTool, len(kept))
+			for i, toolName := range kept {
+				clientTools[i] = toolMap[toolName]
+			}
+			result.ToolsPerClient[clientName] = clientTools
+			m.logger.Debug("%s Added %d tools for MCP client %s", MCPLogPrefix, len(clientTools), clientName)
+
+			// A client with a visible tool is one the caller can reach, so its
+			// instructions apply. A code mode client's ride in its stub instead
+			// (see GetAggregatedServerInstructions for the scoping rule).
+			if withInstructions && !client.ExecutionConfig.CodeModeFor(ctx) {
+				if instructions := discovery.GetInstructions(); instructions != "" {
+					if result.Instructions == nil {
+						result.Instructions = make([]schemas.MCPServerInstructions, 0, len(clientNames))
+					}
+					result.Instructions = append(result.Instructions, schemas.MCPServerInstructions{
+						ClientName:   clientName,
+						Instructions: instructions,
+						MaxLength:    client.ExecutionConfig.MaxInstructionsLength,
+					})
+				}
+			}
+		}
+
+		if offerConnect && discovery == nil && perUserDiscoveryOn(client.ExecutionConfig) && connectAccessible(ctx, client, m.logger) {
+			result.ConnectTools = append(result.ConnectTools, connectTool(client.ExecutionConfig))
+		}
+	}
+	return result
+}
+
+// GetClientByName returns a client by name. The snapshot carries connection
+// state only; tools and instructions live in the manager's discovery store
+// (DiscoveryStore()).
+//
+// Parameters:
+//   - clientName: Name of the client to get
+//
+// Returns:
+//   - *schemas.MCPClientState: Client state if found, nil otherwise
+func (m *MCPManager) GetClientByName(clientName string) *schemas.MCPClientState {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	m.logger.Debug("%s GetClientByName: Looking for client '%s' among %d clients", MCPLogPrefix, clientName, len(m.clientMap))
+	for _, client := range m.clientMap {
+		m.logger.Debug("%s Checking client with Name: %s, ID: %s", MCPLogPrefix, client.ExecutionConfig.Name, client.ExecutionConfig.ID)
+		if client.ExecutionConfig.Name == clientName {
+			// Return a copy to prevent TOCTOU race conditions
+			// The caller receives a snapshot of the client state at this point in time
+			m.logger.Debug("%s Found client '%s' with IsCodeModeClient=%v", MCPLogPrefix, clientName, client.ExecutionConfig.IsCodeModeClient)
+			clientCopy := *client
+			return &clientCopy
+		}
+	}
+	m.logger.Debug("%s Client '%s' not found", MCPLogPrefix, clientName)
+	return nil
+}
+
+// GetInjectedTool resolves a provider-injected tool by client name and unprefixed tool
+// name, returning a copy whose function name carries the "<client>-" prefix. The tool
+// is read from the caller's discovery on ctx, the same one execution later resolves
+// the call through (see GetClientForTool).
+//
+// It deliberately skips tools_to_execute and the request include lists that
+// GetToolPerClient applies: the provider config is the authorization. Only a client
+// that is missing or disabled, a tool the client does not expose, or an app-only tool is refused.
+func (m *MCPManager) GetInjectedTool(ctx context.Context, clientName, toolName string) (schemas.ChatTool, error) {
+	// Find the client under the lock, then read its tools outside it: a ctx-aware
+	// discovery store may read through to slower backing, which must not run under m.mu.
+	var config *schemas.MCPClientConfig
+	var disabled bool
+	m.mu.RLock()
+	for _, client := range m.clientMap {
+		if client.ExecutionConfig == nil || client.ExecutionConfig.Name != clientName {
+			continue
+		}
+		config = client.ExecutionConfig
+		disabled = client.State == schemas.MCPConnectionStateDisabled
+		break
+	}
+	m.mu.RUnlock()
+	if config == nil {
+		return schemas.ChatTool{}, fmt.Errorf("mcp client %q not found", clientName)
+	}
+	if disabled {
+		return schemas.ChatTool{}, fmt.Errorf("mcp client %q is disabled", clientName)
+	}
+	tool, ok := m.discoveryStore.GetDiscovery(ctx, config).GetTools()[clientName+"-"+toolName]
+	if !ok {
+		return schemas.ChatTool{}, fmt.Errorf("mcp client %q does not expose tool %q", clientName, toolName)
+	}
+	if !tool.MCP.ModelVisible() {
+		return schemas.ChatTool{}, fmt.Errorf("mcp client %q tool %q is only callable from an MCP App", clientName, toolName)
+	}
+	// A deep copy: the caller owns the returned schema, and an edit to it must never
+	// reach the stored definition every later request is built from.
+	return schemas.DeepCopyChatTool(tool), nil
+}
+
+// GetMaxAgentDepth returns the configured cap on model turns in a tool loop
+// (mcp_agent_depth), shared by agent mode and provider-injected tools.
+func (m *MCPManager) GetMaxAgentDepth() int {
+	if m.toolsManager == nil {
+		return schemas.DefaultMaxAgentDepth
+	}
+	return int(m.toolsManager.maxAgentDepth.Load())
+}
+
+// misconfiguredError marks a connect failure caused by the client's own
+// configuration: the same configuration fails the same way on every attempt,
+// so the connect classifiers never retry it. Its text is the wrapped error's.
+type misconfiguredError struct{ err error }
+
+// Error returns the wrapped error's text unchanged.
+func (e misconfiguredError) Error() string { return e.err.Error() }
+
+// Unwrap exposes the wrapped error to errors.Is and errors.As.
+func (e misconfiguredError) Unwrap() error { return e.err }
+
+// isPermanentConnectError reports connect failures that no retry can fix: a
+// misconfigured client, an upstream speaking only protocol versions this client
+// does not support, and a server certificate this client does not trust. Each
+// is matched by type, so it holds through any wrapping that keeps the chain.
+func isPermanentConnectError(err error) bool {
+	if _, ok := errors.AsType[misconfiguredError](err); ok {
+		return true
+	}
+	if _, ok := errors.AsType[mcp.UnsupportedProtocolVersionError](err); ok {
+		return true
+	}
+	if _, ok := errors.AsType[*tls.CertificateVerificationError](err); ok {
+		return true
+	}
+	return false
+}
+
+// validateMCPTLSConfig refuses a ca_cert_pem that does not parse, the check
+// every dial makes, so the client is refused when it is added or edited
+// instead of failing each connection afterwards. The certificate is ignored
+// when insecure_skip_verify is set, so it is not checked then either.
+func validateMCPTLSConfig(config *schemas.MCPClientConfig) error {
+	tlsCfg := config.TLSConfig
+	if tlsCfg == nil || tlsCfg.InsecureSkipVerify || tlsCfg.CACertPEM == nil {
+		return nil
+	}
+	caPEM := tlsCfg.CACertPEM.GetValue()
+	if caPEM == "" {
+		return nil
+	}
+	if !x509.NewCertPool().AppendCertsFromPEM([]byte(caPEM)) {
+		return fmt.Errorf("tls_config.ca_cert_pem is not a valid PEM certificate in client '%s'", config.Name)
+	}
+	return nil
+}
+
+// DiscoveryStore returns the manager's discovery store — the single owner of
+// every client's discovery (tools, instructions, resources, prompts). Client state
+// snapshots carry connection state only; whoever needs a client's discovery
+// fetches it from here with the client's config, passing the caller's ctx so a
+// client with per_user_discovery on serves the caller its own.
+func (m *MCPManager) DiscoveryStore() schemas.MCPDiscoveryStore {
+	return m.discoveryStore
+}
+
+// GetToolsForClient returns the tools the caller on ctx should see for one
+// client, or nil when it has none recorded. Callers that also need the
+// instructions or discovery time read the store directly (DiscoveryStore).
+func (m *MCPManager) GetToolsForClient(ctx context.Context, clientID string) map[string]schemas.ChatTool {
+	return m.discoveryForID(ctx, clientID).GetTools()
+}
+
+// GetClientDiscovery returns the discovery the caller on ctx sees for one
+// client, or nil when it has none recorded. The value is shared; callers must
+// not mutate it.
+func (m *MCPManager) GetClientDiscovery(ctx context.Context, clientID string) *schemas.MCPDiscovery {
+	return m.discoveryForID(ctx, clientID)
+}
+
+// GetInstructionsForClient returns the upstream instructions the caller on ctx
+// should see for one client, from the same discovery its tools come from; ""
+// when it has none.
+func (m *MCPManager) GetInstructionsForClient(ctx context.Context, clientID string) string {
+	return m.discoveryForID(ctx, clientID).GetInstructions()
+}
+
+// isTransientError determines if an error is transient and should be retried.
+// Permanent errors (auth failures, config errors, context deadline, etc.) return false.
+// Transient errors (network issues, temporary timeouts, etc.) return true.
+func isTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := err.Error()
+	if errors.Is(err, ErrMCPProtocolVersionAboveMax) || isAuthRequiredError(err) || isPermanentConnectError(err) {
+		return false
+	}
+
+	// Context errors are NEVER retryable - they indicate the operation exceeded its deadline
+	// If context is cancelled or deadline exceeded, the issue is permanent (not transient)
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if strings.Contains(errStr, "context canceled") || strings.Contains(errStr, "context deadline exceeded") {
+		return false
+	}
+
+	for _, permanentErr := range permanentErrorPhrases {
+		if strings.Contains(strings.ToLower(errStr), permanentErr) {
+			return false
+		}
+	}
+
+	// Bare digits, deliberately: a collision cannot change this classifier's
+	// answer, because the timeout loop below would reject the same text anyway.
+	for _, status := range dialBarePermanentStatusCodes {
+		if strings.Contains(strings.ToLower(errStr), status) {
+			return false
+		}
+	}
+
+	// Timeouts are permanent here specifically because this classifier backs
+	// connection establishment; see timeoutErrorSubstrings.
+	for _, timeoutErr := range timeoutErrorSubstrings {
+		if strings.Contains(strings.ToLower(errStr), timeoutErr) {
+			return false
+		}
+	}
+
+	for _, transientErr := range transientErrorSubstrings {
+		if strings.Contains(strings.ToLower(errStr), transientErr) {
+			return true
+		}
+	}
+
+	// Check for net.Error types (timeout-related errors)
+	if netErr, ok := errors.AsType[net.Error](err); ok {
+		// Timeout errors are transient and should be retried
+		if netErr.Timeout() {
+			return true
+		}
+	}
+
+	// Default: treat as transient to be safe (connection-related errors)
+	// This ensures we retry unknown errors that are likely transient — the
+	// right default for connection-establishment callers, where an
+	// unrecognized failure is still usually infra-related. NOT the right
+	// default for a tool call already past a live connection — see
+	// isTransientToolCallError below, which shares the same substring list
+	// but flips this default.
+	return true
+}
+
+// permanentErrorPhrases is what "retrying cannot help" looks like in words:
+// a rejected credential, a misconfiguration, a command that cannot run. Every
+// classifier in this file treats these as permanent, and they outrank a timeout
+// appearing in the same text, because "command failed: timeout" is a dead
+// command that happens to mention a timeout rather than a slow one.
+var permanentErrorPhrases = []string{
+	// Authentication/authorization errors
+	"unauthorized", "forbidden", "invalid auth", "invalid credential", "authorization required",
+	// HTTP client errors
+	"bad request", "method not allowed",
+	// Configuration errors
+	"command not found", "no such file", "not found", "permission denied",
+	"invalid config",
+	// Command execution errors
+	"executable file not found", "permission denied", "command failed",
+}
+
+// permanentHTTPStatusCodes is the same idea by status code rather than by
+// wording, held apart from the phrases because three digits collide with
+// ordinary parts of an error message in a way a phrase never does: a port
+// (8422), a latency (400ms), a byte count.
+//
+// The two classifiers therefore match them differently. isTransientError uses
+// bare substrings, which is harmless there because it also treats every
+// timeout as permanent, so a collision cannot change its answer.
+// isTransientProbeError cannot afford that, because it checks permanent
+// markers *before* deciding a timeout is retryable: see its own comment.
+var permanentHTTPStatusCodes = []string{"400", "401", "403", "404", "405", "422"}
+
+// dialBarePermanentStatusCodes is isTransientError's historical set, matched as
+// bare digits. It deliberately excludes 404, which the keyword-anchored read
+// above does include: a bare scan would take the "404" inside a port like :4040
+// for a status, and a genuine 404 response already carries "not found" from the
+// phrase list anyway.
+var dialBarePermanentStatusCodes = []string{"400", "401", "403", "405", "422"}
+
+// httpStatusPattern reads a three-digit status that some keyword marks AS a
+// status, rather than any three digits that happen to appear in the text. That
+// keyword requirement is the whole point: it is what makes it safe to check
+// statuses ahead of the timeout rule, because a port (8422) or a latency
+// (400ms) carries no keyword and so is never mistaken for one. The digits must
+// follow the keyword directly, separated by nothing but spaces and an optional
+// colon, so "HTTP transport error: ... 8422" does not match either.
+var httpStatusPattern = regexp.MustCompile(`(?i)\b(?:http|status(?:\s+code)?)\s*:?\s*(\d{3})\b`)
+
+// extractHTTPStatus returns the status code an error text reports, or "" when
+// it reports none. Covers "status 422", "status: 422", "status code: 401" and
+// "HTTP 404" alike, so the matcher is not limited to the spellings whoever
+// wrote it happened to think of.
+func extractHTTPStatus(errStr string) string {
+	match := httpStatusPattern.FindStringSubmatch(errStr)
+	if match == nil {
+		return ""
+	}
+	return match[1]
+}
+
+// timeoutErrorSubstrings is what "did not complete in time" looks like. The two
+// classifiers split on it rather than on its contents: isTransientError treats
+// every entry as permanent, because for connection establishment a timeout
+// usually means the endpoint is wrong or unreachable and the same dial will
+// time out again, while isTransientProbeError treats every entry as retryable,
+// because over an already-established connection a timeout is the most
+// retryable failure there is.
+//
+// Both iterate this one list on purpose. Spelling the phrases out at either
+// call site invites exactly the asymmetry that existed before: a probe that
+// retried "timeout" and "deadline exceeded" but not "waiting for endpoint",
+// which then fell through and was classified permanent.
+var timeoutErrorSubstrings = []string{"timeout", "deadline exceeded", "waiting for endpoint"}
+
+// transientErrorSubstrings is the shared substring list both isTransientError
+// (connection-establishment, default-retry-unknown) and
+// isTransientToolCallError (tool calls, default-don't-retry-unknown) match
+// against — one source of truth for what "looks like a transport blip" means,
+// even though the two callers apply opposite defaults to anything outside it.
+var transientErrorSubstrings = []string{
+	// Network errors
+	"connection refused", "connection reset", "broken pipe",
+	"network is unreachable", "no route to host",
+	// Timeout errors
+	"timeout", "deadline exceeded", "i/o timeout",
+	// DNS errors
+	"no such host", "name resolution failed",
+	// HTTP errors
+	"503", "502", "504", "429", "500", // Service Unavailable, Bad Gateway, Gateway Timeout, Too Many Requests, Internal Server Error
+	// Connection errors
+	"connection error", "connection lost", "connection failed",
+	// I/O errors
+	"i/o error", "read error", "write error",
+	// Temporary errors
+	"temporary failure", "try again",
+}
+
+// isTransientToolCallError is ToolCallRetryConfig's classifier: a live tool
+// call already has a working connection (AcquireClientConn succeeded to get
+// here), so an error at this point is either a genuine transport blip
+// (matches transientErrorSubstrings — worth one quick retry) or something
+// application-level (a tool's own business-logic failure, bad arguments, a
+// panic in the tool implementation) that retrying can't fix and might
+// actively harm if the tool isn't idempotent. Unlike isTransientError, this
+// does NOT default to true for unrecognized text — only a positive match
+// against known transport-failure shapes triggers a retry; everything else
+// (including net.Error timeouts, which isTransientError treats as transient
+// but which already have "timeout"/"deadline exceeded" in the substring list
+// above anyway) goes straight through as non-retryable.
+func isTransientToolCallError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	// Auth failures, and any error that reads like one, are checked first,
+	// before the transient substring scan: error text like "401 unauthorized:
+	// try again" would otherwise match "try again" below and get retried,
+	// contradicting the non-retryable auth-failure rule this classifier exists
+	// to enforce for tool calls.
+	if isAuthFailure(err) || isAuthFailureErrorText(errStr) {
+		return false
+	}
+	for _, transientErr := range transientErrorSubstrings {
+		if strings.Contains(errStr, transientErr) {
+			return true
+		}
+	}
+	return false
+}
+
+// isAuthRequiredError reports whether err is mcp-go's 401: since v1.3.0 its text says only
+// "authorization required", with no status code.
+func isAuthRequiredError(err error) bool {
+	return errors.Is(err, transport.ErrAuthorizationRequired) || errors.Is(err, transport.ErrOAuthAuthorizationRequired)
+}
+
+// isAuthFailure reports whether a tool-call error is an upstream auth rejection:
+// mcp-go's typed 401, or auth-shaped text inside the *transport.Error frame,
+// which wraps only what the transport produced, as isDeadSessionError reads
+// it. A JSON-RPC error the server answered with is the tool's own result and
+// carries no such frame, so it never matches whatever its text says: a tool
+// reporting "forbidden" for its own reasons used to force a credential refresh
+// and a reconnect of a healthy client.
+func isAuthFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isAuthRequiredError(err) {
+		return true
+	}
+	transportErr, ok := errors.AsType[*transport.Error](err)
+	return ok && isAuthFailureErrorText(transportErr.Error())
+}
+
+// authStatusCode matches 401 or 403 as a number of its own, so a port, path or id that merely
+// contains those digits (":4010", "/tenants/84013") is not read as an auth status.
+var authStatusCode = regexp.MustCompile(`(?:^|[^0-9])40[13](?:[^0-9]|$)`)
+
+// isAuthFailureErrorText reports whether an error's text reads like an auth
+// rejection (401/403/unauthorized/forbidden). isAuthFailure applies it only
+// inside the transport's error frame, since a tool's own error can carry any of
+// these words. isTransientToolCallError applies it to any error, to keep such a
+// failure from being retried whichever side produced it.
+func isAuthFailureErrorText(errStr string) bool {
+	lower := strings.ToLower(errStr)
+	if authStatusCode.MatchString(lower) {
+		return true
+	}
+	for _, needle := range []string{"unauthorized", "forbidden", "authorization required"} {
+		if strings.Contains(lower, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// deadSessionErrorSubstrings is what "the upstream has abandoned this MCP
+// session" looks like by the time it reaches a CallTool error. Like
+// isAuthFailureErrorText above, substring matching on flattened text is the
+// only option: mcp-go collapses HTTP status codes and its own sentinels into a
+// plain error string before any call site sees them. What it does keep is the
+// *transport.Error frame around anything the transport (as opposed to the
+// tool) produced, and isDeadSessionError matches these needles only inside
+// that frame.
+//
+// The spec's signal is HTTP 404 on a request carrying Mcp-Session-Id, which
+// mcp-go turns into ErrSessionTerminated ("session terminated (404). need to
+// re-initialize"), so the first two entries cover every compliant server. The
+// rest are wordings real servers use when they answer a dead session with
+// something other than a 404.
+//
+// Deliberately narrow. Generic transport failures (connection refused, broken
+// pipe, 5xx) are left out even though a reconnect would sometimes help: they
+// are already retried by ToolCallRetryConfig, the periodic connection checker
+// repairs the ones a reconnect can fix, and a false positive here costs a
+// needless session swap plus one extra attempt at the tool.
+var deadSessionErrorSubstrings = []string{
+	"session terminated", "need to re-initialize",
+	"expect initialize request", "session not found",
+	"invalid session", "unknown session", "no transport found for session",
+}
+
+// isDeadSessionError reports whether an upstream tool-call error says the MCP
+// session behind the connection is gone. Retrying over the same connection
+// cannot fix that; only a fresh one can. Prefer this over the text-only form
+// below whenever the error value itself is in hand.
+//
+// The typed check comes first because it does not depend on how the sentinel is
+// worded: mcp-go returns ErrSessionTerminated for the spec's signal (a 404 on a
+// request carrying Mcp-Session-Id) and preserves it through its own wrapping,
+// so errors.Is sees it at the call site.
+//
+// The text fallback is not redundant, and cannot be removed. It is the only
+// signal a server gives when it answers a dead session with something other
+// than a 404: the 422 carrying "Unexpected message, expect initialize request"
+// that prompted this work has no typed error anywhere, because mcp-go formats
+// non-404 statuses straight into prose. Today the two checks agree on every
+// input, since the sentinel's own text contains one of the needles below; the
+// typed check is what keeps that true if the wording ever changes upstream.
+//
+// The text fallback only reads errors the transport produced. client.sendRequest
+// returns exactly two shapes: a transport failure, which it wraps in
+// *transport.Error, or the tool's own JSON-RPC error, which it flattens to the
+// tool's message with no wrapper at all (mcp.JSONRPCErrorDetails.AsError). Every
+// dead-session wording above comes from the first shape, an HTTP status the
+// transport formatted into prose. The second shape is the tool talking about
+// its own domain, and a tool that legitimately answers "invalid session" or
+// "session not found" must not be mistaken for a dead MCP session: the recovery
+// this gates reconnects a healthy client and, for a retry-safe tool, replays
+// the call. errors.As rather than a type assertion, because ExecuteWithRetry
+// and callers may wrap the transport error further before it gets here.
+func isDeadSessionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, transport.ErrSessionTerminated) {
+		return true
+	}
+	var transportErr *transport.Error
+	if !errors.As(err, &transportErr) {
+		return false
+	}
+	return isDeadSessionErrorText(transportErr.Error())
+}
+
+// unfulfilledInputPrefix starts mcp-go's error for an input request it had no handler for; an upstream
+// error that merely mentions "multi round-trip:" is not one.
+const unfulfilledInputPrefix = "multi round-trip: fulfilling input request "
+
+// relayedClientCapabilities are the client capabilities Bifrost can pass through to a gateway caller.
+var relayedClientCapabilities = mcp.ClientCapabilities{
+	Elicitation: &mcp.ElicitationCapability{},
+	Extensions:  map[string]any{schemas.MCPAppsExtension: struct{}{}},
+}
+
+// BifrostContextKeyMCPToolListing values.
+const (
+	listModelTools   = "model"
+	listAllTools     = "all"
+	listGatewayTools = "gateway"
+)
+
+// WithModelToolsOnly hides app-only tools from listings on ctx. Code mode uses it, since a model writes its scripts.
+// A derived context, not SetValue, so the override never reaches the rest of the request.
+func WithModelToolsOnly(ctx context.Context) context.Context {
+	return context.WithValue(ctx, schemas.BifrostContextKeyMCPToolListing, listModelTools)
+}
+
+// WithAllTools lists app-only tools on ctx too. Only for the gateway's sync; calls still follow AppToolsAllowed.
+func WithAllTools(ctx context.Context) context.Context {
+	return context.WithValue(ctx, schemas.BifrostContextKeyMCPToolListing, listAllTools)
+}
+
+// WithGatewayTools is WithAllTools plus every tool either /mcp or a client's /mcp/<slug> may serve, for
+// the gateway's install. Each request still sees only what CodeModeFor gives it.
+func WithGatewayTools(ctx context.Context) context.Context {
+	return context.WithValue(ctx, schemas.BifrostContextKeyMCPToolListing, listGatewayTools)
+}
+
+// codeModeListing reports whether a listing on ctx shows the client's own tools directly, and whether
+// the client needs the code-mode tools listed.
+func codeModeListing(ctx context.Context, client *schemas.MCPClientConfig) (direct, codeMode bool) {
+	if listing, _ := ctx.Value(schemas.BifrostContextKeyMCPToolListing).(string); listing == listGatewayTools {
+		return client.ServesOwnToolsGlobalOrSlug(), client.UsesCodeModeGlobalOrSlug()
+	}
+	codeMode = client.CodeModeFor(ctx)
+	return !codeMode, codeMode
+}
+
+// AppToolsAllowed reports whether the request may see and call app-only tools: a /mcp/<slug> request for
+// one MCP client, from a caller that declared MCP Apps. ctx must carry the caller's capabilities.
+func AppToolsAllowed(ctx context.Context) bool {
+	if listing, _ := ctx.Value(schemas.BifrostContextKeyMCPToolListing).(string); listing == listModelTools {
+		return false
+	}
+	if gateway, _ := ctx.Value(schemas.BifrostContextKeyIsMCPGateway).(bool); !gateway {
+		return false
+	}
+	if client, _ := ctx.Value(schemas.BifrostContextKeyMCPGatewayClient).(string); client == "" {
+		return false
+	}
+	return CallerDeclaresApps(ctx)
+}
+
+// InputRequiredForLog returns, for the MCP log, what a relayed input_required result asked the caller;
+// ok is false for any other message.
+func InputRequiredForLog(message *schemas.ChatMessage) (asked any, ok bool) {
+	if message == nil || message.ChatToolMessage == nil {
+		return nil, false
+	}
+	result := message.ChatToolMessage.MCPResult(message.Content)
+	if result == nil || !result.NeedsInput() {
+		return nil, false
+	}
+	if len(result.InputRequests) == 0 {
+		return nil, true // a retry-later round asks nothing
+	}
+	return map[string]any{"input_requests": result.InputRequests}, true
+}
+
+// InputResumptionForLog returns the answers a gateway caller's retry carried.
+func InputResumptionForLog(ctx context.Context) any {
+	resume, _ := ctx.Value(schemas.BifrostContextKeyMCPInputResumption).(*mcp.MultiRoundTripParams)
+	if resume == nil || len(resume.InputResponses) == 0 {
+		return nil
+	}
+	return resume.InputResponses
+}
+
+// roundTripStatePrefix marks a requestState Bifrost wrapped: "bfrt1.<round-trip id>.<upstream's state>".
+const roundTripStatePrefix = "bfrt1."
+
+const roundTripIDLen = 16
+
+// RoundTripID is the id every round of one gateway tool call shares in the MCP logs: a short hash of the
+// first round's request id.
+func RoundTripID(requestID string) string {
+	sum := sha256.Sum256([]byte(requestID))
+	return hex.EncodeToString(sum[:roundTripIDLen/2])
+}
+
+// CallRoundTripID is the round-trip id of the gateway tool call on ctx: the one its retry carried, else
+// one derived from this request.
+func CallRoundTripID(ctx context.Context) string {
+	if carried, _ := ctx.Value(schemas.BifrostContextKeyMCPRoundTripID).(string); carried != "" {
+		return carried
+	}
+	requestID, _ := ctx.Value(schemas.BifrostContextKeyRequestID).(string)
+	return RoundTripID(requestID)
+}
+
+// WrapRoundTripState is the requestState Bifrost hands its caller: the upstream's state behind the call's
+// round-trip id, so the retry names the call it continues.
+func WrapRoundTripState(id, state string) string {
+	return roundTripStatePrefix + id + "." + state
+}
+
+// UnwrapRoundTripState splits a caller's requestState into the round-trip id and the upstream's state. A
+// state Bifrost did not wrap comes back unchanged, with no id.
+func UnwrapRoundTripState(state string) (id, upstream string) {
+	rest, ok := strings.CutPrefix(state, roundTripStatePrefix)
+	if !ok || len(rest) <= roundTripIDLen || rest[roundTripIDLen] != '.' {
+		return "", state
+	}
+	for _, c := range rest[:roundTripIDLen] {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return "", state
+		}
+	}
+	return rest[:roundTripIDLen], rest[roundTripIDLen+1:]
+}
+
+// CallerDeclaresApps reports whether ctx carries a gateway caller's capabilities that declare MCP Apps,
+// on any gateway endpoint.
+func CallerDeclaresApps(ctx context.Context) bool {
+	caller, _ := ctx.Value(schemas.BifrostContextKeyMCPCallerCapabilities).(*mcp.ClientCapabilities)
+	if caller == nil {
+		return false
+	}
+	_, ok := caller.Extensions[schemas.MCPAppsExtension]
+	return ok
+}
+
+// listsAppTools reports whether a tool listing on ctx includes app-only tools.
+func listsAppTools(ctx context.Context) bool {
+	if listing, _ := ctx.Value(schemas.BifrostContextKeyMCPToolListing).(string); listing == listAllTools || listing == listGatewayTools {
+		return true
+	}
+	return AppToolsAllowed(ctx)
+}
+
+// GatewayAggregate reports whether ctx is a gateway request that may reach several MCP clients
+// (/mcp or a Virtual MCP), where ui:// resources are namespaced by client.
+func GatewayAggregate(ctx context.Context) bool {
+	gateway, _ := ctx.Value(schemas.BifrostContextKeyIsMCPGateway).(bool)
+	client, _ := ctx.Value(schemas.BifrostContextKeyMCPGatewayClient).(string)
+	return gateway && client == ""
+}
+
+// GatewayUIResourceURI is uri as aggregate gateway requests see it: ui://<client>/<rest>, the client
+// name path-escaped since names may contain "/", "?" or "#".
+func GatewayUIResourceURI(clientName, uri string) string {
+	rest, ok := strings.CutPrefix(uri, "ui://")
+	if !ok {
+		return uri
+	}
+	return "ui://" + url.PathEscape(clientName) + "/" + rest
+}
+
+// ToolClientName is the MCP client a prefixed tool name belongs to (client names have no hyphens),
+// or "" for an unprefixed name such as a code-mode tool.
+func ToolClientName(toolName string) string {
+	clientName, _, found := strings.Cut(toolName, "-")
+	if !found {
+		return ""
+	}
+	return clientName
+}
+
+// upstreamUIResourceURI undoes GatewayUIResourceURI for clientName's resources.
+func upstreamUIResourceURI(clientName, uri string) (string, bool) {
+	rest, ok := strings.CutPrefix(uri, "ui://"+url.PathEscape(clientName)+"/")
+	if !ok {
+		return uri, false
+	}
+	return "ui://" + rest, true
+}
+
+// readRelayedCapabilities are what resource and prompt reads pass through: MCP Apps, so an upstream
+// serves its ui:// resources to an apps caller.
+var readRelayedCapabilities = mcp.ClientCapabilities{Extensions: map[string]any{schemas.MCPAppsExtension: struct{}{}}}
+
+// bifrostClientCapabilities is declared at connect time so upstreams list their MCP Apps tools.
+var bifrostClientCapabilities = mcp.ClientCapabilities{
+	Extensions: map[string]any{schemas.MCPAppsExtension: map[string]any{"mimeTypes": []string{schemas.MCPAppsMimeType}}},
+}
+
+// manualInputRoundTrips leaves an upstream's input_required to CallUpstreamTool instead of mcp-go's loop.
+var manualInputRoundTrips = client.WithManualInputRoundTrips()
+
+// maxRetryLaterRounds bounds how often Bifrost itself retries an upstream that answers "retry later"
+// (input_required with no input requests), as mcp-go's own round-trip loop does.
+const maxRetryLaterRounds = 3
+
+// upstreamContext sets what a 2026-07-28 request declares: the capabilities in relayed that the gateway
+// caller declared, otherwise none. Legacy connections declared theirs at initialize.
+func upstreamContext(ctx context.Context, conn *client.Client, relayed mcp.ClientCapabilities) (_ context.Context, answerable mcp.ClientCapabilities, hasCaller bool) {
+	caller, _ := ctx.Value(schemas.BifrostContextKeyMCPCallerCapabilities).(*mcp.ClientCapabilities)
+	hasCaller = caller != nil
+	if hasCaller {
+		answerable = relayableCapabilities(*caller, relayed)
+	}
+	if version := conn.ProtocolVersion(); version != "" && !mcp.IsModernProtocol(version) {
+		return ctx, answerable, hasCaller
+	}
+	return client.WithRequestClientCapabilities(ctx, answerable), answerable, hasCaller
+}
+
+// CallUpstreamTool sends call on conn. With relay, a gateway caller gets an upstream's input_required
+// result back unchanged when it can answer every request in it, or when the upstream only asks it to
+// retry later, and its retry's answers and requestState are sent upstream. Anyone else gets an
+// *UnservableInputError once Bifrost has retried a "retry later" answer itself. Exported for code
+// mode's nested tool calls, which cannot pass a request back mid-script.
+func CallUpstreamTool(ctx context.Context, conn *client.Client, call mcp.CallToolRequest, relay bool) (*mcp.CallToolResult, error) {
+	var relayed mcp.ClientCapabilities
+	if relay {
+		relayed = relayedClientCapabilities
+	}
+	ctx, answerable, hasCaller := upstreamContext(ctx, conn, relayed)
+	relay = relay && hasCaller
+	if relay {
+		if resume, _ := ctx.Value(schemas.BifrostContextKeyMCPInputResumption).(*mcp.MultiRoundTripParams); resume != nil {
+			call.Params.MultiRoundTripParams = *resume
+		}
+	}
+	for round := 1; ; round++ {
+		result, err := CallToolWithin(ctx, conn, call)
+		if err != nil || !result.NeedsInput() {
+			return result, err
+		}
+		if relay && canAnswer(answerable, result.InputRequests) {
+			return result, nil
+		}
+		if len(result.InputRequests) > 0 || round >= maxRetryLaterRounds {
+			return nil, &UnservableInputError{Requests: result.InputRequests}
+		}
+		call.Params.InputResponses = nil
+		call.Params.RequestState = result.RequestState
+	}
+}
+
+// canAnswer reports whether a caller declaring answerable can answer every request. An empty set asks
+// only for a retry, which any caller can do.
+func canAnswer(answerable mcp.ClientCapabilities, requests mcp.InputRequests) bool {
+	for _, request := range requests {
+		switch request.Method {
+		case mcp.MethodElicitationCreate:
+			if !canElicit(answerable.Elicitation, request.Elicitation) {
+				return false
+			}
+		case mcp.MethodSamplingCreateMessage:
+			if answerable.Sampling == nil {
+				return false
+			}
+		case mcp.MethodListRoots:
+			if answerable.Roots == nil {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// canElicit reports whether a caller declaring capability can answer an elicitation in params' mode.
+// An empty capability declares form mode only.
+func canElicit(capability *mcp.ElicitationCapability, params *mcp.ElicitationParams) bool {
+	if capability == nil {
+		return false
+	}
+	if params != nil && params.Mode == mcp.ElicitationModeURL {
+		return capability.URL != nil
+	}
+	return capability.Form != nil || capability.URL == nil
+}
+
+// UnservableInputError is an upstream's input_required that Bifrost could not pass to its caller. No
+// requests means the upstream kept asking for a retry.
+type UnservableInputError struct {
+	Requests   mcp.InputRequests
+	ServerName string // when set, Error explains the requests in full
+}
+
+func (e *UnservableInputError) Error() string {
+	if e.ServerName != "" {
+		return describeInputRequests(e.Requests, e.ServerName)
+	}
+	if len(e.Requests) == 0 {
+		return "upstream kept asking to retry without completing the call"
+	}
+	return "upstream needs input the caller cannot provide"
+}
+
+// relayableCapabilities keeps the parts of caller that relayed also has, using the caller's values.
+// Experimental and task capabilities are never relayed.
+func relayableCapabilities(caller, relayed mcp.ClientCapabilities) mcp.ClientCapabilities {
+	var out mcp.ClientCapabilities
+	if relayed.Elicitation != nil {
+		out.Elicitation = caller.Elicitation
+	}
+	if relayed.Sampling != nil {
+		out.Sampling = caller.Sampling
+	}
+	if relayed.Roots != nil {
+		out.Roots = caller.Roots
+	}
+	for name, value := range caller.Extensions {
+		if _, ok := relayed.Extensions[name]; !ok {
+			continue
+		}
+		if out.Extensions == nil {
+			out.Extensions = make(map[string]any, len(relayed.Extensions))
+		}
+		out.Extensions[name] = value
+	}
+	return out
+}
+
+// unservableInputKinds maps mcp-go's wording for an input request it had no handler for (Bifrost
+// registers none, so declares no capability) to what the upstream was asking for.
+var unservableInputKinds = []struct {
+	marker string
+	method mcp.MCPMethod
+	what   string
+}{
+	{"no elicitation handler configured", mcp.MethodElicitationCreate, "input from the user (elicitation)"},
+	{"no sampling handler configured", mcp.MethodSamplingCreateMessage, "an LLM completion (sampling)"},
+	{"no roots handler configured", mcp.MethodListRoots, "the client's filesystem roots (roots)"},
+}
+
+// DescribeUnservableInput explains a tool call that failed because the upstream needed something
+// only a user-facing client can provide: input from the user, an LLM completion, or a step in the
+// user's browser. Exported for code mode's nested tool calls. mcp-go reports most of these as typed errors; an input request it could not
+// fulfil (2026-07-28 input_required) only as text.
+func DescribeUnservableInput(err error, serverName string) (string, bool) {
+	var urlNeeded mcp.URLElicitationRequiredError
+	var capability mcp.MissingRequiredClientCapabilityError
+	var unservable *UnservableInputError
+	switch {
+	case errors.As(err, &unservable):
+		return describeInputRequests(unservable.Requests, serverName), true
+	case errors.As(err, &urlNeeded):
+		steps := make([]string, 0, len(urlNeeded.Elicitations))
+		for _, e := range urlNeeded.Elicitations {
+			steps = append(steps, strings.TrimSpace(e.Message+" "+e.URL))
+		}
+		return fmt.Sprintf("MCP server %q needs a step completed in the browser before this tool can run: %s", serverName, strings.Join(steps, "; ")), true
+	case errors.As(err, &capability):
+		return fmt.Sprintf("MCP server %q needs the client capability %q to run this tool, which Bifrost does not support", serverName, capability.Capability), true
+	case errors.Is(err, client.ErrMaxInputRoundTripsExceeded):
+		return fmt.Sprintf("MCP server %q kept asking Bifrost to retry the call without completing it", serverName), true
+	}
+	text := err.Error()
+	if !strings.Contains(text, unfulfilledInputPrefix) {
+		return "", false
+	}
+	for _, kind := range unservableInputKinds {
+		if strings.Contains(text, kind.marker) {
+			return fmt.Sprintf("MCP server %q asked for %s, which Bifrost cannot provide", serverName, kind.what), true
+		}
+	}
+	return fmt.Sprintf("MCP server %q asked for input Bifrost cannot provide", serverName), true
+}
+
+// describeInputRequests explains an input_required result Bifrost could not pass on, in the words
+// DescribeUnservableInput uses for the same requests reported as errors.
+func describeInputRequests(requests mcp.InputRequests, serverName string) string {
+	if len(requests) == 0 {
+		return fmt.Sprintf("MCP server %q kept asking Bifrost to retry the call without completing it", serverName)
+	}
+	var steps []string
+	for _, id := range slices.Sorted(maps.Keys(requests)) {
+		request := requests[id]
+		if request.Method == mcp.MethodElicitationCreate && request.Elicitation != nil && request.Elicitation.Mode == "url" {
+			steps = append(steps, strings.TrimSpace(request.Elicitation.Message+" "+request.Elicitation.URL))
+			continue
+		}
+		for _, kind := range unservableInputKinds {
+			if kind.method == request.Method {
+				return fmt.Sprintf("MCP server %q asked for %s, which Bifrost cannot provide", serverName, kind.what)
+			}
+		}
+		return fmt.Sprintf("MCP server %q asked for input Bifrost cannot provide", serverName)
+	}
+	return fmt.Sprintf("MCP server %q needs a step completed in the browser before this tool can run: %s", serverName, strings.Join(steps, "; "))
+}
+
+// hasProtocolSession reports whether conn speaks a revision with protocol-level sessions, which
+// 2026-07-28 removed.
+func hasProtocolSession(conn *client.Client) bool {
+	return conn != nil && !mcp.IsModernProtocol(conn.ProtocolVersion())
+}
+
+// isDeadSessionErrorText is the text half of isDeadSessionError, kept separate
+// for callers that only hold the flattened message.
+func isDeadSessionErrorText(errStr string) bool {
+	lower := strings.ToLower(errStr)
+	for _, needle := range deadSessionErrorSubstrings {
+		if strings.Contains(lower, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// isTransientProbeError is ProbeRetryConfig's classifier, for the periodic
+// connection checker's own ping / list_tools calls. It differs from the shared
+// isTransientError in two ways, both because a probe runs over an
+// already-established connection instead of establishing one:
+//
+//   - A timeout is retryable here. isTransientError's blanket "if something
+//     times out, retrying won't help" fits a dial, where a timeout usually
+//     means the endpoint is wrong or unreachable. ConnectionCheckTimeout is 5
+//     seconds, so without this one slow response from a busy upstream spends
+//     none of the retry budget the probe exists to absorb blips with, marking
+//     the client Unstable on the first attempt and, now that a failed check
+//     reconnects, churning a working session over a single hiccup. The worst
+//     case this admits (four 5-second attempts plus the config's ~3.5s of
+//     backoff per operation) is what any unrecognized connection error already
+//     costs on this path.
+//   - A dead session is permanent, via the same classifier the reactive
+//     tool-call path uses. mcp-go clears its session id and returns
+//     ErrSessionTerminated on a 404 without re-initializing, so every retry
+//     over this connection fails identically; only a reconnect repairs it, and
+//     retrying first just delays that by the whole backoff schedule.
+//
+// Auth rejections are checked before the timeout rule for the same reason
+// isTransientToolCallError checks them first: error text like "403 forbidden:
+// timeout" must not fall into the timeout branch.
+func isTransientProbeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	if isDeadSessionErrorText(errStr) || errors.Is(err, ErrMCPProtocolVersionAboveMax) || isAuthRequiredError(err) || isPermanentConnectError(err) {
+		return false
+	}
+	// Checked before the timeout rule, not after: an error carrying any
+	// permanent marker is permanent even when its text also says "timeout"
+	// (auth rejections among them, since they are phrases on this list).
+	// Letting the timeout branch run first would make "status 422: timeout" or
+	// "command failed: timeout" retryable, which is strictly worse than the
+	// shared classifier they would otherwise fall through to.
+	for _, permanentErr := range permanentErrorPhrases {
+		if strings.Contains(errStr, permanentErr) {
+			return false
+		}
+	}
+	// Status codes only in status position, never as bare digits. Checking
+	// permanent markers ahead of the timeout rule is what makes that
+	// distinction load-bearing: a bare match would read the port in "dial tcp
+	// 127.0.0.1:8422: i/o timeout", or the latency in "i/o timeout after
+	// 400ms", as a permanent status and mark a client Unstable on the first
+	// attempt, spending none of the retry budget this classifier exists to
+	// spend. Matching narrowly is the safer error of the two: a status form
+	// this misses costs a few wasted retries, while a false positive recreates
+	// that bug.
+	if status := extractHTTPStatus(errStr); status != "" && slices.Contains(permanentHTTPStatusCodes, status) {
+		return false
+	}
+	// Cancellation is not a timeout, and has to be ruled out before the
+	// timeout rule for the same reason the permanent markers above are: left to
+	// isTransientError at the bottom, it never gets a say once the text also
+	// mentions a timeout. A timeout says the upstream was slow, which the next
+	// attempt may not be; a cancellation says someone stopped this request on
+	// purpose. The checker never cancels its own probes (their outer ctx is
+	// context.Background()), but mcp-go does when a client is closed mid-probe
+	// (a reconnect swapping the connection out, RemoveClient, Cleanup), and the
+	// timeout wording needs nothing more exotic than a URL containing it.
+	// Typed and text forms both, as in isTransientError, since a %v anywhere
+	// up the chain leaves only the text. mcp-go's own "context cancelled while
+	// waiting for endpoint" is deliberately not caught by either: it carries no
+	// %w and its own spelling, and on this path it only ever means the
+	// attempt's deadline expired.
+	if errors.Is(err, context.Canceled) || strings.Contains(errStr, "context canceled") {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	for _, timeoutErr := range timeoutErrorSubstrings {
+		if strings.Contains(errStr, timeoutErr) {
+			return true
+		}
+	}
+	return isTransientError(err)
+}
+
+// ExecuteWithRetry executes a function with exponential backoff retry logic.
+// Only retries on transient errors; permanent errors (auth, config) fail immediately.
+// It returns the error from the last attempt if all retries fail.
+//
+// Parameters:
+//   - ctx: Context for cancellation
+//   - fn: Function to execute with retry logic
+//   - config: Retry configuration
+//   - logger: Logger for logging retries
+//
+// Returns:
+//   - error: The last error if all retries failed, nil if successful
+func ExecuteWithRetry(
+	ctx context.Context,
+	fn func() error,
+	config RetryConfig,
+	logger schemas.Logger,
+) error {
+	var lastErr error
+	backoff := config.InitialBackoff
+	isRetryable := config.IsRetryable
+	if isRetryable == nil {
+		isRetryable = isTransientError
+	}
+
+	for attempt := 0; attempt <= config.MaxRetries; attempt++ {
+		// Check context before attempting
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("retry context cancelled: %w", ctx.Err())
+		default:
+		}
+
+		// Execute the function
+		lastErr = fn()
+		if lastErr == nil {
+			return nil // Success on this attempt
+		}
+
+		// Check if error is transient - if not, fail immediately without retrying
+		if !isRetryable(lastErr) {
+			logger.Debug("%s permanent error (not retrying): %v", MCPLogPrefix, lastErr)
+			return lastErr
+		}
+
+		// If this was the last attempt, return the error
+		if attempt == config.MaxRetries {
+			return lastErr
+		}
+
+		logger.Debug("%s retrying after %s for attempt %d/%d (transient error): %v", MCPLogPrefix, backoff, attempt+1, config.MaxRetries, lastErr)
+
+		// Wait before next attempt (with context cancellation support)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("retry context cancelled: %w", ctx.Err())
+		case <-time.After(backoff):
+			// Continue to next attempt
+		}
+
+		// Update backoff for next iteration
+		backoff = time.Duration(float64(backoff) * 2)
+		if backoff > config.MaxBackoff {
+			backoff = config.MaxBackoff
+		}
+	}
+
+	return lastErr
+}
+
+// listToolsResult captures the full outcome of retrieveExternalToolsDetailed so the
+// plugin gate can expose RawToolCount and SkippedTools to plugins.
+type listToolsResult struct {
+	tools    map[string]schemas.ChatTool
+	rawCount int
+	skipped  []schemas.SkippedMCPTool
+}
+
+// retrieveExternalToolsDetailed retrieves and filters tools from an external MCP server
+// without holding locks. Uses exponential backoff retry logic (5 retries, 1-30 seconds)
+// for tool retrieval. Returns the full result so the plugin gate can surface RawToolCount
+// and SkippedTools. All callers should go through MCPManager.runListToolsWithHooks rather
+// than calling this directly — the gate wraps this with PreMCPHook/PostMCPHook.
+func retrieveExternalToolsDetailed(ctx context.Context, client *client.Client, clientName string, logger schemas.Logger) (*listToolsResult, error) {
+	// A server offering only prompts or resources has no tools/list to call.
+	if caps := client.GetServerCapabilities(); caps.Tools == nil && (caps.Prompts != nil || caps.Resources != nil) {
+		return &listToolsResult{tools: map[string]schemas.ChatTool{}}, nil
+	}
+	// Get available tools from external server with retry logic
+	listRequest := mcp.ListToolsRequest{
+		PaginatedRequest: mcp.PaginatedRequest{
+			Request: mcp.Request{
+				Method: string(mcp.MethodToolsList),
+			},
+		},
+	}
+
+	var toolsResponse *mcp.ListToolsResult
+	retryConfig := ConnectRetryConfig
+	err := ExecuteWithRetry(
+		ctx,
+		func() error {
+			var retrieveErr error
+			toolsResponse, retrieveErr = client.ListTools(ctx, listRequest)
+			return retrieveErr
+		},
+		retryConfig,
+		logger,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list tools: %v", err)
+	}
+
+	if toolsResponse == nil {
+		return &listToolsResult{
+			tools: make(map[string]schemas.ChatTool),
+		}, nil
+	}
+
+	tools := make(map[string]schemas.ChatTool)
+	var skipped []schemas.SkippedMCPTool
+
+	// toolsResponse is already a ListToolsResult
+	for _, mcpTool := range toolsResponse.Tools {
+		// Validate the original tool name (with hyphens replaced by underscores for validation only)
+		validationName := strings.ReplaceAll(mcpTool.Name, "-", "_")
+		if err := validateNormalizedToolName(validationName); err != nil {
+			logger.Warn("%s Skipping MCP tool %q: %v", MCPLogPrefix, mcpTool.Name, err)
+			skipped = append(skipped, schemas.SkippedMCPTool{
+				OriginalName: mcpTool.Name,
+				Reason:       err.Error(),
+			})
+			continue
+		}
+
+		// Convert MCP tool schema to Bifrost format
+		bifrostTool := convertMCPToolToBifrostSchema(&mcpTool, logger)
+		// Prefix tool name with client name to make it permanent (using '-' as separator)
+		// Keep the original tool name (don't sanitize) so we can call the MCP server correctly
+		prefixedToolName := fmt.Sprintf("%s-%s", clientName, mcpTool.Name)
+		// Update the tool's function name to match the prefixed name
+		if bifrostTool.Function != nil {
+			bifrostTool.Function.Name = prefixedToolName
+		}
+		// Store the tool with the prefixed name
+		tools[prefixedToolName] = bifrostTool
+	}
+
+	return &listToolsResult{
+		tools:    tools,
+		rawCount: len(toolsResponse.Tools),
+		skipped:  skipped,
+	}, nil
+}
+
+// shouldIncludeClient determines if a client should be included based on filtering rules.
+func shouldIncludeClient(clientName string, includeClients []string, logger schemas.Logger) bool {
+	// If includeClients is specified (not nil), apply whitelist filtering
+	if includeClients != nil {
+		// Handle empty array [] - means no clients are included
+		if len(includeClients) == 0 {
+			logger.Debug("%s shouldIncludeClient: %s - BLOCKED (empty include list)", MCPLogPrefix, clientName)
+			return false // No clients allowed
+		}
+
+		// Handle wildcard "*" - if present, all clients are included
+		if slices.Contains(includeClients, "*") {
+			logger.Debug("%s shouldIncludeClient: %s - ALLOWED (wildcard filter)", MCPLogPrefix, clientName)
+			return true // All clients allowed
+		}
+
+		// Check if specific client is in the list
+		included := slices.Contains(includeClients, clientName)
+		logger.Debug("%s shouldIncludeClient: %s - %s (filter: %v)", MCPLogPrefix, clientName, map[bool]string{true: "ALLOWED", false: "BLOCKED"}[included], includeClients)
+		return included
+	}
+
+	// Default: include all clients when no filtering specified (nil case)
+	logger.Debug("%s shouldIncludeClient: %s - ALLOWED (no filter)", MCPLogPrefix, clientName)
+	return true
+}
+
+// shouldSkipToolForConfig checks if a tool should be skipped based on client configuration (without accessing clientMap).
+func shouldSkipToolForConfig(toolName string, config *schemas.MCPClientConfig) bool {
+	if config == nil {
+		return true // No tools allowed
+	}
+	// If ToolsToExecute is specified (not nil), apply filtering
+	if config.ToolsToExecute != nil {
+		// Handle empty array [] - means no tools are allowed
+		if config.ToolsToExecute.IsEmpty() {
+			return true // No tools allowed
+		}
+
+		// Handle wildcard "*" - if present, all tools are allowed
+		if config.ToolsToExecute.IsUnrestricted() {
+			return false // All tools allowed
+		}
+
+		// Strip client prefix from tool name before checking
+		// Tool names in config are stored without prefix (e.g., "add")
+		// but tool names in ToolMap are stored with prefix (e.g., "calculator/add")
+		unprefixedToolName := StripClientPrefix(toolName, config.Name)
+
+		// Check if specific tool is in the allowed list
+		return !config.ToolsToExecute.Contains(unprefixedToolName) // Tool not in allowed list
+	}
+
+	return true // Tool is skipped (nil is treated as [] - no tools)
+}
+
+// CanAutoExecuteTool checks if a tool can be auto-executed based on client configuration.
+// Returns true if the tool can be auto-executed, false otherwise.
+func CanAutoExecuteTool(toolName string, config *schemas.MCPClientConfig) bool {
+	// First check if tool is in ToolsToExecute (must be executable first)
+	if shouldSkipToolForConfig(toolName, config) {
+		return false // Tool is not in ToolsToExecute, so it cannot be auto-executed
+	}
+
+	// If ToolsToAutoExecute is specified (not nil), apply filtering
+	if config.ToolsToAutoExecute != nil {
+		// Handle empty array [] - means no tools are auto-executed
+		if config.ToolsToAutoExecute.IsEmpty() {
+			return false // No tools auto-executed
+		}
+
+		// Handle wildcard "*" - if present, all tools are auto-executed
+		if config.ToolsToAutoExecute.IsUnrestricted() {
+			return true // All tools auto-executed
+		}
+
+		// Strip client prefix from tool name before checking
+		// Tool names in config are stored without prefix (e.g., "add")
+		// but tool names in ToolMap are stored with prefix (e.g., "calculator/add")
+		unprefixedToolName := StripClientPrefix(toolName, config.Name)
+
+		// Check if specific tool is in the auto-execute list
+		return config.ToolsToAutoExecute.Contains(unprefixedToolName)
+	}
+
+	return false // Tool is not auto-executed (nil is treated as [] - no tools)
+}
+
+// AuthorizeCodeModeToolCall is the invocation-time allow-list check for a tool that
+// Code Mode is about to call. It runs at the actual chokepoint (callMCPTool), not as a
+// heuristic over generated code text: a model can reach a bound tool through syntactic
+// indirection (e.g. getattr(server, name)) that a source-text scan won't recognize.
+//
+// tools_to_execute always applies. tools_to_auto_execute applies only when the call runs
+// unattended, which the agent loop marks with BifrostContextKeyMCPUnattendedExecution.
+// A call a human approved, or one the application executes itself, keeps the documented
+// "manual approval required" semantics instead of being denied outright.
+func AuthorizeCodeModeToolCall(ctx *schemas.BifrostContext, toolName string, config *schemas.MCPClientConfig) error {
+	if shouldSkipToolForConfig(toolName, config) {
+		return fmt.Errorf("tool %q is not in tools_to_execute for this client", toolName)
+	}
+	if unattended, _ := ctx.Value(schemas.BifrostContextKeyMCPUnattendedExecution).(bool); unattended && !CanAutoExecuteTool(toolName, config) {
+		return fmt.Errorf("tool %q requires approval and cannot be auto-executed via Code Mode", toolName)
+	}
+	return nil
+}
+
+// shouldSkipToolForRequest checks if a tool should be skipped based on the request context.
+// shouldSkipToolForRequest determines if a tool should be skipped based on request context filtering.
+// Context filtering can only NARROW the tools available, NOT expand beyond client configuration.
+// This is checked AFTER client-level filtering (shouldSkipToolForConfig).
+func shouldSkipToolForRequest(ctx context.Context, clientName, toolName string) bool {
+	includeTools := ctx.Value(schemas.MCPContextKeyIncludeTools)
+
+	if includeTools != nil {
+		// Try []string first (preferred type)
+		if includeToolsList, ok := includeTools.([]string); ok {
+			// Handle empty array [] - means no tools are included
+			if len(includeToolsList) == 0 {
+				return true // No tools allowed
+			}
+
+			// Handle wildcard "clientName-*" - if present, all tools are included for this client
+			if slices.Contains(includeToolsList, fmt.Sprintf("%s-*", clientName)) {
+				return false // All tools allowed
+			}
+
+			// Check if specific tool is in the list (format: clientName-toolName)
+			// Note: toolName is already prefixed when coming from ToolMap, so use it directly
+			if slices.Contains(includeToolsList, toolName) {
+				return false // Tool is explicitly allowed
+			}
+
+			// If includeTools is specified but this tool is not in it, skip it
+			return true
+		}
+	}
+
+	return false // Tool is allowed (default when no filtering specified)
+}
+
+// convertMCPToolToBifrostSchema converts an MCP tool definition to Bifrost format.
+func convertMCPToolToBifrostSchema(mcpTool *mcp.Tool, logger schemas.Logger) schemas.ChatTool {
+	var properties *schemas.OrderedMap
+	if len(mcpTool.InputSchema.Properties) > 0 {
+		// Fix array schemas on the source map before copying to OrderedMap
+		FixArraySchemas(mcpTool.InputSchema.Properties, logger)
+
+		// mcp-go decodes properties into a Go map, so the server's key order is
+		// already lost here. Sort the keys: ranging over the map would give a
+		// different order on each tools/list sync, which changes the tool JSON
+		// sent to providers (breaking prompt caching) and the tools hash.
+		properties = schemas.OrderedMapFromMap(mcpTool.InputSchema.Properties)
+	} else {
+		// For tools with no parameters, initialize an empty properties map
+		// This is required by some providers (e.g., OpenAI) which expect
+		// object schemas to always have a properties field, even if empty
+		properties = schemas.NewOrderedMap()
+	}
+
+	// Preserve JSON Schema definitions ($defs). The MCP SDK already folds legacy
+	// "definitions" into Defs on unmarshal, so we only need to handle Defs here.
+	// Without this, any $ref pointing at #/$defs/... rides along inside Properties
+	// while the definitions it targets are dropped, leaving a dangling $ref that
+	// providers reject (e.g. Vertex Gemini returns INVALID_ARGUMENT).
+	var defs *schemas.OrderedMap
+	if len(mcpTool.InputSchema.Defs) > 0 {
+		// Normalize array schemas inside each definition, mirroring the fix applied
+		// to Properties above.
+		FixArraySchemas(mcpTool.InputSchema.Defs, logger)
+
+		// Sorted for the same reason as properties above.
+		defs = schemas.OrderedMapFromMap(mcpTool.InputSchema.Defs)
+	}
+
+	// Preserve MCP tool annotations if any are set.
+	// Clone bool pointers so Bifrost's copy is independent of the upstream mcp.Tool lifetime.
+	var annotations *schemas.MCPToolAnnotations
+	a := mcpTool.Annotations
+	if a.Title != "" || a.ReadOnlyHint != nil || a.DestructiveHint != nil || a.IdempotentHint != nil || a.OpenWorldHint != nil {
+		cloneBool := func(b *bool) *bool {
+			if b == nil {
+				return nil
+			}
+			v := *b
+			return &v
+		}
+		annotations = &schemas.MCPToolAnnotations{
+			Title:           a.Title,
+			ReadOnlyHint:    cloneBool(a.ReadOnlyHint),
+			DestructiveHint: cloneBool(a.DestructiveHint),
+			IdempotentHint:  cloneBool(a.IdempotentHint),
+			OpenWorldHint:   cloneBool(a.OpenWorldHint),
+		}
+	}
+
+	return schemas.ChatTool{
+		Type: schemas.ChatToolTypeFunction,
+		Function: &schemas.ChatToolFunction{
+			Name:        mcpTool.Name,
+			Description: schemas.Ptr(mcpTool.Description),
+			Parameters: &schemas.ToolFunctionParameters{
+				Type:       mcpTool.InputSchema.Type,
+				Properties: properties,
+				Required:   mcpTool.InputSchema.Required,
+				Defs:       defs,
+			},
+		},
+		Annotations: annotations,
+		MCP:         toolMetadata(mcpTool),
+	}
+}
+
+// toolMetadata is the title, icons and output schema mcpTool declares, or nil when it declares none.
+func toolMetadata(mcpTool *mcp.Tool) *schemas.MCPToolMetadata {
+	outputSchema := mcpTool.RawOutputSchema
+	if outputSchema == nil && declaresOutputSchema(mcpTool.OutputSchema) {
+		outputSchema, _ = json.Marshal(mcpTool.OutputSchema)
+		// mcp-go writes "type": "" when none is set.
+		if mcpTool.OutputSchema.Type == "" && mcpTool.OutputSchema.Types == nil {
+			outputSchema, _ = sjson.DeleteBytes(outputSchema, "type")
+		}
+	}
+	var meta json.RawMessage
+	if mcpTool.Meta != nil && (mcpTool.Meta.ProgressToken != nil || len(mcpTool.Meta.AdditionalFields) > 0) {
+		meta, _ = json.Marshal(mcpTool.Meta)
+	}
+	if mcpTool.Title == "" && len(mcpTool.Icons) == 0 && outputSchema == nil && meta == nil {
+		return nil
+	}
+	metadata := &schemas.MCPToolMetadata{Title: mcpTool.Title, Icons: mcpTool.Icons, OutputSchema: outputSchema, Meta: meta}
+	if meta != nil {
+		metadata.UIResourceURI, metadata.Visibility = appsUIMeta(meta)
+	}
+	return metadata
+}
+
+// appsUIMeta reads ui.resourceUri (or the deprecated "ui/resourceUri") and ui.visibility from a tool's _meta.
+func appsUIMeta(meta json.RawMessage) (resourceURI string, visibility []string) {
+	ui := gjson.GetBytes(meta, "ui")
+	resourceURI = ui.Get("resourceUri").String()
+	if resourceURI == "" {
+		resourceURI = gjson.GetBytes(meta, "ui/resourceUri").String()
+	}
+	if !strings.HasPrefix(resourceURI, "ui://") {
+		resourceURI = ""
+	}
+	for _, v := range ui.Get("visibility").Array() {
+		if v.Type == gjson.String {
+			visibility = append(visibility, v.String())
+		}
+	}
+	return resourceURI, visibility
+}
+
+// declaresOutputSchema reports whether any part of the output schema is set; type is optional.
+func declaresOutputSchema(schema mcp.ToolOutputSchema) bool {
+	return schema.Type != "" || schema.Types != nil || schema.Properties != nil || len(schema.Required) > 0 ||
+		schema.AdditionalProperties != nil || schema.Defs != nil || len(schema.AdditionalFields) > 0
+}
+
+// createToolResponseMessage is the tool message for an MCP result, marked failed when the server says so.
+func createToolResponseMessage(toolCall schemas.ChatAssistantMessageToolCall, result *mcp.CallToolResult, toolName string) *schemas.ChatMessage {
+	content := toolResultContent(result, toolName)
+	toolMsg := &schemas.ChatToolMessage{ToolCallID: toolCall.ID}
+	if result != nil {
+		if result.IsError {
+			toolMsg.IsError = schemas.Ptr(true)
+		}
+		toolMsg.SetMCPResult(result, content)
+	}
+	return &schemas.ChatMessage{
+		Role:            schemas.ChatMessageRoleTool,
+		Content:         content,
+		ChatToolMessage: toolMsg,
+	}
+}
+
+// ValidatePerUserDiscovery reports whether config may have per_user_discovery
+// on: only a per-user auth type has a credential per caller to discover with,
+// and an openapi client's tools come from its document, the same for every
+// caller.
+func ValidatePerUserDiscovery(config *schemas.MCPClientConfig) error {
+	if config == nil || config.PerUserDiscovery == nil || !*config.PerUserDiscovery {
+		return nil
+	}
+	if !config.AuthType.IsPerUser() {
+		return fmt.Errorf("per_user_discovery is only valid for per-user auth types (per_user_oauth, per_user_headers, token_exchange), not '%s', in client '%s'", config.AuthType, config.Name)
+	}
+	if config.ConnectionType == schemas.MCPConnectionTypeOpenAPI {
+		return fmt.Errorf("per_user_discovery does not apply to openapi clients, whose tools come from the OpenAPI document, in client '%s'", config.Name)
+	}
+	return nil
+}
+
+// validateMCPClientConfig validates an MCP client configuration.
+func validateMCPClientConfig(config *schemas.MCPClientConfig) error {
+	if strings.TrimSpace(config.ID) == "" {
+		return fmt.Errorf("id is required for MCP client config")
+	}
+	if err := ValidateMCPClientName(config.Name); err != nil {
+		return fmt.Errorf("invalid name for MCP client: %w", err)
+	}
+	if config.ConnectionType == "" {
+		return fmt.Errorf("connection type is required for MCP client config")
+	}
+	switch config.ConnectionType {
+	case schemas.MCPConnectionTypeHTTP:
+		if config.ConnectionString == nil {
+			return fmt.Errorf("ConnectionString is required for HTTP connection type in client '%s'", config.Name)
+		}
+	case schemas.MCPConnectionTypeSSE:
+		if config.ConnectionString == nil {
+			return fmt.Errorf("ConnectionString is required for SSE connection type in client '%s'", config.Name)
+		}
+	case schemas.MCPConnectionTypeSTDIO:
+		if config.StdioConfig == nil {
+			return fmt.Errorf("StdioConfig is required for STDIO connection type in client '%s'", config.Name)
+		}
+		// mcp-go starts no process for an empty command and leaves its stdout nil, which its
+		// reader goroutine then dereferences.
+		if strings.TrimSpace(config.StdioConfig.Command) == "" {
+			return fmt.Errorf("a stdio command is required for STDIO connection type in client '%s'", config.Name)
+		}
+	case schemas.MCPConnectionTypeInProcess:
+		// InProcess can be provided programmatically or created automatically.
+	case schemas.MCPConnectionTypeOpenAPI:
+		if err := validateOpenAPIClientConfig(config); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unknown connection type '%s' in client '%s'", config.ConnectionType, config.Name)
+	}
+	if err := validateMCPTLSConfig(config); err != nil {
+		return err
+	}
+	if config.AuthType == schemas.MCPAuthTypePerUserHeaders {
+		if len(config.PerUserHeaderKeys) == 0 {
+			return fmt.Errorf("per_user_header_keys is required (non-empty) for per_user_headers auth type in client '%s'", config.Name)
+		}
+		for i, key := range config.PerUserHeaderKeys {
+			if strings.TrimSpace(key) == "" {
+				return fmt.Errorf("per_user_header_keys[%d] is empty in client '%s'", i, config.Name)
+			}
+		}
+		if config.OauthConfigID != nil && *config.OauthConfigID != "" {
+			return fmt.Errorf("oauth_config_id must not be set for per_user_headers auth type in client '%s'", config.Name)
+		}
+	}
+	if err := ValidatePerUserDiscovery(config); err != nil {
+		return err
+	}
+	if config.AuthType == schemas.MCPAuthTypeTokenExchange {
+		if config.TokenExchange == nil || strings.TrimSpace(config.TokenExchange.Audience) == "" {
+			return fmt.Errorf("token_exchange.audience is required (non-empty) for token_exchange auth type in client '%s'", config.Name)
+		}
+		if !config.TokenExchange.ExchangesAsSSOApplication() && strings.TrimSpace(config.TokenExchange.ClientID.GetValue()) == "" && !config.TokenExchange.ClientID.IsFromSecret() {
+			return fmt.Errorf("token_exchange.client_id is required (non-empty) for token_exchange auth type in client '%s' unless use_idp_credentials is set or the profile is id_jag", config.Name)
+		}
+		if config.OauthConfigID != nil && *config.OauthConfigID != "" {
+			return fmt.Errorf("oauth_config_id must not be set for token_exchange auth type in client '%s'", config.Name)
+		}
+		if err := config.TokenExchange.ValidateProfile(); err != nil {
+			return fmt.Errorf("%w in client '%s'", err, config.Name)
+		}
+	}
+	return nil
+}
+
+// validateOpenAPIClientConfig checks the fields an openapi client needs beyond the
+// common ones: a spec source, a well-formed base URL when one is given, no
+// connection string (the upstream is openapi_config.base_url), and an auth type the
+// synthesized server can honor. OAuth-flavored and token-exchange auth drive an MCP
+// handshake against a remote MCP server; there is no such server here, so they are
+// refused rather than silently ignored.
+func validateOpenAPIClientConfig(config *schemas.MCPClientConfig) error {
+	if config.OpenAPIConfig == nil {
+		return fmt.Errorf("openapi_config is required for openapi connection type in client '%s'", config.Name)
+	}
+	if !config.OpenAPIConfig.HasSpecSource() {
+		return fmt.Errorf("openapi_config requires one of spec, spec_file or spec_url in client '%s'", config.Name)
+	}
+	if config.ConnectionString != nil && strings.TrimSpace(config.ConnectionString.GetValue()) != "" {
+		return fmt.Errorf("connection_string must not be set for openapi connection type in client '%s' (use openapi_config.base_url)", config.Name)
+	}
+	if config.OpenAPIConfig.BaseURL != nil && strings.TrimSpace(*config.OpenAPIConfig.BaseURL) != "" {
+		u, err := url.Parse(strings.TrimSpace(*config.OpenAPIConfig.BaseURL))
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("openapi_config.base_url must be an absolute http(s) URL in client '%s'", config.Name)
+		}
+	}
+	if config.OpenAPIConfig.MaxResponseBytes < 0 {
+		return fmt.Errorf("openapi_config.max_response_bytes must not be negative in client '%s'", config.Name)
+	}
+	switch config.AuthType {
+	case "", schemas.MCPAuthTypeNone, schemas.MCPAuthTypeHeaders, schemas.MCPAuthTypePerUserHeaders:
+	default:
+		return fmt.Errorf("auth_type %q is not supported for openapi connection type in client '%s' (use none, headers or per_user_headers)", config.AuthType, config.Name)
+	}
+	return nil
+}
+
+// ValidateMCPClientName validates an MCP client name.
+// Names must be ASCII-only, cannot contain spaces or hyphens, and cannot start with a number.
+func ValidateMCPClientName(name string) error {
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("name is required for MCP client")
+	}
+	for _, r := range name {
+		if r > 127 { // non-ASCII
+			return fmt.Errorf("name must contain only ASCII characters")
+		}
+	}
+	if strings.Contains(name, "-") {
+		return fmt.Errorf("name cannot contain hyphens")
+	}
+	if strings.Contains(name, " ") {
+		return fmt.Errorf("name cannot contain spaces")
+	}
+	if len(name) > 0 && name[0] >= '0' && name[0] <= '9' {
+		return fmt.Errorf("name cannot start with a number")
+	}
+	return nil
+}
+
+// parseToolName parses the tool name to be JavaScript-compatible.
+// It converts spaces and hyphens to underscores, removes invalid characters, and ensures
+// the name starts with a valid JavaScript identifier character.
+func parseToolName(toolName string) string {
+	if toolName == "" {
+		return ""
+	}
+
+	var result strings.Builder
+	runes := []rune(toolName)
+
+	// Process first character - must be letter, underscore, or dollar sign
+	if len(runes) > 0 {
+		first := runes[0]
+		if unicode.IsLetter(first) || first == '_' || first == '$' {
+			result.WriteRune(unicode.ToLower(first))
+		} else {
+			// If first char is invalid, prefix with underscore
+			result.WriteRune('_')
+			if unicode.IsDigit(first) {
+				result.WriteRune(first)
+			}
+		}
+	}
+
+	// Process remaining characters
+	for i := 1; i < len(runes); i++ {
+		r := runes[i]
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '$' {
+			result.WriteRune(unicode.ToLower(r))
+		} else if unicode.IsSpace(r) || r == '-' {
+			// Replace spaces and hyphens with single underscore
+			// Avoid consecutive underscores
+			if result.Len() > 0 && result.String()[result.Len()-1] != '_' {
+				result.WriteRune('_')
+			}
+		}
+		// Skip other invalid characters
+	}
+
+	parsed := result.String()
+
+	// Remove trailing underscores
+	parsed = strings.TrimRight(parsed, "_")
+
+	// Ensure we have at least one character
+	// Should never happen, but just in case
+	if parsed == "" {
+		return "tool"
+	}
+
+	return parsed
+}
+
+// validateNormalizedToolName validates a normalized tool name to prevent path traversal.
+// It rejects tool names that are empty, contain '/', or contain '..' after normalization.
+// This prevents issues when tool names are used in VFS file paths.
+//
+// Parameters:
+//   - normalizedName: The tool name after normalization (e.g., after replacing '-' with '_')
+//
+// Returns:
+//   - error: An error if the tool name is invalid, nil otherwise
+func validateNormalizedToolName(normalizedName string) error {
+	if normalizedName == "" {
+		return fmt.Errorf("tool name cannot be empty after normalization")
+	}
+	if strings.Contains(normalizedName, "/") {
+		return fmt.Errorf("tool name cannot contain '/' (path separator) after normalization: %s", normalizedName)
+	}
+	if strings.Contains(normalizedName, "..") {
+		return fmt.Errorf("tool name cannot contain '..' (path traversal) after normalization: %s", normalizedName)
+	}
+	return nil
+}
+
+// extractToolCallsFromCode extracts tool calls from Python/Starlark code
+// Tool calls are in the format: server_name.tool_name(...)
+func extractToolCallsFromCode(code string) ([]toolCallInfo, error) {
+	toolCalls := []toolCallInfo{}
+
+	// Regex pattern to match tool calls:
+	// - Optional "await" keyword
+	// - Server name (identifier)
+	// - Dot
+	// - Tool name (identifier)
+	// - Opening parenthesis
+	// This pattern matches: await serverName.toolName( or serverName.toolName(
+	toolCallPattern := regexp.MustCompile(`(?:await\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\.\s*([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(`)
+
+	// Find all matches
+	matches := toolCallPattern.FindAllStringSubmatch(code, -1)
+	for _, match := range matches {
+		if len(match) >= 3 {
+			serverName := match[1]
+			toolName := match[2]
+			toolCalls = append(toolCalls, toolCallInfo{
+				serverName: serverName,
+				toolName:   toolName,
+			})
+		}
+	}
+
+	return toolCalls, nil
+}
+
+// isToolCallAllowedForCodeMode checks if a tool call is allowed based on allowedAutoExecutionTools map
+func isToolCallAllowedForCodeMode(serverName, toolName string, allClientNames []string, allowedAutoExecutionTools map[string][]string) bool {
+	// Check if the server name is in the list of all client names
+	if !slices.Contains(allClientNames, serverName) {
+		// It can be a built-in Python/Starlark object, if not then downstream execution will fail with a runtime error.
+		return true
+	}
+
+	// Get allowed tools for this server
+	allowedTools, exists := allowedAutoExecutionTools[serverName]
+	if !exists {
+		// Server not in allowed list, return false to prevent downstream execution.
+		return false
+	}
+
+	// Check if wildcard "*" is present (all tools allowed)
+	if slices.Contains(allowedTools, "*") {
+		return true
+	}
+
+	// Check if specific tool is in the allowed list
+	if slices.Contains(allowedTools, toolName) {
+		return true
+	}
+
+	return false // Tool not in allowed list
+}
+
+// hasToolCalls checks if a chat response contains tool calls that need to be executed
+func hasToolCallsForChatResponse(response *schemas.BifrostChatResponse) bool {
+	if response == nil || len(response.Choices) == 0 {
+		return false
+	}
+
+	for _, choice := range response.Choices {
+		// Check finish reason - "tool_calls" explicitly signals tool execution
+		if choice.FinishReason != nil && *choice.FinishReason == "tool_calls" {
+			return true
+		}
+
+		// Check if message has tool calls regardless of finish_reason.
+		// Some providers (e.g. Gemini) return finish_reason "stop" even when tool calls are present,
+		// so we cannot rely solely on finish_reason to detect tool calls.
+		// Also, when converting from Responses API format, text and tool calls may be split
+		// across separate choices, so we must check all choices.
+		if choice.ChatNonStreamResponseChoice != nil &&
+			choice.ChatNonStreamResponseChoice.Message != nil &&
+			choice.ChatNonStreamResponseChoice.Message.ChatAssistantMessage != nil &&
+			len(choice.ChatNonStreamResponseChoice.Message.ChatAssistantMessage.ToolCalls) > 0 {
+			return true
+		}
+	}
+
+	return false
+}
+
+func hasToolCallsForResponsesResponse(response *schemas.BifrostResponsesResponse) bool {
+	if response == nil || len(response.Output) == 0 {
+		return false
+	}
+
+	// Check if any output message is a tool call
+	for _, output := range response.Output {
+		if output.Type == nil {
+			continue
+		}
+
+		// Check for tool call types
+		switch *output.Type {
+		case schemas.ResponsesMessageTypeFunctionCall, schemas.ResponsesMessageTypeCustomToolCall:
+			// Verify that ResponsesToolMessage is actually set
+			if output.ResponsesToolMessage != nil {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// StripClientPrefix removes the client name prefix from a tool name.
+// Tool names are stored with format "{clientName}-{toolName}", but when calling
+// the MCP server, we need the original tool name without the prefix.
+//
+// Parameters:
+//   - prefixedToolName: Tool name with client prefix (e.g., "calculator-add")
+//   - clientName: Client name to strip (e.g., "calculator")
+//
+// Returns:
+//   - string: Sanitized tool name without prefix (e.g., "add")
+func StripClientPrefix(prefixedToolName, clientName string) string {
+	prefix := clientName + "-"
+	if strings.HasPrefix(prefixedToolName, prefix) {
+		return strings.TrimPrefix(prefixedToolName, prefix)
+	}
+	// If prefix doesn't match, return as-is (shouldn't happen, but be safe)
+	return prefixedToolName
+}
+
+// FixArraySchemas recursively fixes array schemas by ensuring they have an 'items' field.
+// This prevents validation errors like "array schema missing items" when tools are registered.
+// It handles nested arrays (array-of-array) and recurses into items regardless of type.
+//
+// Parameters:
+//   - properties: The properties map to fix
+func FixArraySchemas(properties map[string]interface{}, logger schemas.Logger) {
+	for key, value := range properties {
+		// Check if the value is a map (representing a schema object)
+		if schemaMap, ok := value.(map[string]interface{}); ok {
+			// Check if this is an array type
+			if schemaType, ok := schemaMap["type"].(string); ok && schemaType == "array" {
+				// Check if 'items' is missing
+				if _, hasItems := schemaMap["items"]; !hasItems {
+					// Add a default 'items' schema (unconstrained)
+					schemaMap["items"] = map[string]interface{}{}
+					logger.Debug("%s Fixed array schema for property '%s': added missing 'items' field", MCPLogPrefix, key)
+				}
+				// Recurse into items regardless of type (object or array)
+				if itemsMap, ok := schemaMap["items"].(map[string]interface{}); ok {
+					itemsType, _ := itemsMap["type"].(string)
+					switch itemsType {
+					case "array":
+						// Handle nested arrays (array-of-array)
+						FixArraySchemas(map[string]interface{}{"": itemsMap}, logger)
+					case "object":
+						// Recurse into object properties
+						if itemsProps, ok := itemsMap["properties"].(map[string]interface{}); ok {
+							FixArraySchemas(itemsProps, logger)
+						}
+					}
+				}
+			}
+
+			// Recursively fix nested object properties
+			if schemaType, ok := schemaMap["type"].(string); ok && schemaType == "object" {
+				if nestedProps, ok := schemaMap["properties"].(map[string]interface{}); ok {
+					FixArraySchemas(nestedProps, logger)
+				}
+			}
+
+			// Handle anyOf, oneOf, allOf
+			for _, unionKey := range []string{"anyOf", "oneOf", "allOf"} {
+				if unionArray, ok := schemaMap[unionKey].([]interface{}); ok {
+					for _, unionItem := range unionArray {
+						if unionMap, ok := unionItem.(map[string]interface{}); ok {
+							if unionType, ok := unionMap["type"].(string); ok && unionType == "array" {
+								if _, hasItems := unionMap["items"]; !hasItems {
+									unionMap["items"] = map[string]interface{}{}
+									logger.Debug("%s Fixed array schema in %s for property '%s': added missing 'items' field", MCPLogPrefix, unionKey, key)
+								}
+								// Recurse into items regardless of type
+								if itemsMap, ok := unionMap["items"].(map[string]interface{}); ok {
+									itemsType, _ := itemsMap["type"].(string)
+									switch itemsType {
+									case "array":
+										// Handle nested arrays
+										FixArraySchemas(map[string]interface{}{"": itemsMap}, logger)
+									case "object":
+										if itemsProps, ok := itemsMap["properties"].(map[string]interface{}); ok {
+											FixArraySchemas(itemsProps, logger)
+										}
+									}
+								}
+							}
+							if nestedProps, ok := unionMap["properties"].(map[string]interface{}); ok {
+								FixArraySchemas(nestedProps, logger)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// initializeClient runs the MCP handshake for any protocol revision, offering at most maxVersion
+// ("" = uncapped). mcp-go gives up when server/discover is refused with only pre-2026-07-28
+// versions supported, so those are retried through the initialize handshake at the newest
+// version both sides support within the cap.
+func initializeClient(ctx context.Context, c *client.Client, request mcp.InitializeRequest, maxVersion string) (*mcp.InitializeResult, error) {
+	if maxVersion != "" && (request.Params.ProtocolVersion == "" || request.Params.ProtocolVersion > maxVersion) {
+		request.Params.ProtocolVersion = maxVersion
+	}
+	result, err := c.Initialize(ctx, request)
+	var unsupported mcp.UnsupportedProtocolVersionError
+	if err != nil && errors.As(err, &unsupported) {
+		legacy := newestLegacyVersion(unsupported.Supported, maxVersion)
+		if legacy == "" {
+			return nil, err
+		}
+		request.Params.ProtocolVersion = legacy
+		result, err = c.Initialize(ctx, request)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if negotiated := c.ProtocolVersion(); maxVersion != "" && negotiated > maxVersion {
+		return nil, fmt.Errorf("%w: upstream negotiated %s, newer than this client's max protocol version %s", ErrMCPProtocolVersionAboveMax, negotiated, maxVersion)
+	}
+	return result, nil
+}
+
+// ErrMCPProtocolVersionAboveMax is an upstream that negotiated past the client's max protocol
+// version. Retrying cannot change it.
+var ErrMCPProtocolVersionAboveMax = errors.New("mcp protocol version above the configured maximum")
+
+// newestLegacyVersion is the newest pre-2026-07-28 version in supported that Bifrost also
+// supports, at most maxVersion ("" = uncapped).
+func newestLegacyVersion(supported []string, maxVersion string) string {
+	for _, version := range mcp.LegacyProtocolVersions() {
+		if (maxVersion == "" || version <= maxVersion) && slices.Contains(supported, version) {
+			return version
+		}
+	}
+	return ""
+}

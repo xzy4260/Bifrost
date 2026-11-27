@@ -1,0 +1,173 @@
+{{- if and .Values.vectorStore.enabled (eq .Values.vectorStore.type "redis") .Values.vectorStore.redis.enabled (not .Values.vectorStore.redis.external.enabled) }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "bifrost.fullname" . }}-redis-master
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "bifrost.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "bifrost.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: redis
+  template:
+    metadata:
+      labels:
+        {{- include "bifrost.labels" . | nindent 8 }}
+        app.kubernetes.io/component: redis
+      {{- if .Values.vectorStore.redis.metrics.enabled }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ include "bifrost.redis.metricsPort" . | quote }}
+        prometheus.io/path: "/metrics"
+      {{- end }}
+    spec:
+      containers:
+        - name: redis
+          image: "{{ .Values.vectorStore.redis.image.repository }}:{{ .Values.vectorStore.redis.image.tag }}"
+          imagePullPolicy: {{ .Values.vectorStore.redis.image.pullPolicy }}
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          env:
+            {{- if .Values.vectorStore.redis.auth.enabled }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "bifrost.fullname" . }}-redis
+                  key: password
+            - name: REDISCLI_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "bifrost.fullname" . }}-redis
+                  key: password
+            {{- end }}
+            {{- with .Values.vectorStore.redis.master.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.vectorStore.redis.master.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.vectorStore.redis.auth.enabled }}
+          {{- $stack := contains "redis-stack" .Values.vectorStore.redis.image.repository }}
+          {{- $server := ternary "redis-stack-server" "redis-server" $stack }}
+          {{- /* redis-stack-server saves to /var/lib/redis-stack unless told otherwise, which is not the
+                 volume, so --dir points it at /data. redis-server already runs from /data. */}}
+          {{- $dir := ternary "--dir /data " "" $stack }}
+          command:
+            {{- /* The launcher does not read REDIS_ARGS (only the image entrypoint does), so with extra env
+                   set the server starts through a shell that appends it. */}}
+            {{- if or .Values.vectorStore.redis.master.extraEnv .Values.vectorStore.redis.master.envFrom }}
+            - sh
+            - -c
+            - exec {{ $server }} {{ $dir }}--requirepass "$REDIS_PASSWORD" $REDIS_ARGS
+            {{- else }}
+            - {{ $server }}
+            {{- if $stack }}
+            - --dir
+            - /data
+            {{- end }}
+            - --requirepass
+            - $(REDIS_PASSWORD)
+            {{- end }}
+          {{- end }}
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli ping
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli ping
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.vectorStore.redis.master.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+        {{- with .Values.vectorStore.redis.metrics }}
+        {{- if .enabled }}
+        {{- $image := .image | default dict }}
+        {{- $port := include "bifrost.redis.metricsPort" $ }}
+        - name: metrics
+          image: "{{ $image.repository | default "oliver006/redis_exporter" }}:{{ $image.tag | default "v1.97.0" }}"
+          imagePullPolicy: {{ $image.pullPolicy | default "IfNotPresent" }}
+          ports:
+            - name: metrics
+              containerPort: {{ $port }}
+              protocol: TCP
+          env:
+            - name: REDIS_ADDR
+              value: "redis://localhost:6379"
+            - name: REDIS_EXPORTER_WEB_LISTEN_ADDRESS
+              value: {{ printf ":%v" $port | quote }}
+            {{- /* /scrape takes any target and sends it the Redis password. Set before extraEnv so a user
+                   who needs it can override with "false". */}}
+            - name: REDIS_EXPORTER_DISABLE_SCRAPE_ENDPOINT
+              value: "true"
+            {{- if $.Values.vectorStore.redis.auth.enabled }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "bifrost.fullname" $ }}-redis
+                  key: password
+            {{- end }}
+            {{- with .extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- /* TCP, not /health: exporter basic auth set through extraEnv also guards /health, and an
+                 unauthenticated probe would restart a healthy exporter. */}}
+          livenessProbe:
+            tcpSocket:
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          {{- /* No readinessProbe, so a slow /metrics never gates Redis. This is not full isolation: a
+                 crashing or unpullable exporter still leaves the pod unready and off the Service. */}}
+          {{- with .resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- end }}
+        {{- end }}
+      volumes:
+        - name: data
+          {{- if .Values.vectorStore.redis.master.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "bifrost.fullname" . }}-redis
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+      {{- with .Values.vectorStore.redis.master.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.vectorStore.redis.master.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.vectorStore.redis.master.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

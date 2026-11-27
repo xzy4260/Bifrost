@@ -1,0 +1,371 @@
+package websocket
+
+import (
+	"fmt"
+	"testing"
+
+	ws "github.com/fasthttp/websocket"
+	"github.com/maximhq/bifrost/core/schemas"
+)
+
+// TestSessionPendingInputsAcrossLongConversation releases each turn without retaining completed IDs.
+func TestSessionPendingInputsAcrossLongConversation(t *testing.T) {
+	session := NewSession(nil)
+	for i := range 10000 {
+		id := fmt.Sprintf("item-%d", i)
+		session.RecordRealtimeInput(id, "audio", "audio event")
+		updated, closed := session.UpdateRealtimeTurnInput(RealtimeTurnInput{ItemID: id, Role: "user", Summary: "words", Raw: "transcript", TranscriptComplete: true})
+		if !updated || closed {
+			t.Fatalf("turn %d was not updated", i)
+		}
+		inputs := session.ConsumeRealtimeTurnInputs()
+		if len(inputs) != 1 || inputs[0].Summary != "words" || session.realtimeTurnInputs != nil {
+			t.Fatalf("turn %d retained inputs or lost its transcript", i)
+		}
+		updated, closed = session.UpdateRealtimeTurnInput(RealtimeTurnInput{ItemID: id, Role: "user", Summary: "late words", Raw: "late transcript"})
+		if updated || closed || len(session.PeekRealtimeTurnInputs()) != 0 {
+			t.Fatalf("turn %d reintroduced a consumed input", i)
+		}
+	}
+	session.Close()
+	_, closed := session.UpdateRealtimeTurnInput(RealtimeTurnInput{ItemID: "item", Role: "user", Summary: "words"})
+	if !closed {
+		t.Fatal("closed session must not schedule a persisted lookup")
+	}
+}
+
+// TestSessionTranscriptRacesConsumption assigns the update to either pending state or persisted lookup.
+func TestSessionTranscriptRacesConsumption(t *testing.T) {
+	for range 100 {
+		session := NewSession(nil)
+		session.RecordRealtimeInput("item", "audio", "audio event")
+		start := make(chan struct{})
+		updated := make(chan bool, 1)
+		consumed := make(chan []RealtimeTurnInput, 1)
+		go func() {
+			<-start
+			matched, _ := session.UpdateRealtimeTurnInput(RealtimeTurnInput{ItemID: "item", Role: "user", Summary: "words", Raw: "transcript", TranscriptComplete: true})
+			updated <- matched
+		}()
+		go func() {
+			<-start
+			consumed <- session.ConsumeRealtimeTurnInputs()
+		}()
+		close(start)
+		matched, inputs := <-updated, <-consumed
+		if len(inputs) != 1 || (matched && inputs[0].Summary != "words") || (!matched && inputs[0].Summary != "audio") {
+			t.Fatal("transcript was lost between pending state and persisted lookup")
+		}
+		if session.realtimeTurnInputs != nil {
+			t.Fatal("completion left a pending input behind")
+		}
+	}
+}
+
+// BenchmarkSessionRealtimeTurnLifecycle measures allocations released at each turn boundary.
+func BenchmarkSessionRealtimeTurnLifecycle(b *testing.B) {
+	session := NewSession(nil)
+	b.ReportAllocs()
+	for b.Loop() {
+		session.RecordRealtimeInput("item", "audio", "audio event")
+		session.UpdateRealtimeTurnInput(RealtimeTurnInput{ItemID: "item", Role: "user", Summary: "words", Raw: "transcript", TranscriptComplete: true})
+		session.ConsumeRealtimeTurnInputs()
+	}
+}
+
+func TestSessionManagerCreateAndGet(t *testing.T) {
+	manager := NewSessionManager(2)
+	conn := newTestConn()
+
+	session, err := manager.Create(conn)
+	if err != nil {
+		t.Fatalf("Create() unexpected error: %v", err)
+	}
+	if session == nil {
+		t.Fatal("Create() returned nil session")
+	}
+	if got := manager.Get(conn); got != session {
+		t.Fatal("Get() did not return the created session")
+	}
+	if got := manager.Count(); got != 1 {
+		t.Fatalf("Count() = %d, want 1", got)
+	}
+}
+
+func TestSessionManagerConnectionLimit(t *testing.T) {
+	manager := NewSessionManager(1)
+
+	if _, err := manager.Create(newTestConn()); err != nil {
+		t.Fatalf("first Create() unexpected error: %v", err)
+	}
+	if _, err := manager.Create(newTestConn()); err != ErrConnectionLimitReached {
+		t.Fatalf("second Create() error = %v, want %v", err, ErrConnectionLimitReached)
+	}
+}
+
+func TestSessionManagerRemove(t *testing.T) {
+	manager := NewSessionManager(2)
+	conn := newTestConn()
+
+	session, err := manager.Create(conn)
+	if err != nil {
+		t.Fatalf("Create() unexpected error: %v", err)
+	}
+
+	manager.Remove(conn)
+
+	if got := manager.Get(conn); got != nil {
+		t.Fatal("Get() should return nil after Remove()")
+	}
+	if got := manager.Count(); got != 0 {
+		t.Fatalf("Count() = %d, want 0", got)
+	}
+	if !session.closed {
+		t.Fatal("expected removed session to be closed")
+	}
+}
+
+func TestSessionLastResponseID(t *testing.T) {
+	session := NewSession(newTestConn())
+	session.SetLastResponseID("resp-123")
+
+	if got := session.LastResponseID(); got != "resp-123" {
+		t.Fatalf("LastResponseID() = %q, want %q", got, "resp-123")
+	}
+}
+
+func TestSessionManagerCloseAll(t *testing.T) {
+	manager := NewSessionManager(4)
+	connA := newTestConn()
+	connB := newTestConn()
+
+	sessionA, err := manager.Create(connA)
+	if err != nil {
+		t.Fatalf("Create(connA) unexpected error: %v", err)
+	}
+	sessionB, err := manager.Create(connB)
+	if err != nil {
+		t.Fatalf("Create(connB) unexpected error: %v", err)
+	}
+
+	manager.CloseAll()
+
+	if got := manager.Count(); got != 0 {
+		t.Fatalf("Count() = %d, want 0", got)
+	}
+	if !sessionA.closed || !sessionB.closed {
+		t.Fatal("expected all sessions to be closed")
+	}
+
+	// An upgrade accepted just before shutdown must not register a session nobody will close.
+	if _, err := manager.Create(newTestConn()); err != ErrSessionManagerClosed {
+		t.Fatalf("Create after CloseAll: err = %v, want ErrSessionManagerClosed", err)
+	}
+	if got := manager.Count(); got != 0 {
+		t.Fatalf("Count() after a refused Create = %d, want 0", got)
+	}
+}
+
+// TestSessionRealtimeInterimUsage totals the generations of one turn and starts the next turn from zero.
+func TestSessionRealtimeInterimUsage(t *testing.T) {
+	session := NewSession(nil)
+	session.AddRealtimeInterimUsage(nil)
+	if session.ConsumeRealtimeInterimUsage() != nil {
+		t.Fatal("expected no usage before any was added")
+	}
+
+	first := &schemas.BifrostLLMUsage{PromptTokens: 100, CompletionTokens: 10, TotalTokens: 110}
+	session.AddRealtimeInterimUsage(first)
+	session.AddRealtimeInterimUsage(&schemas.BifrostLLMUsage{PromptTokens: 150, CompletionTokens: 60, TotalTokens: 210})
+	got := session.ConsumeRealtimeInterimUsage()
+	if got == nil || got.PromptTokens != 250 || got.CompletionTokens != 70 || got.TotalTokens != 320 {
+		t.Fatalf("usage = %+v, want 250 in, 70 out, 320 total", got)
+	}
+	if first.PromptTokens != 100 {
+		t.Fatalf("the caller's usage was changed to %d", first.PromptTokens)
+	}
+	if session.ConsumeRealtimeInterimUsage() != nil {
+		t.Fatal("usage carried into the next turn")
+	}
+
+	session.AddRealtimeInterimUsage(first)
+	session.Close()
+	if session.ConsumeRealtimeInterimUsage() != nil {
+		t.Fatal("a closed session kept its usage")
+	}
+	session.AddRealtimeInterimUsage(first)
+	if session.ConsumeRealtimeInterimUsage() != nil {
+		t.Fatal("a closed session took new usage")
+	}
+}
+
+func TestSessionRealtimeState(t *testing.T) {
+	session := NewSession(newTestConn())
+	if session.ID() == "" {
+		t.Fatal("expected session ID to be populated")
+	}
+
+	session.SetProviderSessionID("provider-session-1")
+	if got := session.ProviderSessionID(); got != "provider-session-1" {
+		t.Fatalf("ProviderSessionID() = %q, want %q", got, "provider-session-1")
+	}
+
+	session.AppendRealtimeOutputText("hello")
+	session.AppendRealtimeOutputText(" world")
+	if got := session.ConsumeRealtimeOutputText(); got != "hello world" {
+		t.Fatalf("ConsumeRealtimeOutputText() = %q, want %q", got, "hello world")
+	}
+	if got := session.ConsumeRealtimeOutputText(); got != "" {
+		t.Fatalf("ConsumeRealtimeOutputText() after clear = %q, want empty string", got)
+	}
+
+	session.AddRealtimeInput("hello", `{"type":"conversation.item.create","item":{"role":"user"}}`)
+	session.AddRealtimeToolOutput("tool result", `{"type":"conversation.item.create","item":{"type":"function_call_output"}}`)
+	turnInputs := session.ConsumeRealtimeTurnInputs()
+	if len(turnInputs) != 2 {
+		t.Fatalf("len(ConsumeRealtimeTurnInputs()) = %d, want 2", len(turnInputs))
+	}
+	if turnInputs[0].Role != "user" || turnInputs[0].Summary != "hello" {
+		t.Fatalf("turnInputs[0] = %+v, want user hello", turnInputs[0])
+	}
+	if turnInputs[1].Role != "tool" || turnInputs[1].Summary != "tool result" {
+		t.Fatalf("turnInputs[1] = %+v, want tool result", turnInputs[1])
+	}
+	if got := session.ConsumeRealtimeTurnInputs(); len(got) != 0 {
+		t.Fatalf("len(ConsumeRealtimeTurnInputs()) after clear = %d, want 0", len(got))
+	}
+}
+
+// TestSessionRecordRealtimeInputUpdatesPendingItemAndIgnoresConsumedLateUpdate needs no completed-item history.
+func TestSessionRecordRealtimeInputUpdatesPendingItemAndIgnoresConsumedLateUpdate(t *testing.T) {
+	session := NewSession(newTestConn())
+
+	session.RecordRealtimeInput("item_1", "[Audio transcription unavailable]", `{"type":"conversation.item.done","item":{"id":"item_1"}}`)
+	session.UpdateRealtimeTurnInput(RealtimeTurnInput{ItemID: "item_1", Role: "user", Summary: "Hello.", Raw: `{"type":"conversation.item.input_audio_transcription.completed","item_id":"item_1","transcript":"Hello."}`, TranscriptComplete: true})
+
+	turnInputs := session.ConsumeRealtimeTurnInputs()
+	if len(turnInputs) != 1 {
+		t.Fatalf("len(ConsumeRealtimeTurnInputs()) = %d, want 1", len(turnInputs))
+	}
+	if turnInputs[0].ItemID != "item_1" {
+		t.Fatalf("turnInputs[0].ItemID = %q, want %q", turnInputs[0].ItemID, "item_1")
+	}
+	if turnInputs[0].Summary != "Hello." {
+		t.Fatalf("turnInputs[0].Summary = %q, want %q", turnInputs[0].Summary, "Hello.")
+	}
+
+	updated, closed := session.UpdateRealtimeTurnInput(RealtimeTurnInput{ItemID: "item_1", Role: "user", Summary: "Hello.", Raw: `{"type":"conversation.item.input_audio_transcription.completed","item_id":"item_1","transcript":"Hello."}`, TranscriptComplete: true})
+	if updated || closed {
+		t.Fatalf("late update = (%v, %v), want unmatched on an open session", updated, closed)
+	}
+	if got := session.ConsumeRealtimeTurnInputs(); len(got) != 0 {
+		t.Fatalf("len(ConsumeRealtimeTurnInputs()) after late consumed update = %d, want 0", len(got))
+	}
+}
+
+// TestSessionRecordRealtimeEchoedInput lets the provider's announcement of a user item take the place of a message
+// the client sent without an id, and nothing else.
+func TestSessionRecordRealtimeEchoedInput(t *testing.T) {
+	ids := func(session *Session) []string {
+		var got []string
+		for _, input := range session.PeekRealtimeTurnInputs() {
+			got = append(got, input.ItemID)
+		}
+		return got
+	}
+	same := func(got, want []string) bool {
+		if len(got) != len(want) {
+			return false
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				return false
+			}
+		}
+		return true
+	}
+
+	t.Run("takes the oldest message with no id of the same text", func(t *testing.T) {
+		session := NewSession(newTestConn())
+		session.RecordRealtimeInput("", "a", "client 1")
+		session.RecordRealtimeInput("", "a", "client 2")
+		session.RecordRealtimeEchoedInput("x", "a", "echo")
+		if got := ids(session); !same(got, []string{"x", ""}) {
+			t.Fatalf("ids = %q, want [x \"\"]", got)
+		}
+		if raw := session.PeekRealtimeTurnInputs()[0].Raw; raw != "echo" {
+			t.Fatalf("raw = %q, want the echo's, as for an item matched by id", raw)
+		}
+	})
+
+	t.Run("an entry that already holds the id is merged first", func(t *testing.T) {
+		session := NewSession(newTestConn())
+		session.RecordRealtimeInput("x", "a", "client with id")
+		session.RecordRealtimeInput("", "a", "client without id")
+		session.RecordRealtimeEchoedInput("x", "a", "echo")
+		if got := ids(session); !same(got, []string{"x", ""}) {
+			t.Fatalf("ids = %q, want [x \"\"]", got)
+		}
+	})
+
+	t.Run("a message of another role is not taken", func(t *testing.T) {
+		session := NewSession(newTestConn())
+		session.AddRealtimeToolOutput("a", "tool result")
+		session.RecordRealtimeEchoedInput("x", "a", "echo")
+		if got := ids(session); !same(got, []string{"", "x"}) {
+			t.Fatalf("ids = %q, want [\"\" x]", got)
+		}
+	})
+
+	t.Run("text that is empty is never a match", func(t *testing.T) {
+		session := NewSession(newTestConn())
+		session.RecordRealtimeInput("", "", "audio without a transcript")
+		session.RecordRealtimeEchoedInput("x", "", "echo")
+		if got := ids(session); !same(got, []string{"", "x"}) {
+			t.Fatalf("ids = %q, want [\"\" x]", got)
+		}
+	})
+
+	t.Run("whitespace around the text is ignored", func(t *testing.T) {
+		session := NewSession(newTestConn())
+		session.RecordRealtimeInput("", "  a  ", "client")
+		session.RecordRealtimeEchoedInput("x", "a", "echo")
+		if got := ids(session); !same(got, []string{"x"}) {
+			t.Fatalf("ids = %q, want [x]", got)
+		}
+	})
+
+	t.Run("only an announcement takes a message's place, never another recording", func(t *testing.T) {
+		session := NewSession(newTestConn())
+		session.RecordRealtimeInput("", "a", "client 1")
+		session.RecordRealtimeInput("x", "a", "client 2")
+		session.RecordRealtimeInput("", "a", "transcript without an id")
+		if got := ids(session); !same(got, []string{"", "x", ""}) {
+			t.Fatalf("ids = %q, want [\"\" x \"\"]", got)
+		}
+	})
+
+	t.Run("a closed session records nothing", func(t *testing.T) {
+		session := NewSession(newTestConn())
+		session.RecordRealtimeInput("", "a", "client")
+		session.Close()
+		session.RecordRealtimeEchoedInput("x", "a", "echo")
+		if got := ids(session); len(got) != 0 {
+			t.Fatalf("ids = %q, want none", got)
+		}
+	})
+
+	t.Run("an echo after the inputs were consumed is an input of its own", func(t *testing.T) {
+		session := NewSession(newTestConn())
+		session.RecordRealtimeInput("", "a", "client")
+		session.ConsumeRealtimeTurnInputs()
+		session.RecordRealtimeEchoedInput("x", "a", "echo")
+		if got := ids(session); !same(got, []string{"x"}) {
+			t.Fatalf("ids = %q, want [x]", got)
+		}
+	})
+}
+
+func newTestConn() *ws.Conn {
+	return &ws.Conn{}
+}

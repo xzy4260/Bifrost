@@ -1,0 +1,1824 @@
+import { CalendarAlignmentNotice } from "@/components/calendarAlignmentNotice";
+import { calendarWindowDurations, isMultiUnitDuration } from "@/lib/constants/governance";
+import { useVirtualKeyUsage } from "@/app/workspace/virtual-keys/hooks/useVirtualKeyUsage";
+import { MCPClientConfigsEditor } from "@/components/mcp/mcpClientConfigsEditor";
+import { CustomerSelector } from "@/components/entitySelectors/customerSelector";
+import { TeamSelector } from "@/components/entitySelectors/teamSelector";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import {
+	AlertDialog,
+	AlertDialogAction,
+	AlertDialogCancel,
+	AlertDialogContent,
+	AlertDialogDescription,
+	AlertDialogFooter,
+	AlertDialogHeader,
+	AlertDialogTitle,
+} from "@/components/ui/alertDialog";
+import { Button } from "@/components/ui/button";
+import { ComboboxSelect } from "@/components/ui/combobox";
+import { ConfigSyncAlert } from "@/components/ui/configSyncAlert";
+import { DateTimePicker } from "@/components/ui/datePickerWithRange";
+import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { MultiSelect } from "@/components/ui/multiSelect";
+import NumberAndSelect from "@/components/ui/numberAndSelect";
+import { ProviderConfigsEditor } from "@/components/ui/providerConfigsEditor";
+import { HeadersTable } from "@/components/ui/headersTable";
+import { DottedSeparator } from "@/components/ui/separator";
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { Switch } from "@/components/ui/switch";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Textarea } from "@/components/ui/textarea";
+import Toggle from "@/components/ui/toggle";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { resetDurationOptions, supportsCalendarAlignment } from "@/lib/constants/governance";
+import { ProviderLabels, ProviderName } from "@/lib/constants/logs";
+import { getBusinessUnitPicker } from "@/lib/registries/businessUnitPicker";
+import { getUserPicker } from "@/lib/registries/userPicker";
+import { validateVirtualKeyMetadata, virtualKeyMetadataUpdate } from "@/lib/utils/virtualKeyMetadata";
+import {
+	getErrorMessage,
+	useAttachVirtualMCPVirtualKeyMutation,
+	useCreateVirtualKeyMutation,
+	useDetachVirtualMCPVirtualKeyMutation,
+	useGetAllKeysQuery,
+	useGetCoreConfigQuery,
+	useGetProvidersQuery,
+	useGetTeamQuery,
+	useGetVirtualKeyQuery,
+	useRotateVirtualKeyMutation,
+	useUpdateVirtualKeyMutation,
+} from "@/lib/store";
+import { AgentGrantsEditor } from "@/components/agents/agentGrantsEditor";
+import { RelayGrantsEditor } from "@/components/relays/relayGrantsEditor";
+import { VirtualMcpAssignmentsEditor } from "@/components/mcp/virtualMcpAssignmentsEditor";
+import {
+	createDeleteAfterExpire,
+	diffVmcpAssignments,
+	resolveOwnerProfileState,
+	updateDeleteAfterExpire,
+	vmcpAssignmentsDirty,
+} from "./virtualKeySheet.utils";
+import { CreateVirtualKeyRequest, UpdateVirtualKeyRequest, VirtualKey } from "@/lib/types/governance";
+import ManagedVirtualKeyActions from "@enterprise/components/access-profiles/managedVirtualKeyActions";
+import { RbacOperation, RbacResource, useRbac } from "@enterprise/lib";
+import { useGetEntityAccessProfileQuery, useGetMyVKCreationPolicyQuery } from "@enterprise/lib/store/apis/accessProfileApi";
+import { useAttachVirtualKeyUsersMutation, useDetachVirtualKeyUserMutation } from "@enterprise/lib/store/apis/virtualKeyUsersApi";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { useNavigate } from "@tanstack/react-router";
+import { formatDistanceToNow } from "date-fns";
+import { AlertTriangle, Lock, RotateCcw, Users } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+// Side-effect import: registers the enterprise user picker so "Assign to User"
+// becomes available. Resolves to an empty module on OSS builds.
+import "@enterprise/lib/registrations/userPicker";
+// Same pattern for the business unit owner option.
+import "@enterprise/lib/registrations/businessUnitPicker";
+import { useForm } from "react-hook-form";
+import { Trans, useTranslation } from "react-i18next";
+import { toast } from "sonner";
+import { z } from "zod";
+import i18n, { getLocale } from "@/lib/i18n";
+import { dateFnsLocale } from "@/lib/i18n/dateLocale";
+
+interface VirtualKeySheetProps {
+	virtualKey?: VirtualKey | null;
+	// When set, the new VK is created under this owner - a team, business unit or customer. The
+	// entity assignment is pre-set and cannot be changed (but all other fields remain editable).
+	// name is only for the banner; the caller already has it, so the sheet does not look it up.
+	defaultOwner?: { kind: "team" | "business_unit" | "customer"; id: string; name?: string };
+	onSave: () => void;
+	onCancel: () => void;
+}
+
+// Provider configuration schema
+const providerConfigSchema = z.object({
+	id: z.number().optional(),
+	provider: z.string().min(1, { error: () => i18n.t("virtualKeys.providerRequired", { ns: "models" }) }),
+	weight: z
+		.number()
+		.min(0, { error: () => i18n.t("virtualKeys.weightMin", { ns: "models" }) })
+		.max(1, { error: () => i18n.t("virtualKeys.weightMax", { ns: "models" }) })
+		.optional(),
+	allowed_models: z.array(z.string()).optional(),
+	blacklisted_models: z.array(z.string()).optional(),
+	key_ids: z.array(z.string()).optional(), // Keys associated with this provider config
+	// Provider-level rate limits
+	rate_limit: z
+		.object({
+			token_max_limit: z.number().int().nonnegative().optional(),
+			token_reset_duration: z.string().optional(),
+			request_max_limit: z.number().int().nonnegative().optional(),
+			request_reset_duration: z.string().optional(),
+		})
+		.optional(),
+	// Per-model rate limits under this provider
+	model_budgets: z
+		.array(
+			z.object({
+				model_name: z
+					.string()
+					.trim()
+					.min(1, { error: () => i18n.t("virtualKeys.modelNameRequired", { ns: "models" }) }),
+				rate_limit: z
+					.object({
+						token_max_limit: z.number().int().nonnegative().optional(),
+						token_reset_duration: z.string().optional(),
+						request_max_limit: z.number().int().nonnegative().optional(),
+						request_reset_duration: z.string().optional(),
+					})
+					.optional(),
+			}),
+		)
+		.optional(),
+});
+
+const mcpConfigSchema = z.object({
+	id: z.number().optional(),
+	mcp_client_name: z.string().min(1, { error: () => i18n.t("virtualKeys.mcpClientNameRequired", { ns: "models" }) }),
+	tools_to_execute: z.array(z.string()).optional(),
+});
+
+// Main form schema
+const formSchema = z
+	.object({
+		name: z.string().min(1, { error: () => i18n.t("virtualKeys.nameRequired", { ns: "models" }) }),
+		description: z.string().optional(),
+		providerConfigs: z.array(providerConfigSchema).optional(),
+		// When true, all providers are allowed; providerConfigs remain optional per-provider overrides.
+		allowAllProviders: z.boolean(),
+		mcpConfigs: z.array(mcpConfigSchema).optional(),
+		agentGrants: z.array(z.string()).optional(),
+		// Relay access: the relays named, like agent grants.
+		relayGrants: z.array(z.string()).optional(),
+		entityType: z.enum(["team", "customer", "business_unit", "user", "none"]),
+		teamId: z.string().optional(),
+		customerId: z.string().optional(),
+		businessUnitId: z.string().optional(),
+		// Enterprise-only: a VK can be attached to at most one user, via the
+		// separate /virtual-keys/{id}/users endpoint rather than the VK payload.
+		userId: z.string().optional(),
+		isActive: z.boolean(),
+		expiresAt: z.string().nullable().optional(), // ISO 8601 datetime-local string, or null to clear
+		// Content logging for this key's traffic: inherit the client setting, force it off, or force it on.
+		contentLogging: z.enum(["inherit", "disabled", "enabled"]),
+		// Custom key/value attribution, validated against the same rules the server applies.
+		metadata: z.record(z.string(), z.string()).superRefine((metadata, ctx) => {
+			const error = validateVirtualKeyMetadata(metadata);
+			if (error) ctx.addIssue({ code: "custom", message: error });
+		}),
+		deleteAfterExpire: z.boolean(), // Only meaningful with an expiry; the daily cleanup job deletes the key once expired
+		// Calendar alignment for rate-limit windows (the field keeps its original name).
+		budgetCalendarAligned: z.boolean(),
+		// Token limits
+		tokenMaxLimit: z.number().int().nonnegative().optional(),
+		tokenResetDuration: z.string().optional(),
+		// Request limits
+		requestMaxLimit: z.number().int().nonnegative().optional(),
+		requestResetDuration: z.string().optional(),
+	})
+	.refine(
+		(data) => {
+			// If entityType is "team", teamId must be provided and not empty
+			if (data.entityType === "team") {
+				return data.teamId && data.teamId.trim() !== "";
+			}
+			// If entityType is "customer", customerId must be provided and not empty
+			if (data.entityType === "customer") {
+				return data.customerId && data.customerId.trim() !== "";
+			}
+			// If entityType is "business_unit", businessUnitId must be provided and not empty
+			if (data.entityType === "business_unit") {
+				return data.businessUnitId && data.businessUnitId.trim() !== "";
+			}
+			// If entityType is "user", userId must be provided and not empty
+			if (data.entityType === "user") {
+				return data.userId && data.userId.trim() !== "";
+			}
+			return true;
+		},
+		{
+			message: i18n.t("virtualKeys.assignmentInvalid", { ns: "models" }),
+			path: ["entityType"], // This will show the error on the entityType field
+		},
+	);
+
+type FormData = z.infer<typeof formSchema>;
+
+const pad2 = (n: number) => n.toString().padStart(2, "0");
+
+const toDatetimeLocal = (d: Date) =>
+	`${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+
+const presetFromNow = (offsetMs: number) => toDatetimeLocal(new Date(Date.now() + offsetMs));
+
+const EXPIRY_PRESETS = [
+	{ key: "preset30min" as const, testId: "30-min", ms: 30 * 60_000 },
+	{ key: "preset1hour" as const, testId: "1-hour", ms: 60 * 60_000 },
+	{ key: "preset24hours" as const, testId: "24-hours", ms: 24 * 60 * 60_000 },
+	{ key: "preset7days" as const, testId: "7-days", ms: 7 * 24 * 60 * 60_000 },
+] as const;
+
+interface ExpiryFieldProps {
+	value: string | null | undefined;
+	onChange: (v: string | null) => void;
+	deleteAfterExpire: boolean;
+	onDeleteAfterExpireChange: (v: boolean) => void;
+	// The client-wide delete_expired_virtual_keys setting; the switch starts there and a
+	// matching value is sent as inherit.
+	deleteExpiredByDefault: boolean;
+}
+
+function ExpiryPickerField({ value, onChange, deleteAfterExpire, onDeleteAfterExpireChange, deleteExpiredByDefault }: ExpiryFieldProps) {
+	const { t } = useTranslation("models");
+	// Preset timestamps are computed from Date.now() at click time, so the picked
+	// preset can't be derived back from the value; track it for highlighting.
+	const [selectedPreset, setSelectedPreset] = useState<string | null>(null);
+
+	return (
+		<FormItem>
+			<FormLabel>{t("virtualKeys.expiry")}</FormLabel>
+			<p className="text-muted-foreground text-xs">
+				{value
+					? t("virtualKeys.expiresIn", {
+							when: formatDistanceToNow(new Date(value), { addSuffix: true, locale: dateFnsLocale(i18n.language) }),
+						})
+					: t("virtualKeys.neverExpires")}
+			</p>
+			<div className="flex flex-wrap gap-1.5">
+				<Button
+					type="button"
+					variant={!value ? "default" : "outline"}
+					size="sm"
+					data-testid="vk-expiry-never"
+					onClick={() => {
+						setSelectedPreset(null);
+						onChange(null);
+						onDeleteAfterExpireChange(deleteExpiredByDefault);
+					}}
+				>
+					{t("virtualKeys.never")}
+				</Button>
+				{EXPIRY_PRESETS.map(({ key, testId, ms }) => (
+					<Button
+						key={key}
+						type="button"
+						variant={value && selectedPreset === key ? "default" : "outline"}
+						size="sm"
+						data-testid={`vk-expiry-preset-${testId}`}
+						onClick={() => {
+							setSelectedPreset(key);
+							onChange(presetFromNow(ms));
+						}}
+					>
+						{t(`virtualKeys.${key}`)}
+					</Button>
+				))}
+				<DateTimePicker
+					buttonClassName="h-8 text-sm px-3"
+					buttonVariant={value && !selectedPreset ? "default" : "outline"}
+					dateTime={value ? new Date(value) : undefined}
+					disabledBefore={new Date()}
+					onDateTimeUpdate={(dt) => {
+						setSelectedPreset(null);
+						onChange(toDatetimeLocal(dt));
+					}}
+				/>
+			</div>
+			{value && (
+				<div className="flex items-center justify-between gap-4 pt-1">
+					<div className="grid gap-0.5 leading-none">
+						<Label htmlFor="vk-delete-after-expire" className="text-sm font-normal">
+							{t("virtualKeys.deleteAfterExpire")}
+						</Label>
+						<p className="text-muted-foreground text-xs">
+							{t("virtualKeys.deleteAfterExpireHelp")}{" "}
+							{deleteAfterExpire === deleteExpiredByDefault
+								? t("virtualKeys.deleteAfterExpireFollowsDefault", {
+										state: deleteExpiredByDefault ? t("virtualKeys.stateOn") : t("virtualKeys.stateOff"),
+									})
+								: t("virtualKeys.deleteAfterExpireOverridesDefault")}
+						</p>
+					</div>
+					<Switch
+						id="vk-delete-after-expire"
+						checked={deleteAfterExpire}
+						onCheckedChange={onDeleteAfterExpireChange}
+						data-testid="vk-delete-after-expire"
+					/>
+				</div>
+			)}
+			<FormMessage />
+		</FormItem>
+	);
+}
+
+type ContentLoggingChoice = "inherit" | "disabled" | "enabled";
+
+// The wire field is tri-state (absent, true, false); the form shows it as three named choices.
+function contentLoggingChoice(disableContentLogging: boolean | null | undefined): ContentLoggingChoice {
+	if (disableContentLogging === true) return "disabled";
+	if (disableContentLogging === false) return "enabled";
+	return "inherit";
+}
+
+function contentLoggingValue(choice: ContentLoggingChoice): boolean | null {
+	if (choice === "disabled") return true;
+	if (choice === "enabled") return false;
+	return null;
+}
+
+// A key owned by a profile-holding team, customer or business unit is governed by that profile: the
+// server discards the key's own providers, budgets, rate limits and MCP access. The editors for
+// those are hidden, so drop whatever they still hold rather than send values that are thrown away.
+function withoutKeyGovernance<T extends CreateVirtualKeyRequest | UpdateVirtualKeyRequest>(request: T): T {
+	const {
+		provider_configs: _providerConfigs,
+		mcp_configs: _mcpConfigs,
+		agent_grants: _agentGrants,
+		relay_grants: _relayGrants,
+		budgets: _budgets,
+		rate_limit: _rateLimit,
+		calendar_aligned: _calendarAligned,
+		allow_all_providers: _allowAllProviders,
+		// Only declared on UpdateVirtualKeyRequest, so it is dropped here rather than deleted off the
+		// rest object, which TypeScript treats as a required property once narrowed.
+		reset_budget_usage: _resetBudgetUsage,
+		...rest
+	} = request as UpdateVirtualKeyRequest;
+	return rest as T;
+}
+
+export default function VirtualKeySheet({ virtualKey, defaultOwner, onSave, onCancel }: VirtualKeySheetProps) {
+	const { t } = useTranslation("models");
+	const { t: tc } = useTranslation("common");
+	const contentLoggingOptions = useMemo(
+		() => [
+			{ value: "inherit" as const, label: t("virtualKeys.contentLoggingInherit") },
+			{ value: "disabled" as const, label: t("virtualKeys.contentLoggingOff") },
+			{ value: "enabled" as const, label: t("virtualKeys.contentLoggingOn") },
+		],
+		[t],
+	);
+	const [isOpen, setIsOpen] = useState(true);
+	const navigate = useNavigate();
+	const isEditing = !!virtualKey;
+	// The delete-after-expire switch starts at the client-wide default; a key stores a value only
+	// when it differs, so flipping the default later still reaches keys that never overrode it.
+	// clientDeleteDefault stays undefined until the config loads; the payload helpers then send the
+	// shown value explicitly.
+	const { data: coreConfig } = useGetCoreConfigQuery({ fromDB: true });
+	const clientDeleteDefault = coreConfig?.client_config?.delete_expired_virtual_keys;
+	const deleteExpiredByDefault = clientDeleteDefault ?? false;
+
+	const hasCreateAccess = useRbac(RbacResource.VirtualKeys, RbacOperation.Create);
+	const hasUpdateAccess = useRbac(RbacResource.VirtualKeys, RbacOperation.Update);
+	const hasCreateStandalone = useRbac(RbacResource.VirtualKeys, RbacOperation.CreateStandalone);
+	const hasProvidersAccess = useRbac(RbacResource.ModelProvider, RbacOperation.View);
+	const hasKeysAccess = useRbac(RbacResource.VirtualKeys, RbacOperation.View);
+	// An owner's access profile is read through that owner's own route, so each kind needs its View.
+	const hasTeamsAccess = useRbac(RbacResource.Teams, RbacOperation.View);
+	const hasCustomersAccess = useRbac(RbacResource.Customers, RbacOperation.View);
+	const hasBusinessUnitsAccess = useRbac(RbacResource.BusinessUnits, RbacOperation.View);
+	const canSubmit = isEditing ? hasUpdateAccess : hasCreateAccess;
+
+	// Detect AP-managed status via the managing profile's virtual_key_ids, not just by the presence
+	// of assignees — directly-attached users don't imply an access-profile relation.
+	const { assignedUsers, isUserProfileManaged, isOwnerGoverned, managingProfile } = useVirtualKeyUsage(virtualKey);
+	// On create, the VK is governed when the role lacks CreateStandalone (the freedom to create
+	// ungoverned keys) *and* vkCreationPolicy resolves a profile to govern with — with no profile
+	// the server creates the key ungoverned. If governed, lock the governance fields up front:
+	// the server applies the profile regardless.
+	const {
+		data: vkCreationPolicy,
+		isError: isVkCreationPolicyError,
+		refetch: refetchVkCreationPolicy,
+	} = useGetMyVKCreationPolicyQuery(undefined, {
+		skip: isEditing,
+		refetchOnMountOrArgChange: true,
+	});
+	// Only a resolved profile governs. "Managed by your access profile" is a claim about a
+	// specific profile, so it is never made on a guess: a caller who holds none gets the plain
+	// form, which is exactly the key the server will create for them.
+	const willBeGovernedOnCreate = !isEditing && !hasCreateStandalone && !!vkCreationPolicy?.has_access_profile;
+	// A failed lookup is not an answer either, and it neither locks the form nor blocks the
+	// create: the server governs the key correctly whatever this form shows, so all that is at
+	// stake is whether these fields survive. It says so and offers a retry.
+	const isVkCreationPolicyUnresolved = !isEditing && !hasCreateStandalone && isVkCreationPolicyError;
+	// The full lock is for a user's managed key. A key its owner's access profile governs is the
+	// owner's key: it is edited, reassigned and unassigned here like any other, and only its
+	// governance fields follow the owner's profile (isGovernedByOwnerProfile below).
+	const isManagedByProfile = (isEditing && isUserProfileManaged) || willBeGovernedOnCreate;
+	// User assignment is enterprise-only: OSS registers no picker, so the option stays hidden.
+	const UserPicker = getUserPicker();
+	// Business unit ownership is enterprise-only for the same reason: the option shows only when a
+	// picker is registered.
+	const BusinessUnitPicker = getBusinessUnitPicker();
+	// A VK can have at most one user (enforced by a unique index server-side).
+	const assignedUserId = assignedUsers[0]?.id ?? "";
+	const assignedUserLabel = assignedUsers[0]?.name || assignedUsers[0]?.email || assignedUserId;
+	// Owner attachment: when creating from an entity's own sheet (defaultOwner provided), the entity
+	// assignment is pre-set and locked. When editing an existing VK the assignment can be changed.
+	const lockedOwner = !isEditing ? defaultOwner : undefined;
+	const isOwnerLocked = !!lockedOwner;
+	const lockedOwnerLabel = { team: "team", business_unit: "business unit", customer: "customer" }[lockedOwner?.kind ?? "team"];
+	const attachedTeamId = isEditing ? virtualKey?.team_id || "" : lockedOwner?.kind === "team" ? lockedOwner.id : "";
+	// The banner names the owner. A caller that did not pass a name falls back to the team lookup
+	// (the one owner kind with a plain by-id read here), and then to the id itself.
+	const { data: attachedTeamData } = useGetTeamQuery(attachedTeamId, {
+		skip: !isOwnerLocked || !attachedTeamId || !!lockedOwner?.name || !hasTeamsAccess,
+	});
+	const lockedOwnerName = lockedOwner?.name || attachedTeamData?.team?.name || lockedOwner?.id || "";
+
+	const handleClose = () => {
+		setIsOpen(false);
+		setTimeout(() => {
+			onCancel();
+		}, 150); // Slightly longer than the 100ms animation duration
+	};
+
+	// RTK Query hooks. Skipped without the permission, which also keeps their error toasts quiet.
+	const { error: providersError } = useGetProvidersQuery(undefined, { skip: !hasProvidersAccess });
+	const { error: keysError } = useGetAllKeysQuery(undefined, { skip: !hasKeysAccess });
+	const [createVirtualKey, { isLoading: isCreating }] = useCreateVirtualKeyMutation();
+	const [updateVirtualKey, { isLoading: isUpdating }] = useUpdateVirtualKeyMutation();
+	const [rotateVirtualKey, { isLoading: isRotating }] = useRotateVirtualKeyMutation();
+	const [attachVirtualKeyUsers, { isLoading: isAttachingUser }] = useAttachVirtualKeyUsersMutation();
+	const [detachVirtualKeyUser, { isLoading: isDetachingUser }] = useDetachVirtualKeyUserMutation();
+	const [attachVirtualMCPVirtualKey] = useAttachVirtualMCPVirtualKeyMutation();
+	const [detachVirtualMCPVirtualKey] = useDetachVirtualMCPVirtualKeyMutation();
+	// Tracks the whole attach/detach reconciliation, which spans several sequential requests whose
+	// own loading states go idle between them; without it Save could re-enable mid-reconcile.
+	const [isReconcilingVmcps, setIsReconcilingVmcps] = useState(false);
+	const isLoading = isCreating || isUpdating || isRotating || isAttachingUser || isDetachingUser || isReconcilingVmcps;
+
+	// Virtual MCPs this key is assigned to. The list VK carries none, so fetch the single VK (which
+	// includes virtual_mcp_ids); stage edits locally and reconcile attach/detach on Save.
+	const {
+		data: vkDetail,
+		isLoading: isVkDetailLoading,
+		isError: isVkDetailError,
+		refetch: refetchVkDetail,
+	} = useGetVirtualKeyQuery(virtualKey?.id ?? "", { skip: !isEditing || !virtualKey?.id });
+	const originalVmcpIds = vkDetail?.virtual_mcp_ids ?? [];
+	const [assignedVmcpIds, setAssignedVmcpIds] = useState<number[]>([]);
+	const vmcpsInitialized = useRef(false);
+	useEffect(() => {
+		if (isEditing && vkDetail && !vmcpsInitialized.current) {
+			setAssignedVmcpIds(vkDetail.virtual_mcp_ids ?? []);
+			vmcpsInitialized.current = true;
+		}
+	}, [isEditing, vkDetail]);
+	// For an existing key the baseline isn't trustworthy until the detail query lands, so the editor
+	// stays disabled and dirty stays false while it loads or errors (see gating on the editor below).
+	const vmcpDetailReady = !isEditing || (!!vkDetail && !isVkDetailLoading && !isVkDetailError);
+	const vmcpDirty = vmcpDetailReady && vmcpAssignmentsDirty(originalVmcpIds, assignedVmcpIds);
+
+	// Attach the newly-assigned Virtual MCPs and detach the removed ones for this key. On any failure,
+	// resync local state from the server so a later Save reconciles against what actually persisted.
+	const reconcileVmcpAssignments = async (vkId: string) => {
+		const { toAttach, toDetach } = diffVmcpAssignments(originalVmcpIds, assignedVmcpIds);
+		if (toAttach.length === 0 && toDetach.length === 0) return;
+		setIsReconcilingVmcps(true);
+		try {
+			for (const id of toAttach) {
+				await attachVirtualMCPVirtualKey({ id, vkId }).unwrap();
+			}
+			for (const id of toDetach) {
+				await detachVirtualMCPVirtualKey({ id, vkId }).unwrap();
+			}
+		} catch (error) {
+			try {
+				const refreshed = await refetchVkDetail().unwrap();
+				setAssignedVmcpIds(refreshed.virtual_mcp_ids ?? []);
+			} catch {
+				// Leave staged state as-is if the resync itself fails; the outer handler surfaces the error.
+			}
+			throw error;
+		} finally {
+			setIsReconcilingVmcps(false);
+		}
+	};
+	// Form setup
+	const form = useForm<z.input<typeof formSchema>, unknown, FormData>({
+		resolver: zodResolver(formSchema),
+		defaultValues: {
+			name: virtualKey?.name || "",
+			description: virtualKey?.description || "",
+			providerConfigs:
+				virtualKey?.provider_configs?.map((config) => ({
+					id: config.id,
+					provider: config.provider,
+					weight: config.weight ?? undefined,
+					allowed_models: config.allowed_models || [],
+					blacklisted_models: config.blacklisted_models || [],
+					key_ids: config.allow_all_keys ? ["*"] : config.keys?.map((key) => key.key_id) || [],
+					rate_limit: config.rate_limit
+						? {
+								token_max_limit: config.rate_limit.token_max_limit ?? undefined,
+								token_reset_duration: config.rate_limit.token_reset_duration,
+								request_max_limit: config.rate_limit.request_max_limit ?? undefined,
+								request_reset_duration: config.rate_limit.request_reset_duration,
+							}
+						: undefined,
+					model_budgets: config.model_budgets?.map((mb) => ({
+						model_name: mb.model_name,
+						rate_limit: mb.rate_limit
+							? {
+									token_max_limit: mb.rate_limit.token_max_limit ?? undefined,
+									token_reset_duration: mb.rate_limit.token_reset_duration,
+									request_max_limit: mb.rate_limit.request_max_limit ?? undefined,
+									request_reset_duration: mb.rate_limit.request_reset_duration,
+								}
+							: undefined,
+					})),
+				})) || [],
+			allowAllProviders: virtualKey?.allow_all_providers ?? false,
+			agentGrants: virtualKey?.agent_grants?.map((grant) => grant.agent_name) || [],
+			relayGrants: virtualKey?.relay_grants?.map((grant) => grant.relay_name) || [],
+			mcpConfigs:
+				virtualKey?.mcp_configs?.map((config) => ({
+					id: config.id,
+					mcp_client_name: config.mcp_client?.name || "",
+					tools_to_execute: config.tools_to_execute || [],
+				})) || [],
+			entityType: virtualKey?.team_id
+				? "team"
+				: virtualKey?.customer_id
+					? "customer"
+					: virtualKey?.business_unit_id
+						? "business_unit"
+						: (lockedOwner?.kind ?? "none"),
+			teamId: virtualKey?.team_id || (lockedOwner?.kind === "team" ? lockedOwner.id : ""),
+			customerId: virtualKey?.customer_id || (lockedOwner?.kind === "customer" ? lockedOwner.id : ""),
+			businessUnitId: virtualKey?.business_unit_id || (lockedOwner?.kind === "business_unit" ? lockedOwner.id : ""),
+			// The attached user arrives from a separate request; synced in below once it loads.
+			userId: "",
+			isActive: virtualKey?.is_active ?? true,
+			contentLogging: contentLoggingChoice(virtualKey?.disable_content_logging),
+			metadata: virtualKey?.metadata ?? {},
+			deleteAfterExpire: virtualKey?.delete_after_expire ?? deleteExpiredByDefault,
+			expiresAt: virtualKey?.expires_at
+				? (() => {
+						const d = new Date(virtualKey.expires_at);
+						return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+					})()
+				: null,
+			budgetCalendarAligned: virtualKey?.calendar_aligned ?? false,
+			tokenMaxLimit: virtualKey?.rate_limit?.token_max_limit ?? undefined,
+			tokenResetDuration: virtualKey?.rate_limit?.token_reset_duration || "1h",
+			requestMaxLimit: virtualKey?.rate_limit?.request_max_limit ?? undefined,
+			requestResetDuration: virtualKey?.rate_limit?.request_reset_duration || "1h",
+		},
+	});
+
+	// Handle keys loading error
+	useEffect(() => {
+		if (keysError) {
+			toast.error(t("virtualKeys.failedLoadKeys", { message: getErrorMessage(keysError) }));
+		}
+	}, [keysError, t]);
+
+	// Handle providers loading error
+	useEffect(() => {
+		if (providersError) {
+			toast.error(t("virtualKeys.failedLoadProviders", { message: getErrorMessage(providersError) }));
+		}
+	}, [providersError, t]);
+
+	// Clear the ids that don't belong to the selected entity type
+	useEffect(() => {
+		const entityType = form.watch("entityType");
+		if (entityType === "none") {
+			form.setValue("teamId", "", { shouldDirty: true });
+			form.setValue("customerId", "", { shouldDirty: true });
+			form.setValue("businessUnitId", "", { shouldDirty: true });
+			form.setValue("userId", "", { shouldDirty: true });
+		} else if (entityType === "team") {
+			form.setValue("customerId", "", { shouldDirty: true });
+			form.setValue("businessUnitId", "", { shouldDirty: true });
+			form.setValue("userId", "", { shouldDirty: true });
+		} else if (entityType === "customer") {
+			form.setValue("teamId", "", { shouldDirty: true });
+			form.setValue("businessUnitId", "", { shouldDirty: true });
+			form.setValue("userId", "", { shouldDirty: true });
+		} else if (entityType === "business_unit") {
+			form.setValue("teamId", "", { shouldDirty: true });
+			form.setValue("customerId", "", { shouldDirty: true });
+			form.setValue("userId", "", { shouldDirty: true });
+		} else if (entityType === "user") {
+			form.setValue("teamId", "", { shouldDirty: true });
+			form.setValue("customerId", "", { shouldDirty: true });
+			form.setValue("businessUnitId", "", { shouldDirty: true });
+		}
+	}, [form.watch("entityType"), form]);
+
+	// The VK-user association is fetched separately from the VK itself, so it can't be part of
+	// defaultValues. Seed it once when it arrives, and only if the user hasn't already touched the
+	// assignment (their in-progress edit must win over a late-arriving response).
+	const didSyncAssignedUser = useRef(false);
+	useEffect(() => {
+		if (didSyncAssignedUser.current || !isEditing || !assignedUserId) return;
+		didSyncAssignedUser.current = true;
+		if (form.formState.dirtyFields.entityType || form.getValues("entityType") !== "none") return;
+		form.setValue("entityType", "user");
+		form.setValue("userId", assignedUserId);
+	}, [assignedUserId, isEditing, form]);
+
+	// The client config can arrive after the form was seeded; follow it while the user hasn't
+	// touched the switch and the key has no override of its own.
+	useEffect(() => {
+		if (form.formState.dirtyFields.deleteAfterExpire) return;
+		if (virtualKey?.delete_after_expire != null) return;
+		form.setValue("deleteAfterExpire", deleteExpiredByDefault);
+	}, [deleteExpiredByDefault, virtualKey?.delete_after_expire, form]);
+
+	// Get current provider configs from form
+	const providerConfigs = form.watch("providerConfigs") || [];
+
+	// Whether "Allow all providers" is on
+	const allowAllProviders = form.watch("allowAllProviders");
+
+	// Get current MCP configs from form
+	const mcpConfigs = form.watch("mcpConfigs") || [];
+
+	// A team, customer or business unit can hold an access profile, which then governs every key
+	// the entity owns: the server strips the key's own providers, budgets, rate limits and MCP
+	// access on create or move. Resolve the profile of whichever owner is selected (including the
+	// locked defaultTeamId) so the sheet can lock those fields before Save. A 404 (no profile) or
+	// any other error leaves data undefined, which reads as "not governed". The lookup needs View on
+	// the owner's kind and is skipped without it (see resolveOwnerProfileState).
+	const watchedEntityType = form.watch("entityType");
+	const watchedTeamId = form.watch("teamId");
+	const watchedCustomerId = form.watch("customerId");
+	const watchedBusinessUnitId = form.watch("businessUnitId");
+	const owner =
+		watchedEntityType === "team" && watchedTeamId
+			? { entityType: "team" as const, entityId: watchedTeamId, label: tc("entities.team") }
+			: watchedEntityType === "customer" && watchedCustomerId
+				? { entityType: "customer" as const, entityId: watchedCustomerId, label: tc("entities.customer") }
+				: watchedEntityType === "business_unit" && watchedBusinessUnitId
+					? { entityType: "business_unit" as const, entityId: watchedBusinessUnitId, label: t("virtualKeys.ownerBusinessUnit") }
+					: undefined;
+	const canReadOwnerProfile = owner
+		? { team: hasTeamsAccess, customer: hasCustomersAccess, business_unit: hasBusinessUnitsAccess }[owner.entityType]
+		: false;
+	const {
+		data: ownerProfileData,
+		isError: isOwnerProfileError,
+		isFetching: isOwnerProfileFetching,
+		error: ownerProfileError,
+		refetch: refetchOwnerProfile,
+	} = useGetEntityAccessProfileQuery(
+		{ entityType: owner?.entityType ?? "team", entityId: owner?.entityId ?? "" },
+		{ skip: !owner || !canReadOwnerProfile },
+	);
+	// While a newly selected owner's lookup is in flight, data still holds the previous owner's
+	// response; matching the entity keeps that stale profile from locking the form.
+	const ownerProfile =
+		owner &&
+		canReadOwnerProfile &&
+		!isOwnerProfileError &&
+		ownerProfileData?.access_profile?.entity_type === owner.entityType &&
+		ownerProfileData.access_profile?.entity_id === owner.entityId
+			? ownerProfileData.access_profile
+			: undefined;
+	// The key's current owner, as the server stored it, for when the owner's profile cannot be read.
+	const isCurrentOwner =
+		isEditing &&
+		!!owner &&
+		owner.entityId ===
+			{ team: virtualKey?.team_id, customer: virtualKey?.customer_id, business_unit: virtualKey?.business_unit_id }[owner.entityType];
+	// Only a 404 means "this owner holds no profile". Any other failure leaves the answer unknown,
+	// and unknown must not read as ungoverned: the governance editors would unlock, and a save would
+	// send fields the server discards for a governed owner - reporting success while dropping the
+	// operator's edits. Same for the window where the lookup is still in flight, including the one
+	// after switching owners, when the response in hand is still the previous owner's.
+	// Absent data is not "still loading": the OSS build answers this from a stub that has no backend
+	// to ask, and a settled "no profile" has to read as ungoverned or Save would never enable there.
+	// Pending is what isFetching says, and nothing else.
+	// A caller without View on the owner's kind never asks, so it is neither pending nor failed.
+	const ownerProfileStatus = (ownerProfileError as unknown as { status?: number } | null | undefined)?.status;
+	const {
+		isGoverned: isGovernedByOwnerProfile,
+		failed: ownerProfileFailed,
+		unknown: isOwnerProfileUnknown,
+	} = resolveOwnerProfileState({
+		hasOwner: !!owner,
+		canReadOwnerProfile,
+		isFetching: isOwnerProfileFetching,
+		isError: isOwnerProfileError,
+		errorStatus: ownerProfileStatus,
+		hasOwnerProfile: !!ownerProfile,
+		isServerFlaggedCurrentOwner: isCurrentOwner && isOwnerGoverned,
+	});
+	// An owner-governed key gave its own configuration up to the profile, so taking it off that owner
+	// (unassigning it, or moving it under an owner without a profile) leaves it with nothing
+	// configured until it is set up again here.
+	const originalOwnerId = virtualKey?.team_id || virtualKey?.customer_id || virtualKey?.business_unit_id || "";
+	const leavesGoverningOwner =
+		isEditing && isOwnerGoverned && (owner?.entityId ?? "") !== originalOwnerId && !isGovernedByOwnerProfile && !isOwnerProfileUnknown;
+	const ownerProfileNotice =
+		ownerProfile && owner ? (
+			<p data-testid="vk-owner-profile-notice">
+				<Trans
+					i18nKey="virtualKeys.ownerProfileNotice"
+					ns="models"
+					values={{ name: ownerProfile.name, owner: owner.label }}
+					components={{ name: <span className="font-medium" /> }}
+				/>
+			</p>
+		) : isGovernedByOwnerProfile && owner ? (
+			<p data-testid="vk-owner-profile-notice">{t("virtualKeys.ownerProfileNoticeUnnamed", { owner: owner.label })}</p>
+		) : null;
+
+	// Watch rate-limit fields for conditional rendering of reset buttons
+	const watchedTokenMaxLimit = form.watch("tokenMaxLimit");
+	const watchedRequestMaxLimit = form.watch("requestMaxLimit");
+	const watchedTokenResetDuration = form.watch("tokenResetDuration");
+	const watchedRequestResetDuration = form.watch("requestResetDuration");
+	const watchedBudgetCalendarAligned = form.watch("budgetCalendarAligned");
+
+	// Calendar alignment is VK-wide: show the toggle when any configured rate limit uses a
+	// calendar-alignable duration.
+	const hasAnyAlignableRateLimit =
+		(watchedTokenMaxLimit !== undefined &&
+			watchedTokenMaxLimit !== null &&
+			(supportsCalendarAlignment(watchedTokenResetDuration || "1h") || isMultiUnitDuration(watchedTokenResetDuration || "1h"))) ||
+		(watchedRequestMaxLimit !== undefined &&
+			watchedRequestMaxLimit !== null &&
+			(supportsCalendarAlignment(watchedRequestResetDuration || "1h") || isMultiUnitDuration(watchedRequestResetDuration || "1h")));
+	const showCalendarAlignToggle =
+		hasAnyAlignableRateLimit ||
+		calendarWindowDurations(providerConfigs).some((duration) => supportsCalendarAlignment(duration) || isMultiUnitDuration(duration));
+
+	// Handle adding a new MCP client configuration
+	const handleAddMCPClient = (mcpClientName: string) => {
+		const existingConfig = mcpConfigs.find((config) => config.mcp_client_name === mcpClientName);
+		if (existingConfig) {
+			toast.error(t("virtualKeys.mcpAlreadyConfigured"));
+			return;
+		}
+
+		const newConfig = {
+			mcp_client_name: mcpClientName,
+			tools_to_execute: ["*"],
+		};
+
+		form.setValue("mcpConfigs", [...mcpConfigs, newConfig], {
+			shouldDirty: true,
+		});
+	};
+
+	// Handle removing an MCP client configuration
+	const handleRemoveMCPClient = (index: number) => {
+		const updatedConfigs = mcpConfigs.filter((_, i) => i !== index);
+		form.setValue("mcpConfigs", updatedConfigs, { shouldDirty: true });
+	};
+
+	// Handle updating MCP client configuration
+	const handleUpdateMCPConfig = (index: number, field: keyof (typeof mcpConfigs)[0], value: any) => {
+		const updatedConfigs = [...mcpConfigs];
+		updatedConfigs[index] = { ...updatedConfigs[index], [field]: value };
+		form.setValue("mcpConfigs", updatedConfigs, { shouldDirty: true });
+	};
+
+	const [showCalendarAlignWarning, setShowCalendarAlignWarning] = useState(false);
+	const [showReassignTeamWarning, setShowReassignTeamWarning] = useState(false);
+	const [pendingTeamId, setPendingTeamId] = useState<string | null>(null);
+	const [showRotateWarning, setShowRotateWarning] = useState(false);
+
+	const handleCalendarAlignedChange = (checked: boolean) => {
+		if (checked && isEditing) {
+			// Show warning when enabling on an existing VK
+			setShowCalendarAlignWarning(true);
+		} else {
+			form.setValue("budgetCalendarAligned", checked, { shouldDirty: true });
+		}
+	};
+
+	const clearVirtualKeyRateLimits = () => {
+		form.setValue("tokenMaxLimit", undefined, { shouldDirty: true });
+		form.setValue("tokenResetDuration", "1h", { shouldDirty: true });
+		form.setValue("requestMaxLimit", undefined, { shouldDirty: true });
+		form.setValue("requestResetDuration", "1h", { shouldDirty: true });
+	};
+
+	// Build a request rate-limit payload from the form's rate-limit fields. Returns the field
+	// values when a limit is set, {} to clear an existing rate limit (removal), or undefined.
+	const normalizeRateLimit = (
+		rl:
+			| { token_max_limit?: number; token_reset_duration?: string; request_max_limit?: number; request_reset_duration?: string }
+			| undefined,
+		hadExisting: boolean,
+	) => {
+		const hasToken = rl?.token_max_limit !== undefined;
+		const hasRequest = rl?.request_max_limit !== undefined;
+		if (hasToken || hasRequest) {
+			return {
+				token_max_limit: rl?.token_max_limit ?? null,
+				token_reset_duration: hasToken ? rl?.token_reset_duration || "1h" : null,
+				request_max_limit: rl?.request_max_limit ?? null,
+				request_reset_duration: hasRequest ? rl?.request_reset_duration || "1h" : null,
+			};
+		}
+		return hadExisting ? {} : undefined;
+	};
+
+	const normalizeProviderConfigs = (configs: typeof providerConfigs, existingConfigs?: VirtualKey["provider_configs"]): any[] => {
+		return configs.map((config) => {
+			const existingConfig = existingConfigs?.find((item) => (config.id ? item.id === config.id : item.provider === config.provider));
+			return {
+				...config,
+				weight: config.weight ?? null,
+				rate_limit: normalizeRateLimit(config.rate_limit, !!existingConfig?.rate_limit),
+				// Full desired per-model set: drop unfilled models, keep an empty array so the
+				// backend prunes any per-model limits removed here.
+				model_budgets: (config.model_budgets || [])
+					.filter((mb) => mb.model_name && mb.model_name.trim() !== "")
+					.map((mb) => {
+						const existingMB = existingConfig?.model_budgets?.find((m) => m.model_name === mb.model_name.trim());
+						return {
+							model_name: mb.model_name.trim(),
+							rate_limit: normalizeRateLimit(mb.rate_limit, !!existingMB?.rate_limit),
+						};
+					})
+					.filter((mb) => mb.rate_limit !== undefined),
+			};
+		});
+	};
+
+	const handleRotateVirtualKey = async () => {
+		if (!virtualKey) return;
+		if (!hasUpdateAccess) {
+			toast.error(t("virtualKeys.noPermission"));
+			return;
+		}
+		try {
+			const result = await rotateVirtualKey(virtualKey.id).unwrap();
+			const graceUntil = result.virtual_key?.previous_value_expires_at;
+			toast.success(
+				graceUntil
+					? t("virtualKeys.rotatedWithGrace", { when: new Date(graceUntil).toLocaleString(getLocale()) })
+					: t("virtualKeys.rotatedSuccess"),
+			);
+			setShowRotateWarning(false);
+			onSave();
+		} catch (error) {
+			toast.error(getErrorMessage(error));
+		}
+	};
+
+	const submitVirtualKeyForm = async (data: FormData) => {
+		if (!canSubmit) {
+			toast.error(t("virtualKeys.noPermission"));
+			return;
+		}
+		try {
+			// Managed VKs only allow name + description updates; all other fields are owned by the access profile.
+			if (isManagedByProfile && virtualKey) {
+				await updateVirtualKey({
+					vkId: virtualKey.id,
+					data: {
+						name: data.name,
+						description: data.description,
+						// Content logging is the key's own privacy setting, not profile-governed access, so a
+						// managed key keeps it editable and the save must carry it (null clears to inherit).
+						disable_content_logging: contentLoggingValue(data.contentLogging),
+						// Metadata is attribution on the key itself, not profile-governed access, so it stays editable too.
+						// Sent only when edited: the server replaces it as a whole.
+						...virtualKeyMetadataUpdate(form.formState.defaultValues?.metadata, data.metadata),
+					},
+				}).unwrap();
+				toast.success(t("virtualKeys.updatedShort"));
+				onSave();
+				return;
+			}
+
+			// Normalize provider configs to ensure weights are numbers and handle budget/rate limits
+			const normalizedProviderConfigs = data.providerConfigs
+				? normalizeProviderConfigs(data.providerConfigs, virtualKey?.provider_configs)
+				: [];
+
+			// User assignment lives on its own endpoint (POST/DELETE /virtual-keys/{id}/users) —
+			// the same one the user detail sheet uses — so it is applied alongside the VK payload,
+			// never inside it. Team/customer/business unit are mutually exclusive with it and get cleared.
+			const targetUserId = data.entityType === "user" ? (data.userId || "").trim() : "";
+			const clearsEntity = data.entityType === "none" || data.entityType === "user";
+			// Each owner id is sent only when it is the selected owner; naming one owner clears the other
+			// two server-side, and an update that names none clears all three with null.
+			const ownerIdFor = (type: FormData["entityType"], id: string | undefined) =>
+				data.entityType === type && id && id.trim() !== "" ? id : undefined;
+			const ownerUpdateFor = (type: FormData["entityType"], id: string | undefined) =>
+				ownerIdFor(type, id) ?? (clearsEntity ? null : undefined);
+
+			if (isEditing && virtualKey) {
+				// Update existing virtual key
+				// Only include expires_at when the user actually changed the expiry field
+				// (a timestamp sets it, "" clears it). Pre-filled defaultValues are not dirty,
+				// so an unchanged expired key won't resend its old expired timestamp and
+				// cause the backend to reject the edit.
+				const expiryChanged = !!form.formState.dirtyFields.expiresAt;
+				const expiryPayload = expiryChanged
+					? data.expiresAt
+						? { expires_at: new Date(data.expiresAt).toISOString() }
+						: virtualKey?.expires_at
+							? { expires_at: "" }
+							: {}
+					: {};
+				const deleteAfterExpire = updateDeleteAfterExpire({
+					switchTouched: !!form.formState.dirtyFields.deleteAfterExpire,
+					expiryChanged,
+					hasExpiry: !!data.expiresAt,
+					value: data.deleteAfterExpire,
+					clientDefault: clientDeleteDefault,
+					storedOverride: virtualKey.delete_after_expire,
+				});
+				const deleteAfterExpirePayload = deleteAfterExpire !== undefined ? { delete_after_expire: deleteAfterExpire } : {};
+				const agentGrantsPayload = form.formState.dirtyFields.agentGrants
+					? { agent_grants: (data.agentGrants ?? []).map((agent_name) => ({ agent_name })) }
+					: {};
+				const relayGrantsPayload = form.formState.dirtyFields.relayGrants
+					? { relay_grants: (data.relayGrants ?? []).map((relay_name) => ({ relay_name })) }
+					: {};
+
+				const updateData: UpdateVirtualKeyRequest = {
+					name: data.name,
+					description: data.description,
+					provider_configs: normalizedProviderConfigs,
+					mcp_configs: data.mcpConfigs,
+					team_id: ownerUpdateFor("team", data.teamId),
+					customer_id: ownerUpdateFor("customer", data.customerId),
+					business_unit_id: ownerUpdateFor("business_unit", data.businessUnitId),
+					is_active: data.isActive,
+					calendar_aligned: data.budgetCalendarAligned,
+					allow_all_providers: data.allowAllProviders,
+					// null clears the key back to inheriting the client setting; the server keeps omitted and
+					// null apart, so this is always sent.
+					disable_content_logging: contentLoggingValue(data.contentLogging),
+					...agentGrantsPayload,
+					...relayGrantsPayload,
+					// Sent only when edited, since it replaces the stored metadata as a whole ({} clears it);
+					// an untouched form copy may be older than what is stored now.
+					...virtualKeyMetadataUpdate(form.formState.defaultValues?.metadata, data.metadata),
+					...expiryPayload,
+					...deleteAfterExpirePayload,
+				};
+
+				// Add rate limit if enabled
+				const hadRateLimit = !!virtualKey.rate_limit;
+				const hasTokenMaxLimit = data.tokenMaxLimit !== undefined;
+				const hasRequestMaxLimit = data.requestMaxLimit !== undefined;
+				const hasRateLimit = hasTokenMaxLimit || hasRequestMaxLimit;
+				if (hasRateLimit) {
+					updateData.rate_limit = {
+						token_max_limit: data.tokenMaxLimit ?? null,
+						token_reset_duration: hasTokenMaxLimit ? data.tokenResetDuration || "1h" : null,
+						request_max_limit: data.requestMaxLimit ?? null,
+						request_reset_duration: hasRequestMaxLimit ? data.requestResetDuration || "1h" : null,
+					};
+				} else if (hadRateLimit) {
+					updateData.rate_limit = {};
+				}
+
+				await updateVirtualKey({
+					vkId: virtualKey.id,
+					data: isGovernedByOwnerProfile ? withoutKeyGovernance(updateData) : updateData,
+				}).unwrap();
+
+				// Apply the user assignment after the VK payload, so a key moving from a team to a
+				// user has its team cleared before the attach lands.
+				if (targetUserId !== assignedUserId) {
+					try {
+						if (assignedUserId) {
+							await detachVirtualKeyUser({ vkId: virtualKey.id, userId: assignedUserId }).unwrap();
+						}
+						if (targetUserId) {
+							await attachVirtualKeyUsers({
+								vkId: virtualKey.id,
+								data: { user_ids: [targetUserId], preserve_usage: false },
+							}).unwrap();
+						}
+					} catch (attachError) {
+						// The owner change is already committed. Moving to a user clears team, customer and
+						// business unit, so a failed attachment would leave the key with no owner at all -
+						// put the previous owner back before the error is reported.
+						const hadOwner = !!(virtualKey.team_id || virtualKey.customer_id || virtualKey.business_unit_id);
+						if (clearsEntity && hadOwner) {
+							try {
+								await updateVirtualKey({
+									vkId: virtualKey.id,
+									data: {
+										team_id: virtualKey.team_id ?? null,
+										customer_id: virtualKey.customer_id ?? null,
+										business_unit_id: virtualKey.business_unit_id ?? null,
+									},
+								}).unwrap();
+							} catch {
+								// The restore failed too; the attachment error below is the one to surface.
+							}
+						}
+						throw attachError;
+					}
+				}
+				if (!isGovernedByOwnerProfile) {
+					await reconcileVmcpAssignments(virtualKey.id);
+				}
+				toast.success(t("virtualKeys.updatedSuccess"));
+			} else {
+				// Create new virtual key
+				const createDeleteAfterExpireValue = createDeleteAfterExpire(data.deleteAfterExpire, clientDeleteDefault);
+				const createData: CreateVirtualKeyRequest = {
+					name: data.name,
+					description: data.description || undefined,
+					provider_configs: normalizedProviderConfigs,
+					mcp_configs: data.mcpConfigs,
+					agent_grants: (data.agentGrants ?? []).map((agent_name) => ({ agent_name })),
+					relay_grants: (data.relayGrants ?? []).map((relay_name) => ({ relay_name })),
+					team_id: ownerIdFor("team", data.teamId),
+					customer_id: ownerIdFor("customer", data.customerId),
+					business_unit_id: ownerIdFor("business_unit", data.businessUnitId),
+					is_active: data.isActive,
+					// VK-level setting that governs rate-limit calendar alignment.
+					calendar_aligned: data.budgetCalendarAligned,
+					allow_all_providers: data.allowAllProviders,
+					// Optional expiry: send as UTC ISO string, or omit for no expiry. An omitted flag inherits
+					// the workspace default.
+					...(data.expiresAt
+						? {
+								expires_at: new Date(data.expiresAt).toISOString(),
+								...(createDeleteAfterExpireValue !== undefined ? { delete_after_expire: createDeleteAfterExpireValue } : {}),
+							}
+						: {}),
+					// Omitted means inherit on create.
+					...(data.contentLogging !== "inherit" ? { disable_content_logging: data.contentLogging === "disabled" } : {}),
+					...(Object.keys(data.metadata).length > 0 ? { metadata: data.metadata } : {}),
+				};
+
+				// Add rate limit if enabled
+				const hasTokenMaxLimit = data.tokenMaxLimit !== undefined;
+				const hasRequestMaxLimit = data.requestMaxLimit !== undefined;
+				if (hasTokenMaxLimit || hasRequestMaxLimit) {
+					createData.rate_limit = {
+						token_max_limit: data.tokenMaxLimit,
+						token_reset_duration: hasTokenMaxLimit ? data.tokenResetDuration || "1h" : undefined,
+						request_max_limit: data.requestMaxLimit,
+						request_reset_duration: hasRequestMaxLimit ? data.requestResetDuration || "1h" : undefined,
+					};
+				}
+
+				const created = await createVirtualKey(isGovernedByOwnerProfile ? withoutKeyGovernance(createData) : createData).unwrap();
+				if (targetUserId) {
+					// The key exists at this point; surface the assignment failure separately so the
+					// user knows the key was created but is unassigned.
+					try {
+						await attachVirtualKeyUsers({
+							vkId: created.virtual_key.id,
+							data: { user_ids: [targetUserId], preserve_usage: false },
+						}).unwrap();
+					} catch (error) {
+						toast.error(t("virtualKeys.createdButUserFailed"), {
+							description: getErrorMessage(error),
+						});
+						onSave();
+						return;
+					}
+				}
+				try {
+					if (!isGovernedByOwnerProfile) await reconcileVmcpAssignments(created.virtual_key.id);
+				} catch (error) {
+					toast.error(t("virtualKeys.createdButVmcpFailed"), { description: getErrorMessage(error) });
+					onSave();
+					return;
+				}
+				toast.success(t("virtualKeys.createdSuccess"));
+			}
+
+			onSave();
+		} catch (error: any) {
+			if (error?.status === 409) {
+				form.setError("name", { message: getErrorMessage(error) });
+				return;
+			}
+			toast.error(getErrorMessage(error));
+		}
+	};
+
+	// Handle form submission
+	const onSubmit = async (data: FormData) => {
+		await submitVirtualKeyForm(data);
+	};
+
+	return (
+		<Sheet open={isOpen} onOpenChange={(open) => !open && handleClose()}>
+			<SheetContent
+				className="flex w-full flex-col gap-4 overflow-x-hidden p-0 pt-4"
+				data-testid="vk-sheet-content"
+				onInteractOutside={(e) => e.preventDefault()}
+				onEscapeKeyDown={() => handleClose()}
+			>
+				<SheetHeader className="flex flex-col items-start px-0 py-4" headerClassName="mb-0 sticky -top-4 bg-card z-10 px-4 md:px-8">
+					<SheetTitle className="flex items-center gap-2">{isEditing ? virtualKey?.name : t("virtualKeys.create")}</SheetTitle>
+					<SheetDescription>{isEditing ? t("virtualKeys.editDescriptionLong") : t("virtualKeys.createDescriptionLong")}</SheetDescription>
+				</SheetHeader>
+
+				<Form {...form}>
+					<form onSubmit={form.handleSubmit(onSubmit)} className="flex h-full flex-col gap-6">
+						<div className="grow space-y-4 px-4 md:px-8">
+							{isVkCreationPolicyUnresolved && (
+								<Alert variant="warning">
+									<AlertTriangle className="h-4 w-4" />
+									<AlertDescription className="flex items-center justify-between gap-4">
+										<span>{t("virtualKeys.creationPolicyCheckFailed")}</span>
+										<Button type="button" size="sm" variant="outline" onClick={() => refetchVkCreationPolicy()}>
+											{t("virtualKeys.retry")}
+										</Button>
+									</AlertDescription>
+								</Alert>
+							)}
+							{ownerProfileFailed && (
+								<Alert variant="destructive" data-testid="vk-owner-profile-error">
+									<AlertTriangle className="h-4 w-4" />
+									<AlertDescription className="flex w-full items-center justify-between gap-3">
+										<span>{t("virtualKeys.ownerProfileError", { owner: owner?.label ?? t("virtualKeys.ownerFallback") })}</span>
+										<Button
+											type="button"
+											size="sm"
+											variant="outline"
+											onClick={() => void refetchOwnerProfile()}
+											data-testid="vk-owner-profile-retry"
+										>
+											{t("virtualKeys.retry")}
+										</Button>
+									</AlertDescription>
+								</Alert>
+							)}
+							{(isManagedByProfile || isGovernedByOwnerProfile) && (
+								<>
+									<Alert variant="info">
+										<Lock className="h-4 w-4" />
+										<AlertDescription>
+											{ownerProfileNotice
+												? ownerProfileNotice
+												: isEditing
+													? t("virtualKeys.managedEditHelp")
+													: t("virtualKeys.managedCreateHelp")}
+										</AlertDescription>
+									</Alert>
+									{isEditing && isManagedByProfile && <ManagedVirtualKeyActions managingProfile={managingProfile} />}
+								</>
+							)}
+
+							{isOwnerLocked && !isManagedByProfile && (
+								<Alert variant="info">
+									<Users className="h-4 w-4" />
+									<AlertDescription>
+										<Trans
+											i18nKey={isGovernedByOwnerProfile ? "virtualKeys.ownerLockedGovernedHelp" : "virtualKeys.ownerLockedHelp"}
+											ns="models"
+											values={{ kind: lockedOwnerLabel, name: lockedOwnerName }}
+											components={{ name: <span className="font-medium" /> }}
+										/>
+									</AlertDescription>
+								</Alert>
+							)}
+
+							{/* Basic Information */}
+							<div className="space-y-4">
+								<FormField
+									control={form.control}
+									name="name"
+									render={({ field }) => (
+										<FormItem>
+											<FormLabel>{t("virtualKeys.nameStar")}</FormLabel>
+											<FormControl>
+												<Input placeholder={t("virtualKeys.namePlaceholder")} data-testid="vk-name-input" {...field} />
+											</FormControl>
+											<FormMessage />
+										</FormItem>
+									)}
+								/>
+
+								<FormField
+									control={form.control}
+									name="description"
+									render={({ field }) => (
+										<FormItem>
+											<FormLabel>{t("virtualKeys.description")}</FormLabel>
+											<FormControl>
+												<Textarea
+													placeholder={t("virtualKeys.descriptionPlaceholder")}
+													data-testid="vk-description-input"
+													{...field}
+													rows={3}
+												/>
+											</FormControl>
+											<FormMessage />
+										</FormItem>
+									)}
+								/>
+								{/* Content logging is a privacy setting on the key itself, not access governance, so it
+								stays editable for a profile-managed key too. */}
+								<FormField
+									control={form.control}
+									name="contentLogging"
+									render={({ field }) => (
+										<FormItem>
+											<FormLabel>{t("virtualKeys.contentLogging")}</FormLabel>
+											{/* FormControl hands the trigger the label's id and aria attributes; hideClear because the
+											choice is an enum with no empty state. */}
+											<FormControl>
+												<ComboboxSelect
+													options={contentLoggingOptions}
+													value={field.value}
+													onValueChange={field.onChange}
+													disableSearch
+													hideClear
+													data-testid="vk-content-logging-select"
+													optionTestId={(value) => `vk-content-logging-option-${value}`}
+												/>
+											</FormControl>
+											<p className="text-muted-foreground text-xs">{t("virtualKeys.contentLoggingHelp")}</p>
+											<FormMessage />
+										</FormItem>
+									)}
+								/>
+								{/* Metadata is attribution on the key itself (cost center, owner, ...), so like content logging it
+								stays editable for a profile-managed key. */}
+								<FormField
+									control={form.control}
+									name="metadata"
+									render={({ field }) => (
+										<FormItem data-testid="vk-metadata-section">
+											<HeadersTable
+												label={t("virtualKeys.metadata")}
+												value={field.value ?? {}}
+												onChange={field.onChange}
+												keyPlaceholder={t("virtualKeys.metadataKeyPlaceholder")}
+												valuePlaceholder={t("virtualKeys.metadataValuePlaceholder")}
+												useSecretVarInput={false}
+											/>
+											<p className="text-muted-foreground text-xs">{t("virtualKeys.metadataHelp")}</p>
+											<FormMessage />
+										</FormItem>
+									)}
+								/>
+							</div>
+							{!isManagedByProfile && (
+								<div className="space-y-4">
+									<div className="space-y-4">
+										<FormField
+											control={form.control}
+											name="isActive"
+											render={({ field }) => (
+												<FormItem>
+													<Toggle
+														label={t("virtualKeys.isActive")}
+														val={field.value}
+														setVal={field.onChange}
+														data-testid="vk-is-active-toggle"
+													/>
+												</FormItem>
+											)}
+										/>
+										<FormField
+											control={form.control}
+											name="expiresAt"
+											render={({ field }) => (
+												<ExpiryPickerField
+													value={field.value}
+													onChange={field.onChange}
+													deleteAfterExpire={form.watch("deleteAfterExpire")}
+													onDeleteAfterExpireChange={(v) => form.setValue("deleteAfterExpire", v, { shouldDirty: true })}
+													deleteExpiredByDefault={deleteExpiredByDefault}
+												/>
+											)}
+										/>
+									</div>
+									{/* The owner's access profile supplies providers, MCP access, budgets and rate limits,
+									    so the key's own editors are hidden while a profile-holding owner is selected. */}
+									{!isGovernedByOwnerProfile && (
+										<>
+											{/* Provider Configurations */}
+											<ProviderConfigsEditor
+												testIdPrefix="vk"
+												value={providerConfigs.map((config) => ({
+													providerName: config.provider,
+													allowedModels: config.allowed_models || [],
+													blacklistedModels: config.blacklisted_models || [],
+													weight: config.weight,
+													keyIds: config.key_ids || [],
+													budgets: [],
+													rateLimit: config.rate_limit ?? null,
+													modelBudgets: (config.model_budgets || []).map((mb) => ({
+														model_name: mb.model_name,
+														budgets: [],
+														rate_limit: mb.rate_limit,
+													})),
+												}))}
+												onChange={(entries) =>
+													form.setValue(
+														"providerConfigs",
+														entries.map((entry) => ({
+															provider: entry.providerName,
+															allowed_models: entry.allowedModels,
+															blacklisted_models: entry.blacklistedModels,
+															weight: entry.weight ?? undefined,
+															key_ids: entry.keyIds,
+															rate_limit: entry.rateLimit ?? undefined,
+															model_budgets: entry.modelBudgets?.map((mb) => ({
+																model_name: mb.model_name,
+																rate_limit: mb.rate_limit,
+															})),
+														})),
+														{ shouldDirty: true },
+													)
+												}
+												allowAllProviders={allowAllProviders}
+												onAllowAllProvidersChange={(checked) => form.setValue("allowAllProviders", checked, { shouldDirty: true })}
+												showBudgets={false}
+												showModelBudgets={false}
+												onManageProviders={() => navigate({ to: "/workspace/providers" })}
+												error={form.formState.errors.providerConfigs?.message}
+											/>
+											{/* MCP Server Configurations */}
+											<MCPClientConfigsEditor
+												value={mcpConfigs}
+												onChange={(next) => form.setValue("mcpConfigs", next, { shouldDirty: true })}
+												showDefaultsNote
+											/>
+											{/* Virtual MCP assignments: attach this key to Virtual MCPs (reconciled on Save). Renders
+											    inline like the MCP server editor above; assignedVmcpIds fills in from the VK detail
+											    (its assignment baseline) once it loads, and vmcpDetailReady keeps Save from acting on a
+											    diff before that baseline is in. */}
+											<VirtualMcpAssignmentsEditor value={assignedVmcpIds} onChange={setAssignedVmcpIds} />
+
+											{/* Agent access grants for the registered agents this key may call. */}
+											<AgentGrantsEditor
+												value={form.watch("agentGrants") ?? []}
+												onChange={(next) => form.setValue("agentGrants", next, { shouldDirty: true })}
+											/>
+
+											{/* Relay access grants for the relays this key may call. */}
+											<RelayGrantsEditor
+												value={form.watch("relayGrants") ?? []}
+												onChange={(next) => form.setValue("relayGrants", next, { shouldDirty: true })}
+											/>
+											<DottedSeparator className="mt-6 mb-5" />
+											{/* Rate Limiting Configuration */}
+											<div className="space-y-4">
+												<div className="flex items-center justify-between gap-2">
+													<Label className="text-sm font-medium">{t("virtualKeys.rateLimitingConfiguration")}</Label>
+													{isEditing && (virtualKey?.rate_limit || watchedTokenMaxLimit || watchedRequestMaxLimit) && (
+														<Button
+															type="button"
+															variant="ghost"
+															size="sm"
+															onClick={clearVirtualKeyRateLimits}
+															data-testid="vk-rate-limit-reset-button"
+														>
+															<RotateCcw className="h-4 w-4" />
+															{t("providers.reset")}
+														</Button>
+													)}
+												</div>
+
+												<FormField
+													control={form.control}
+													name="tokenMaxLimit"
+													render={({ field }) => (
+														<FormItem>
+															<NumberAndSelect
+																id="tokenMaxLimit"
+																labelClassName="font-normal"
+																label={t("modelLimits.maximumTokens")}
+																value={field.value}
+																selectValue={form.watch("tokenResetDuration") || "1h"}
+																onChangeNumber={(value) => {
+																	field.onChange(value);
+																}}
+																onChangeSelect={(value) =>
+																	form.setValue("tokenResetDuration", value, {
+																		shouldDirty: true,
+																	})
+																}
+																options={resetDurationOptions}
+															/>
+															<FormMessage />
+														</FormItem>
+													)}
+												/>
+
+												<FormField
+													control={form.control}
+													name="requestMaxLimit"
+													render={({ field }) => (
+														<FormItem>
+															<NumberAndSelect
+																id="requestMaxLimit"
+																labelClassName="font-normal"
+																label={t("modelLimits.maximumRequests")}
+																value={field.value}
+																selectValue={form.watch("requestResetDuration") || "1h"}
+																onChangeNumber={(value) => {
+																	field.onChange(value);
+																}}
+																onChangeSelect={(value) =>
+																	form.setValue("requestResetDuration", value, {
+																		shouldDirty: true,
+																	})
+																}
+																options={resetDurationOptions}
+															/>
+															<FormMessage />
+														</FormItem>
+													)}
+												/>
+											</div>
+											{/* Calendar alignment: VK-wide setting that applies to rate limits */}
+											<CalendarAlignmentNotice
+												enabled={watchedBudgetCalendarAligned}
+												durations={[
+													...calendarWindowDurations([
+														{
+															rate_limit: {
+																token_max_limit: watchedTokenMaxLimit,
+																token_reset_duration: watchedTokenResetDuration,
+																request_max_limit: watchedRequestMaxLimit,
+																request_reset_duration: watchedRequestResetDuration,
+															},
+														},
+														...providerConfigs,
+													]),
+												]}
+											/>
+											{showCalendarAlignToggle && (
+												<div className="flex items-center justify-between gap-4 rounded-md border px-3 py-2">
+													<div className="space-y-0.5">
+														<Label htmlFor="vk-budget-calendar-aligned-toggle" className="text-sm font-normal">
+															{t("virtualKeys.alignCalendar")}
+														</Label>
+														<p id="vk-budget-calendar-aligned-description" className="text-muted-foreground text-xs">
+															{t("virtualKeys.alignCalendarHelp")}
+														</p>
+													</div>
+													<Switch
+														id="vk-budget-calendar-aligned-toggle"
+														aria-describedby="vk-budget-calendar-aligned-description"
+														checked={watchedBudgetCalendarAligned}
+														onCheckedChange={handleCalendarAlignedChange}
+														data-testid="vk-budget-calendar-aligned-toggle"
+													/>
+												</div>
+											)}
+
+											{/* Warning dialog shown when enabling calendar alignment on an existing VK */}
+											<AlertDialog open={showCalendarAlignWarning} onOpenChange={setShowCalendarAlignWarning}>
+												<AlertDialogContent>
+													<AlertDialogHeader>
+														<AlertDialogTitle>{t("virtualKeys.resetUsageTitle")}</AlertDialogTitle>
+														<AlertDialogDescription>
+															<Trans
+																i18nKey="virtualKeys.resetUsageDescription"
+																ns="models"
+																components={{ strong: <span className="font-semibold" /> }}
+															/>
+														</AlertDialogDescription>
+													</AlertDialogHeader>
+													<AlertDialogFooter>
+														<AlertDialogCancel data-testid="vk-calendar-align-cancel-btn">{tc("cancel")}</AlertDialogCancel>
+														<AlertDialogAction
+															data-testid="vk-calendar-align-enable-btn"
+															onClick={() => {
+																form.setValue("budgetCalendarAligned", true, {
+																	shouldDirty: true,
+																});
+																setShowCalendarAlignWarning(false);
+															}}
+														>
+															{t("virtualKeys.enableCalendarAlignment")}
+														</AlertDialogAction>
+													</AlertDialogFooter>
+												</AlertDialogContent>
+											</AlertDialog>
+										</>
+									)}
+									{/* Reassign team confirmation dialog */}
+									<AlertDialog
+										open={showReassignTeamWarning}
+										onOpenChange={(open) => {
+											setShowReassignTeamWarning(open);
+											if (!open) {
+												setPendingTeamId(null);
+											}
+										}}
+									>
+										<AlertDialogContent>
+											<AlertDialogHeader>
+												<AlertDialogTitle>{t("virtualKeys.reassignTeamTitle")}</AlertDialogTitle>
+												<AlertDialogDescription>{t("virtualKeys.reassignTeamDescription")}</AlertDialogDescription>
+											</AlertDialogHeader>
+											<AlertDialogFooter>
+												<AlertDialogCancel data-testid="virtual-key-reassign-cancel" onClick={() => setPendingTeamId(null)}>
+													{tc("cancel")}
+												</AlertDialogCancel>{" "}
+												<AlertDialogAction
+													data-testid="virtual-key-reassign-confirm"
+													onClick={() => {
+														if (pendingTeamId !== null) {
+															form.setValue("teamId", pendingTeamId, {
+																shouldDirty: true,
+															});
+															void form.trigger("entityType");
+														}
+														setPendingTeamId(null);
+														setShowReassignTeamWarning(false);
+													}}
+												>
+													{t("virtualKeys.reassign")}{" "}
+												</AlertDialogAction>
+											</AlertDialogFooter>
+										</AlertDialogContent>
+									</AlertDialog>
+									<DottedSeparator className="my-6" />
+
+									{/* Entity Assignment */}
+									<div className="space-y-4">
+										<Label className="text-sm font-medium">{t("virtualKeys.entityAssignment")}</Label>
+										{leavesGoverningOwner && (
+											<Alert variant="warning" data-testid="vk-leaves-governing-owner-warning">
+												<AlertTriangle className="h-4 w-4" />
+												<AlertDescription>
+													{t("virtualKeys.leavesGoverningOwner")}{" "}
+													{form.watch("entityType") === "user"
+														? t("virtualKeys.leavesGoverningOwnerUser")
+														: t("virtualKeys.leavesGoverningOwnerUnassigned")}
+												</AlertDescription>
+											</Alert>
+										)}
+
+										<div className="grid grid-cols-1 items-start gap-2 md:grid-cols-2">
+											<FormField
+												control={form.control}
+												name="entityType"
+												render={({ field }) => (
+													<FormItem>
+														<FormLabel className="font-normal">{t("virtualKeys.assignmentType")}</FormLabel>
+														<ComboboxSelect
+															options={[
+																{ value: "none", label: t("virtualKeys.noAssignment") },
+																{ value: "team", label: t("virtualKeys.assignToTeam") },
+																{
+																	value: "customer",
+																	label: t("virtualKeys.assignToCustomer"),
+																},
+																// Enterprise-only, like the user option below; kept visible when the VK is
+																// already owned by a business unit so the current state is never mislabelled.
+																...(BusinessUnitPicker || field.value === "business_unit"
+																	? [{ value: "business_unit", label: t("virtualKeys.assignToBusinessUnit") }]
+																	: []),
+																// Enterprise-only; also kept visible when the VK is already
+																// user-assigned so the current state is never mislabelled.
+																...(UserPicker || field.value === "user" ? [{ value: "user", label: t("virtualKeys.assignToUser") }] : []),
+															]}
+															value={field.value}
+															onValueChange={(value) => {
+																const val = value ?? "none";
+																field.onChange(val);
+																// Switching type clears the other ids and lets the user pick;
+																// there is no entity list loaded to default from.
+																// Defer validation until submit or until an entity is chosen,
+																// eager trigger left a stuck refine error on entityType.
+																form.setValue("teamId", "", { shouldDirty: true });
+																form.setValue("customerId", "", { shouldDirty: true });
+																form.setValue("businessUnitId", "", { shouldDirty: true });
+																form.setValue("userId", "", { shouldDirty: true });
+																form.clearErrors(["entityType", "teamId", "customerId", "businessUnitId", "userId"]);
+															}}
+															disabled={isOwnerLocked}
+															disableSearch
+															hideClear
+															className="h-9"
+														/>
+														<FormMessage />
+													</FormItem>
+												)}
+											/>
+											{form.watch("entityType") === "team" && (
+												<FormField
+													control={form.control}
+													name="teamId"
+													render={({ field }) => (
+														<FormItem>
+															<FormLabel className="font-normal">{t("virtualKeys.selectTeam")}</FormLabel>
+															<TeamSelector
+																value={field.value || ""}
+																onChange={(newVal) => {
+																	if (isEditing && virtualKey?.team_id && newVal && newVal !== virtualKey.team_id) {
+																		setPendingTeamId(newVal);
+																		setShowReassignTeamWarning(true);
+																	} else {
+																		field.onChange(newVal);
+																		// Refine error lives on entityType; re-run so a valid
+																		// team selection clears the assignment-type message.
+																		void form.trigger("entityType");
+																	}
+																}}
+																// The already-assigned team may fall outside the
+																// selector's first page, so seed its label from the
+																// team embedded on the virtual key itself.
+																fallbackOption={
+																	field.value
+																		? {
+																				value: field.value,
+																				label: field.value === virtualKey?.team_id ? (virtualKey?.team?.name ?? field.value) : field.value,
+																			}
+																		: null
+																}
+																disabled={isOwnerLocked}
+																triggerClassName="h-9"
+															/>
+															<FormMessage />
+														</FormItem>
+													)}
+												/>
+											)}
+
+											{form.watch("entityType") === "customer" && (
+												<FormField
+													control={form.control}
+													name="customerId"
+													render={({ field }) => (
+														<FormItem>
+															<FormLabel className="font-normal">{t("virtualKeys.selectCustomer")}</FormLabel>
+															<CustomerSelector
+																value={field.value || ""}
+																disabled={isOwnerLocked}
+																onChange={(val) => {
+																	field.onChange(val);
+																	void form.trigger("entityType");
+																}}
+																fallbackOption={
+																	field.value
+																		? {
+																				value: field.value,
+																				label:
+																					field.value === virtualKey?.customer_id
+																						? (virtualKey?.customer?.name ?? field.value)
+																						: field.value,
+																			}
+																		: null
+																}
+																triggerClassName="h-9"
+															/>
+															<FormMessage />
+														</FormItem>
+													)}
+												/>
+											)}
+
+											{form.watch("entityType") === "business_unit" && BusinessUnitPicker && (
+												<FormField
+													control={form.control}
+													name="businessUnitId"
+													render={({ field }) => (
+														<FormItem>
+															<FormLabel className="font-normal">{t("virtualKeys.selectBusinessUnit")}</FormLabel>
+															<BusinessUnitPicker
+																value={field.value || ""}
+																disabled={isOwnerLocked}
+																onChange={(val) => {
+																	field.onChange(val);
+																	void form.trigger("entityType");
+																}}
+																// No fallbackOption: the key carries only the business unit id (no
+																// preloaded relation), so the picker resolves the selected label itself.
+																triggerClassName="h-9"
+															/>
+															<FormMessage />
+														</FormItem>
+													)}
+												/>
+											)}
+
+											{form.watch("entityType") === "user" && UserPicker && (
+												<FormField
+													control={form.control}
+													name="userId"
+													render={({ field }) => (
+														<FormItem>
+															<FormLabel className="font-normal">{t("virtualKeys.selectUser")}</FormLabel>
+															<UserPicker
+																value={field.value || ""}
+																onChange={(val) => {
+																	field.onChange(val);
+																	void form.trigger("entityType");
+																}}
+																// The attached user may fall outside the picker's first
+																// page; seed the label resolved from the association.
+																fallbackOption={
+																	field.value
+																		? {
+																				value: field.value,
+																				label: field.value === assignedUserId ? assignedUserLabel : field.value,
+																			}
+																		: null
+																}
+																triggerClassName="h-9"
+															/>
+															<FormMessage />
+														</FormItem>
+													)}
+												/>
+											)}
+										</div>
+										{form.watch("entityType") === "user" && (
+											<p className="text-muted-foreground text-xs">{t("virtualKeys.userAssignmentHelp")}</p>
+										)}
+									</div>
+								</div>
+							)}
+						</div>
+						<AlertDialog open={showRotateWarning} onOpenChange={setShowRotateWarning}>
+							<AlertDialogContent>
+								<AlertDialogHeader>
+									<AlertDialogTitle>{t("virtualKeys.rotateTitle")}</AlertDialogTitle>
+									<AlertDialogDescription>{t("virtualKeys.rotateDescription", { name: virtualKey?.name })}</AlertDialogDescription>
+								</AlertDialogHeader>
+								<AlertDialogFooter>
+									<AlertDialogCancel data-testid="vk-rotate-cancel-btn">{tc("cancel")}</AlertDialogCancel>
+									<AlertDialogAction onClick={handleRotateVirtualKey} disabled={isRotating} data-testid="vk-rotate-confirm-btn">
+										{isRotating ? t("virtualKeys.rotating") : t("virtualKeys.rotateKey")}
+									</AlertDialogAction>
+								</AlertDialogFooter>
+							</AlertDialogContent>
+						</AlertDialog>
+						{isEditing && virtualKey?.config_hash && (
+							<div className="px-4 md:px-8">
+								<ConfigSyncAlert className="mt-2" />
+							</div>
+						)}
+						{/* Form Footer */}
+						<div className="border-border bg-card sticky bottom-0 z-10 border-t px-4 py-4 md:px-8">
+							<div className="flex items-center justify-between gap-2">
+								{isEditing ? (
+									<Button
+										type="button"
+										variant="outline"
+										onClick={() => setShowRotateWarning(true)}
+										disabled={!hasUpdateAccess || isRotating}
+										data-testid="vk-rotate-btn"
+									>
+										<RotateCcw className="h-4 w-4" />
+										{isRotating ? t("virtualKeys.rotating") : t("virtualKeys.rotateKey")}
+									</Button>
+								) : (
+									<span />
+								)}
+								<div className="flex justify-end gap-2">
+									<Button type="button" variant="outline" onClick={handleClose} data-testid="vk-cancel-btn">
+										{tc("cancel")}
+									</Button>
+									<TooltipProvider>
+										<Tooltip>
+											<TooltipTrigger asChild>
+												<span className="inline-block">
+													<Button
+														type="submit"
+														disabled={isLoading || !(form.formState.isDirty || vmcpDirty) || !canSubmit || isOwnerProfileUnknown}
+														data-testid="vk-save-btn"
+													>
+														{isLoading ? t("virtualKeys.saving") : isEditing ? t("virtualKeys.update") : t("virtualKeys.createAction")}
+													</Button>
+												</span>
+											</TooltipTrigger>
+											{(isLoading || !(form.formState.isDirty || vmcpDirty) || !canSubmit || isOwnerProfileUnknown) && (
+												<TooltipContent>
+													<p>
+														{!canSubmit
+															? t("virtualKeys.noPermission")
+															: isLoading
+																? t("virtualKeys.saving")
+																: ownerProfileFailed
+																	? t("virtualKeys.ownerProfileCheckFailed")
+																	: isOwnerProfileUnknown
+																		? t("virtualKeys.ownerProfileChecking")
+																		: !(form.formState.isDirty || vmcpDirty)
+																			? t("providers.noChanges")
+																			: ""}{" "}
+													</p>
+												</TooltipContent>
+											)}
+										</Tooltip>
+									</TooltipProvider>
+								</div>
+							</div>
+						</div>
+					</form>
+				</Form>
+			</SheetContent>
+		</Sheet>
+	);
+}

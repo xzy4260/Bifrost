@@ -1,0 +1,81 @@
+import { BifrostSpeech, SpeechInput } from "@/lib/types/logs";
+import { AlertCircle, Play, Volume2 } from "lucide-react";
+import React, { Component } from "react";
+import { useTranslation } from "react-i18next";
+import i18n from "@/lib/i18n";
+import AudioPlayer from "./audioPlayer";
+
+interface SpeechViewProps {
+	speechInput?: SpeechInput;
+	speechOutput?: BifrostSpeech;
+	isStreaming?: boolean;
+}
+
+// Error boundary specifically for audio player errors
+class AudioErrorBoundary extends Component<{ children: React.ReactNode }, { hasError: boolean; error: Error | null }> {
+	constructor(props: { children: React.ReactNode }) {
+		super(props);
+		this.state = { hasError: false, error: null };
+	}
+
+	static getDerivedStateFromError(error: Error) {
+		return { hasError: true, error };
+	}
+
+	componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
+		console.error("Audio player error:", error, errorInfo);
+	}
+
+	render() {
+		if (this.state.hasError) {
+			return (
+				<div className="flex items-center gap-2 rounded-sm border border-red-200 bg-red-50 p-4 text-sm text-red-800">
+					<AlertCircle className="h-4 w-4" />
+					<span>
+						{i18n.t("logs.speech.audioPlayerFailed", {
+							ns: "observability",
+							message: this.state.error?.message || i18n.t("logs.speech.unknownError", { ns: "observability" }),
+						})}
+					</span>
+				</div>
+			);
+		}
+
+		return this.props.children;
+	}
+}
+
+export default function SpeechView({ speechInput, speechOutput, isStreaming }: SpeechViewProps) {
+	const { t } = useTranslation("observability");
+	return (
+		<div className="space-y-4">
+			{/* Speech Input */}
+			{speechInput && (
+				<div className="w-full rounded-sm border" data-testid="log-speech-input">
+					<div className="flex items-center gap-2 border-b px-6 py-2 text-sm font-medium">
+						<Volume2 className="h-4 w-4" />
+						{t("logs.speech.input")}
+					</div>
+					<div className="space-y-4 p-6">
+						<div className="font-mono text-xs">{speechInput.input}</div>
+					</div>
+				</div>
+			)}
+
+			{/* Speech Output */}
+			{(speechOutput || isStreaming) && (
+				<div className="w-full rounded-sm border" data-testid="log-speech-output">
+					<div className="flex items-center gap-2 border-b px-6 py-2 text-sm font-medium">
+						<Play className="h-4 w-4" />
+						{t("logs.speech.output")}
+					</div>
+					<div className="space-y-4 p-6">
+						<AudioErrorBoundary>
+							<AudioPlayer src={speechOutput?.audio || ""} />
+						</AudioErrorBoundary>
+					</div>
+				</div>
+			)}
+		</div>
+	);
+}

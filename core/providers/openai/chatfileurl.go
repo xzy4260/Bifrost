@@ -1,0 +1,390 @@
+package openai
+
+import (
+	"context"
+	"encoding/base64"
+	"fmt"
+	"mime"
+	"net/http"
+	"net/url"
+	"path"
+	"strings"
+
+	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
+	"github.com/maximhq/bifrost/core/schemas"
+)
+
+// mediaTypeExtensions maps the document types Chat Completions accepts onto a filename
+// extension. OpenAI requires a filename whenever file_data is used, and rejects names whose
+// extension disagrees with the payload.
+var mediaTypeExtensions = map[string]string{
+	"application/pdf":  ".pdf",
+	"text/plain":       ".txt",
+	"text/markdown":    ".md",
+	"text/html":        ".html",
+	"text/csv":         ".csv",
+	"application/json": ".json",
+}
+
+// buildChatFileFromFetch turns a fetched document into the pair Chat Completions expects:
+// file_data as a base64 data URI, and a filename.
+//
+// Content-Type frequently carries parameters ("application/pdf; charset=binary"); those must be
+// stripped or the data URI is malformed.
+func buildChatFileFromFetch(mediaType, encoded, sourceURL string) (fileData string, filename string) {
+	if parsed, _, err := mime.ParseMediaType(mediaType); err == nil && parsed != "" {
+		mediaType = parsed
+	}
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	if mediaType == "" {
+		mediaType = "application/octet-stream"
+	}
+
+	fileData = fmt.Sprintf("data:%s;base64,%s", mediaType, encoded)
+
+	ext := mediaTypeExtensions[mediaType]
+
+	// Prefer the URL's basename; fall back to a synthetic name, since a filename is mandatory
+	// alongside file_data.
+	if parsed, err := url.Parse(sourceURL); err == nil {
+		if base := path.Base(parsed.Path); base != "" && base != "." && base != "/" && strings.Contains(base, ".") {
+			if extensionMatchesMediaType(path.Ext(base), mediaType) {
+				return fileData, base
+			}
+			// The URL's extension contradicts what the server actually sent - a ".txt" URL that
+			// responds application/pdf, say. OpenAI validates the filename against file_data's
+			// media type and rejects the pair, so the FETCHED type wins: keep the stem, which is
+			// the part that makes the attachment recognisable, and correct the suffix.
+			if ext != "" {
+				return fileData, strings.TrimSuffix(base, path.Ext(base)) + ext
+			}
+		}
+	}
+	if ext == "" {
+		ext = ".bin"
+	}
+	return fileData, "document" + ext
+}
+
+// mediaTypeExtensionAliases lists additional extensions that are legitimate for a media type
+// beyond the canonical one in mediaTypeExtensions. Deliberately small: the goal is not to accept
+// every spelling in the wild, only to avoid renaming a file whose extension was already correct.
+var mediaTypeExtensionAliases = map[string][]string{
+	"text/html":     {".htm"},
+	"text/markdown": {".markdown"},
+}
+
+// extensionMatchesMediaType reports whether a filename extension is consistent with the fetched
+// media type. An unrecognised media type matches anything: without a mapping there is no basis to
+// claim the caller's extension is wrong, and renaming on a guess would be worse than leaving it.
+func extensionMatchesMediaType(ext, mediaType string) bool {
+	canonical, known := mediaTypeExtensions[mediaType]
+	if !known {
+		return true
+	}
+	ext = strings.ToLower(ext)
+	if ext == canonical {
+		return true
+	}
+	for _, alias := range mediaTypeExtensionAliases[mediaType] {
+		if ext == alias {
+			return true
+		}
+	}
+	return false
+}
+
+// ResolveChatFileURLs resolves URL-sourced document blocks into inline base64, because Chat
+// Completions accepts only file_id or file_data - never file_url. The canonical block shape
+// documents this as "provider fetches at convert time" (schemas/chatcompletions.go); without it
+// OpenAIChatRequest.MarshalJSON strips FileURL and the document is silently lost.
+//
+// Deliberately NOT part of ToOpenAIChatRequest. That function is a pure transformation, and this
+// one performs network I/O whose failures have to reach the caller. While it lived inside the
+// converter there was nowhere to report a failed fetch: the block kept its FileURL, MarshalJSON
+// stripped it, and an empty {"type":"file","file":{}} went upstream - so the operator saw a
+// provider 400 about a missing file_id rather than the fetch error that actually happened.
+//
+// Scoped to OpenAI and Azure because they are the surfaces that reject file_url. Every other
+// provider routed through this package either accepts the block as-is or resolves it elsewhere,
+// and fetching on their behalf would be network I/O spent for nothing.
+//
+// Blocks that already carry a file_id or file_data are left untouched.
+// Returns a plain error rather than a *schemas.BifrostError: every caller runs inside
+// CheckContextAndGetRequestBody's converter closure, which already wraps a returned error as
+// NewBifrostOperationError(ErrRequestBodyConversion, err). Building the structured error here would
+// duplicate that and then be discarded.
+func ResolveChatFileURLs(ctx *schemas.BifrostContext, provider schemas.ModelProvider, req *OpenAIChatRequest) error {
+	if req == nil || (provider != schemas.OpenAI && provider != schemas.Azure) {
+		return nil
+	}
+
+	var fetchCtx context.Context = ctx
+	if ctx == nil {
+		fetchCtx = context.Background()
+	}
+
+	messages := req.Messages
+	for i := range messages {
+		msg := &messages[i]
+		if msg.Content == nil || msg.Content.ContentBlocks == nil {
+			continue
+		}
+		for j := range msg.Content.ContentBlocks {
+			file := msg.Content.ContentBlocks[j].File
+			if file == nil || file.FileURL == nil || *file.FileURL == "" {
+				continue
+			}
+			if file.FileID != nil && *file.FileID != "" {
+				continue
+			}
+			if file.FileData != nil && *file.FileData != "" {
+				continue
+			}
+
+			// Leave references bifrost cannot download in place. Bifrost inlines only
+			// what it can actually fetch; whether the surface accepts the reference is
+			// the provider's call, and it now travels on the wire (MarshalJSON no longer
+			// drops file_url) so the provider can answer for itself instead of the block
+			// arriving empty.
+			if scheme := urlSourceScheme(*file.FileURL); scheme != "http" && scheme != "https" {
+				continue
+			}
+
+			mediaType, encoded, err := providerUtils.FetchAndEncodeURL(fetchCtx, *file.FileURL)
+			if err != nil {
+				return fmt.Errorf("failed to fetch document at %s for messages[%d].content[%d]: %w",
+					*file.FileURL, i, j, err)
+			}
+
+			fileData, filename := buildChatFileFromFetch(mediaType, encoded, *file.FileURL)
+			fileCopy := *file
+			fileCopy.FileData = schemas.Ptr(fileData)
+			if fileCopy.Filename == nil || *fileCopy.Filename == "" {
+				fileCopy.Filename = schemas.Ptr(filename)
+			}
+			fileCopy.FileURL = nil
+			msg.Content.ContentBlocks[j].File = &fileCopy
+		}
+	}
+	return nil
+}
+
+// urlSourceScheme returns the lowercase scheme of rawURL, or "" when it has none or
+// does not parse. Used only to phrase the rejection in ResolveChatFileURLs;
+// FetchAndEncodeURL remains the actual gate on what gets dialled.
+func urlSourceScheme(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(parsed.Scheme)
+}
+
+// fileDataAsDataURL folds Bifrost's file_type extension into file_data, because the OpenAI
+// wire has no file_type field and MarshalJSON strips it. OpenAI and OpenAI-shaped surfaces
+// (Databricks among them) require file_data as a data URL, so bare base64 with its media type
+// named only in file_type used to go upstream with no media type at all and be rejected
+// ("Invalid base64 data URL format"). Native converters read file_type directly and never
+// hit this.
+//
+// Follows the conventions the native converters already apply to the same fields: a
+// text/plain (or "txt") file_type means file_data is plain text, and anything else without a
+// data: prefix is base64. A data URL is left as it is, and so is a payload that is not valid
+// base64, since there is no basis to guess what it is.
+//
+// An empty text/plain payload is still a document (Anthropic accepts a text source with
+// data ""), so it becomes the empty data URL rather than a bare "" no OpenAI surface parses.
+func fileDataAsDataURL(fileData string, fileType *string) string {
+	if strings.HasPrefix(fileData, "data:") {
+		return fileData
+	}
+
+	mediaType := ""
+	if fileType != nil {
+		mediaType = normalizeFileType(*fileType)
+	}
+	if mediaType == "text/plain" {
+		return "data:text/plain;base64," + base64.StdEncoding.EncodeToString([]byte(fileData))
+	}
+	if fileData == "" {
+		return fileData
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(fileData)
+	if err != nil {
+		return fileData
+	}
+	if mediaType == "" {
+		mediaType = sniffFileMediaType(decoded)
+	}
+	return "data:" + mediaType + ";base64," + fileData
+}
+
+// normalizeFileType turns a caller's file_type into a bare, lowercase media type. It accepts
+// both MIME types ("application/pdf; charset=binary") and the short extension names some
+// callers send ("pdf", "txt"). Returns "" when neither reading yields a media type.
+func normalizeFileType(fileType string) string {
+	fileType = strings.ToLower(strings.TrimSpace(fileType))
+	if fileType == "" {
+		return ""
+	}
+	if strings.Contains(fileType, "/") {
+		if parsed, _, err := mime.ParseMediaType(fileType); err == nil && parsed != "" {
+			return parsed
+		}
+		return fileType
+	}
+	if fileType == "txt" {
+		return "text/plain"
+	}
+	if byExt := mime.TypeByExtension("." + fileType); byExt != "" {
+		if parsed, _, err := mime.ParseMediaType(byExt); err == nil && parsed != "" {
+			return parsed
+		}
+	}
+	return ""
+}
+
+// sniffFileMediaType infers the media type of decoded file bytes when the caller named none.
+// PDF is the default when sniffing finds nothing specific, matching the Anthropic and Gemini
+// converters: documents are the dominant use of file blocks.
+func sniffFileMediaType(data []byte) string {
+	detected := http.DetectContentType(data)
+	if parsed, _, err := mime.ParseMediaType(detected); err == nil {
+		detected = parsed
+	}
+	if detected == "" || detected == "application/octet-stream" {
+		return "application/pdf"
+	}
+	return detected
+}
+
+// isEmptyInlineTextFile reports whether file data is an empty text document: file_data ""
+// with a text/plain file_type, or the empty text data URL. Anthropic accepts such a document,
+// but OpenAI-shaped surfaces reject "data:text/plain;base64," ("missing mime type or base64
+// content"), so the marshalers drop it when the message has anything else to send. Callers
+// check the block carries no file_id or file_url first, so a reference is never dropped.
+func isEmptyInlineTextFile(fileData, fileType *string) bool {
+	if fileData == nil {
+		return false
+	}
+	if *fileData == "data:text/plain;base64," {
+		return true
+	}
+	return *fileData == "" && fileType != nil && normalizeFileType(*fileType) == "text/plain"
+}
+
+// isEmptyChatTextFile reports whether a chat file block is an empty text document with no
+// file reference beside it.
+func isEmptyChatTextFile(f *schemas.ChatInputFile) bool {
+	return f != nil && (f.FileID == nil || *f.FileID == "") && (f.FileURL == nil || *f.FileURL == "") &&
+		isEmptyInlineTextFile(f.FileData, f.FileType)
+}
+
+// isEmptyResponsesTextFile is isEmptyChatTextFile for Responses blocks, which carry file_id on
+// the block rather than inside the file object.
+func isEmptyResponsesTextFile(block *schemas.ResponsesMessageContentBlock) bool {
+	f := block.ResponsesInputMessageContentBlockFile
+	return f != nil && (block.FileID == nil || *block.FileID == "") && (f.FileURL == nil || *f.FileURL == "") &&
+		isEmptyInlineTextFile(f.FileData, f.FileType)
+}
+
+// chatEmptyTextFilesToDrop reports whether blocks hold an empty text document and something
+// else, i.e. whether the document can be dropped without leaving the message empty.
+func chatEmptyTextFilesToDrop(blocks []schemas.ChatContentBlock) bool {
+	sawEmpty, sawOther := false, false
+	for _, block := range blocks {
+		if isEmptyChatTextFile(block.File) {
+			sawEmpty = true
+		} else {
+			sawOther = true
+		}
+	}
+	return sawEmpty && sawOther
+}
+
+// responsesEmptyTextFilesToDrop is chatEmptyTextFilesToDrop for Responses blocks. rendered_content
+// does not count as something else: the marshaler always removes it.
+func responsesEmptyTextFilesToDrop(blocks []schemas.ResponsesMessageContentBlock) bool {
+	sawEmpty, sawOther := false, false
+	for i := range blocks {
+		block := &blocks[i]
+		if isEmptyResponsesTextFile(block) {
+			sawEmpty = true
+		} else if block.Type != schemas.ResponsesOutputMessageContentTypeRenderedContent {
+			sawOther = true
+		}
+	}
+	return sawEmpty && sawOther
+}
+
+// fileDataNeedsDataURL reports whether file_data is set without a data: prefix, so the
+// marshal gates copy the block even when the caller sent no file_type to strip.
+func fileDataNeedsDataURL(fileData *string) bool {
+	return fileData != nil && *fileData != "" && !strings.HasPrefix(*fileData, "data:")
+}
+
+// fileNeedsWireRewrite reports whether a file block carries something openAIWireFile has to
+// change before it can go out: a file_type to fold into file_data, bare file_data, or inline
+// file_data with no filename beside it.
+func fileNeedsWireRewrite(fileData, filename, fileType *string) bool {
+	return fileType != nil || fileDataNeedsDataURL(fileData) ||
+		(fileData != nil && *fileData != "" && (filename == nil || *filename == ""))
+}
+
+// openAIWireFile returns file_data as a data URL and a filename to go with it. OpenAI rejects
+// inline file_data without a filename, and validates the filename's extension against the
+// payload, so a missing name is synthesized from the data URL's media type. Ingress converters
+// leave a missing name missing, so a document routed to a provider without the requirement
+// (Anthropic, where it would surface as a title) keeps the shape the client sent.
+func openAIWireFile(fileData, filename, fileType *string) (*string, *string) {
+	if fileData == nil {
+		return nil, filename
+	}
+	data := fileDataAsDataURL(*fileData, fileType)
+	if data != "" && (filename == nil || *filename == "") {
+		filename = schemas.Ptr(defaultInlineFilename(data, fileType))
+	}
+	return &data, filename
+}
+
+// officeDocumentExtensions maps Office media types, whose subtypes are not usable extensions,
+// onto the extensions OpenAI accepts for file inputs.
+var officeDocumentExtensions = map[string]string{
+	"application/vnd.openxmlformats-officedocument.wordprocessingml.document":   ".docx",
+	"application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+	"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":         ".xlsx",
+	"application/msword":            ".doc",
+	"application/vnd.ms-powerpoint": ".ppt",
+	"application/vnd.ms-excel":      ".xls",
+}
+
+// defaultInlineFilename names an inline file after its media type: the data URL's when it has
+// one, otherwise the caller's file_type, otherwise PDF, which is what the native converters
+// assume for an untyped document.
+func defaultInlineFilename(fileData string, fileType *string) string {
+	mediaType := ""
+	if rest, ok := strings.CutPrefix(fileData, "data:"); ok {
+		mediaType, _, _ = strings.Cut(rest, ",")
+		mediaType, _, _ = strings.Cut(mediaType, ";")
+		mediaType = normalizeFileType(mediaType)
+	}
+	if mediaType == "" && fileType != nil {
+		mediaType = normalizeFileType(*fileType)
+	}
+	if ext, ok := mediaTypeExtensions[mediaType]; ok {
+		return "document" + ext
+	}
+	if ext, ok := officeDocumentExtensions[mediaType]; ok {
+		return "document" + ext
+	}
+	// "application/vnd.ms-excel+xml" -> ".xml", "image/png" -> ".png".
+	if _, subtype, found := strings.Cut(mediaType, "/"); found && subtype != "" {
+		if _, suffix, hasSuffix := strings.Cut(subtype, "+"); hasSuffix && suffix != "" {
+			subtype = suffix
+		}
+		return "document." + subtype
+	}
+	return "document.pdf"
+}

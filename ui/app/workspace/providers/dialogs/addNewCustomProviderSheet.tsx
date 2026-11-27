@@ -1,0 +1,401 @@
+import { ProviderSelector, type ProviderSelectorValue } from "@/components/ui/providerSelector";
+import { Button } from "@/components/ui/button";
+import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
+import { Input } from "@/components/ui/input";
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { Switch } from "@/components/ui/switch";
+import { DefaultNetworkConfig } from "@/lib/constants/config";
+import i18n from "@/lib/i18n";
+import { getErrorMessage, useCreateProviderMutation } from "@/lib/store";
+import { BaseProvider, BaseProviderNames, ModelProviderName } from "@/lib/types/config";
+import { allowedRequestsSchema } from "@/lib/types/schemas";
+import { cleanPathOverrides } from "@/lib/utils/validation";
+import { RbacOperation, RbacResource, useRbac } from "@enterprise/lib";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { useEffect, useMemo } from "react";
+import { useForm } from "react-hook-form";
+import { toast } from "sonner";
+import { z } from "zod";
+import { AllowedRequestsFields } from "../fragments/allowedRequestsFields";
+import { useTranslation } from "react-i18next";
+
+const OPENAI_COMPATIBLE_FORMAT = "openai-compatible";
+
+const formSchema = z
+	.object({
+		name: z.string().min(1),
+		baseFormat: z.string().min(1),
+		base_url: z
+			.string()
+			.min(1, { error: () => i18n.t("providers.customBaseUrlRequired", { ns: "models" }) })
+			.url({ error: () => i18n.t("validation.validUrl") }),
+	allowed_requests: allowedRequestsSchema,
+	request_path_overrides: z.record(z.string(), z.string().optional()).optional(),
+	is_key_less: z.boolean().optional(),
+	does_not_send_done_marker: z.boolean().optional(),
+	wait_for_usage: z.boolean().optional(),
+		allow_private_network: z.boolean().optional(),
+	})
+	.superRefine((data, ctx) => {
+		// This is the one format where Bifrost does not append /v1 itself, so the
+		// URL has to carry it. It is stripped again before the config is saved.
+		if (data.baseFormat !== OPENAI_COMPATIBLE_FORMAT) return;
+		if (!/\/v1\/?$/.test(data.base_url)) {
+			ctx.addIssue({
+				code: "custom",
+				path: ["base_url"],
+				message: i18n.t("providers.openaiCompatibleBaseUrlV1", { ns: "models" }),
+			});
+		}
+	});
+
+type FormData = z.infer<typeof formSchema>;
+
+// The picker's rows, module-level so the list keeps one identity across renders.
+const BASE_FORMAT_VALUES: readonly ProviderSelectorValue[] = [
+	...BaseProviderNames,
+	{ value: OPENAI_COMPATIBLE_FORMAT, label: "OpenAI-Compatible API" },
+];
+
+export interface AddCustomProviderSheetContentProps {
+	show?: boolean;
+	onSave: (id: string) => void;
+	onClose: () => void;
+}
+
+interface Props extends AddCustomProviderSheetContentProps {
+	show: boolean;
+}
+
+export function AddCustomProviderSheetContent({ show = true, onClose, onSave }: AddCustomProviderSheetContentProps) {
+	const { t } = useTranslation("models");
+	const { t: tc } = useTranslation("common");
+	const hasProviderCreateAccess = useRbac(RbacResource.ModelProvider, RbacOperation.Create);
+	const [addProvider, { isLoading: isAddingProvider }] = useCreateProviderMutation();
+	const form = useForm<FormData>({
+		resolver: zodResolver(formSchema),
+		defaultValues: {
+			name: "",
+			baseFormat: "",
+			base_url: "",
+			allowed_requests: {
+				text_completion: true,
+				text_completion_stream: true,
+				chat_completion: true,
+				chat_completion_stream: true,
+				responses: true,
+				responses_stream: true,
+				responses_retrieve: true,
+				responses_delete: true,
+				responses_cancel: true,
+				responses_input_items: true,
+				embedding: true,
+				speech: true,
+				speech_stream: true,
+				transcription: true,
+				transcription_stream: true,
+				image_generation: true,
+				image_generation_stream: true,
+				image_edit: true,
+				image_edit_stream: true,
+				image_variation: true,
+				rerank: true,
+				decisions: true,
+				ocr: true,
+				ocr_stream: true,
+				video_generation: true,
+				video_edit: true,
+				video_retrieve: true,
+				video_download: true,
+				video_delete: true,
+				video_list: true,
+				video_remix: true,
+				passthrough: true,
+				passthrough_stream: true,
+				count_tokens: true,
+				list_models: true,
+				websocket_responses: true,
+				realtime: false,
+				live: false,
+			},
+			request_path_overrides: undefined,
+			is_key_less: false,
+			does_not_send_done_marker: false,
+			wait_for_usage: false,
+			allow_private_network: false,
+		},
+	});
+
+	useEffect(() => {
+		if (show) {
+			form.clearErrors();
+		}
+	}, [show]);
+
+	const onSubmit = (data: FormData) => {
+		const payload = {
+			provider: data.name as ModelProviderName,
+			custom_provider_config: {
+				base_provider_type: (data.baseFormat === OPENAI_COMPATIBLE_FORMAT ? "openai" : data.baseFormat) as BaseProvider,
+				allowed_requests: data.allowed_requests,
+				request_path_overrides: cleanPathOverrides(data.request_path_overrides),
+				is_key_less: data.is_key_less ?? false,
+				does_not_send_done_marker: data.does_not_send_done_marker ?? false,
+				wait_for_usage: data.wait_for_usage ?? false,
+			},
+			network_config: {
+				// Bifrost appends /v1 to every OpenAI-format path, so the /v1 typed for
+				// this format is dropped here instead of being doubled upstream.
+				base_url: data.baseFormat === OPENAI_COMPATIBLE_FORMAT ? data.base_url.replace(/\/v1\/?$/, "") : data.base_url,
+				allow_private_network: data.allow_private_network ?? false,
+				default_request_timeout_in_seconds: DefaultNetworkConfig.default_request_timeout_in_seconds,
+				max_retries: 0,
+				retry_backoff_initial: 500,
+				retry_backoff_max: 5000,
+			},
+		};
+
+		addProvider(payload)
+			.unwrap()
+			.then((provider) => {
+				onSave(provider.name);
+				form.reset();
+			})
+			.catch((err) => {
+				toast.error(t("providers.failedToAdd"), {
+					description: getErrorMessage(err),
+				});
+			});
+	};
+
+	const baseFormat = form.watch("baseFormat");
+	const isOpenAICompatible = baseFormat === OPENAI_COMPATIBLE_FORMAT;
+	const isKeyLessDisabled = baseFormat === "bedrock";
+	// Only the OpenAI stream loops read this flag; every other base format ignores it.
+	const isDoneMarkerToggleDisabled = baseFormat !== "openai" && !isOpenAICompatible;
+	const baseUrlPlaceholder = useMemo(
+		() => (isOpenAICompatible ? "https://api.your-provider.com/v1" : "https://api.your-provider.com"),
+		[isOpenAICompatible],
+	);
+	// wait_for_usage only has meaning once the stream ends on finish_reason, so the
+	// toggle is nested under does_not_send_done_marker rather than offered on its own.
+	const doesNotSendDoneMarker = form.watch("does_not_send_done_marker");
+
+	useEffect(() => {
+		if (isDoneMarkerToggleDisabled) {
+			form.setValue("does_not_send_done_marker", false);
+		}
+	}, [isDoneMarkerToggleDisabled, form]);
+
+	// Clear the nested flag whenever its parent goes away: the provider update replaces
+	// custom_provider_config wholesale, so a stale true would otherwise be persisted.
+	useEffect(() => {
+		if (isDoneMarkerToggleDisabled || !doesNotSendDoneMarker) {
+			form.setValue("wait_for_usage", false);
+		}
+	}, [isDoneMarkerToggleDisabled, doesNotSendDoneMarker, form]);
+
+	return (
+		<>
+			<SheetHeader className="flex shrink-0 flex-col items-start py-4" headerClassName="mb-0 sticky -top-4 bg-card z-10 px-4 md:px-8">
+				<SheetTitle>{t("providers.addCustomTitle")}</SheetTitle>
+				<SheetDescription>{t("providers.addCustomDescription")}</SheetDescription>
+			</SheetHeader>
+			<Form {...form}>
+				<form onSubmit={form.handleSubmit(onSubmit)} className="flex flex-col">
+					<div className="min-h-0 flex-1 space-y-4 px-4 pb-4 md:px-8">
+						<FormField
+							control={form.control}
+							name="name"
+							render={({ field }) => (
+								<FormItem className="flex flex-col gap-3">
+									<FormLabel className="text-right">{t("providers.name")}</FormLabel>
+									<div className="col-span-3">
+										<FormControl>
+											<Input
+												placeholder={t("providers.name")}
+												data-testid="custom-provider-name"
+												disabled={!hasProviderCreateAccess}
+												{...field}
+											/>
+										</FormControl>
+										<FormMessage />
+									</div>
+								</FormItem>
+							)}
+						/>
+						<FormField
+							control={form.control}
+							name="baseFormat"
+							render={({ field }) => (
+								<FormItem className="flex flex-col gap-3">
+									<FormLabel>{t("providers.baseFormat")}</FormLabel>
+									<div>
+										<FormControl>
+											<ProviderSelector
+												source="values"
+												values={BASE_FORMAT_VALUES}
+												data-testid="base-provider-select"
+												value={field.value}
+												onChange={field.onChange}
+												disabled={!hasProviderCreateAccess}
+											/>
+										</FormControl>
+										<FormMessage />
+									</div>
+								</FormItem>
+							)}
+						/>
+						<FormField
+							control={form.control}
+							name="base_url"
+							render={({ field }) => (
+								<FormItem className="flex flex-col gap-3">
+									<FormLabel>{t("providers.baseUrl")}</FormLabel>
+									<div>
+										<FormControl>
+											<Input
+												placeholder={baseUrlPlaceholder}
+												data-testid="base-url-input"
+												disabled={!hasProviderCreateAccess}
+												{...field}
+												value={field.value || ""}
+											/>
+										</FormControl>
+										<FormMessage />
+									</div>
+								</FormItem>
+							)}
+						/>
+						<FormField
+							control={form.control}
+							name="allow_private_network"
+							render={({ field }) => (
+								<FormItem>
+									<div className="bg-muted/50 flex items-center justify-between space-x-2 rounded-sm border p-3">
+										<div className="space-y-0.5">
+											<label htmlFor="allow-private-network" className="text-sm font-medium">
+												{t("providers.allowPrivateNetwork")}
+											</label>
+											<p className="text-muted-foreground text-sm">{t("providers.allowPrivateNetworkDesc")}</p>
+										</div>
+										<Switch
+											id="allow-private-network"
+											size="md"
+											checked={field.value}
+											onCheckedChange={field.onChange}
+											disabled={!hasProviderCreateAccess}
+											data-testid="custom-provider-allow-private-network-switch"
+										/>
+									</div>
+								</FormItem>
+							)}
+						/>
+						{!isKeyLessDisabled && (
+							<FormField
+								control={form.control}
+								name="is_key_less"
+								render={({ field }) => (
+									<FormItem>
+										<div className="bg-muted/50 flex items-center justify-between space-x-2 rounded-sm border p-3">
+											<div className="space-y-0.5">
+												<label htmlFor="drop-excess-requests" className="text-sm font-medium">
+													{t("providers.isKeyless")}
+												</label>
+												<p className="text-muted-foreground text-sm">{t("providers.requiresKey")}</p>
+											</div>
+											<Switch
+												id="drop-excess-requests"
+												size="md"
+												checked={field.value}
+												onCheckedChange={field.onChange}
+												disabled={!hasProviderCreateAccess}
+												data-testid="custom-provider-keyless-switch"
+											/>
+										</div>
+									</FormItem>
+								)}
+							/>
+						)}
+						{!isDoneMarkerToggleDisabled && (
+							<FormField
+								control={form.control}
+								name="does_not_send_done_marker"
+								render={({ field }) => (
+									<FormItem>
+										<div className="bg-muted/50 flex items-center justify-between space-x-2 rounded-sm border p-3">
+											<div className="space-y-0.5">
+												<label htmlFor="does-not-send-done-marker" className="text-sm font-medium">
+													{t("providers.doesNotSendDoneMarker")}
+												</label>
+												<p className="text-muted-foreground text-sm">{t("providers.doesNotSendDoneMarkerHelp")}</p>
+											</div>
+											<Switch
+												id="does-not-send-done-marker"
+												size="md"
+												checked={field.value}
+												onCheckedChange={field.onChange}
+												disabled={!hasProviderCreateAccess}
+												data-testid="custom-provider-does-not-send-done-marker-switch"
+											/>
+										</div>
+									</FormItem>
+								)}
+							/>
+						)}
+						{!isDoneMarkerToggleDisabled && doesNotSendDoneMarker && (
+							<FormField
+								control={form.control}
+								name="wait_for_usage"
+								render={({ field }) => (
+									<FormItem>
+										<div className="bg-muted/50 flex items-center justify-between space-x-2 rounded-sm border p-3">
+											<div className="space-y-0.5">
+												<label htmlFor="wait-for-usage" className="text-sm font-medium">
+													{t("providers.custom.waitForUsage")}
+												</label>
+												<p className="text-muted-foreground text-sm">{t("providers.custom.waitForUsageHelp")}</p>
+											</div>
+											<Switch
+												id="wait-for-usage"
+												size="md"
+												checked={field.value}
+												onCheckedChange={field.onChange}
+												disabled={!hasProviderCreateAccess}
+												data-testid="custom-provider-wait-for-usage-switch"
+											/>
+										</div>
+									</FormItem>
+								)}
+							/>
+						)}
+						{/* Allowed Requests Configuration */}
+						<AllowedRequestsFields
+							control={form.control}
+							providerType={form.watch("baseFormat") as BaseProvider}
+							disabled={!hasProviderCreateAccess}
+						/>
+					</div>
+					<div className="bg-card sticky bottom-0 ml-auto flex w-full flex-row gap-2 border-t px-4 py-4 md:px-8">
+						<Button type="button" variant="outline" onClick={onClose} className="ml-auto" data-testid="custom-provider-cancel-btn">
+							{tc("cancel")}
+						</Button>
+						<Button type="submit" isLoading={isAddingProvider} disabled={!hasProviderCreateAccess} data-testid="custom-provider-save-btn">
+							{tc("create")}
+						</Button>
+					</div>
+				</form>
+			</Form>
+		</>
+	);
+}
+
+export default function AddCustomProviderSheet(props: Props) {
+	return (
+		<Sheet open={props.show} onOpenChange={(open) => !open && props.onClose()}>
+			<SheetContent data-testid="custom-provider-sheet" className="p-0 pt-4">
+				<AddCustomProviderSheetContent {...props} />
+			</SheetContent>
+		</Sheet>
+	);
+}

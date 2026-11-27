@@ -1,0 +1,950 @@
+import { formatLatency } from "@/app/workspace/dashboard/utils/chartUtils";
+import BlockHeader from "@/app/workspace/logs/views/blockHeader";
+import LogEntryDetailsView from "@/app/workspace/logs/views/logEntryDetailsView";
+import { LogErrorCard } from "@/app/workspace/logs/views/logErrorCard";
+import PluginLogsView from "@/app/workspace/logs/views/pluginLogsView";
+import { CorrelatedLogsContent } from "@/app/workspace/agent-logs/views/correlatedLogs";
+import { SheetNavigationButtons } from "@/components/sheetNavigationButtons";
+import {
+	AlertDialog,
+	AlertDialogAction,
+	AlertDialogCancel,
+	AlertDialogContent,
+	AlertDialogDescription,
+	AlertDialogFooter,
+	AlertDialogHeader,
+	AlertDialogTitle,
+} from "@/components/ui/alertDialog";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { CodeEditor } from "@/components/ui/codeEditor";
+import {
+	DropdownMenu,
+	DropdownMenuContent,
+	DropdownMenuItem,
+	DropdownMenuSeparator,
+	DropdownMenuTrigger,
+} from "@/components/ui/dropdownMenu";
+import { DottedSeparator } from "@/components/ui/separator";
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { Switch } from "@/components/ui/switch";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useCopyToClipboard } from "@/hooks/useCopyToClipboard";
+import { useSheetNavigation } from "@/hooks/useSheetNavigation";
+import { mapAppToClientApp, mapUserAgentToApp } from "@/lib/constants/logs";
+import { useGetMCPLogByIdQuery, useGetMCPLogsStatsQuery, useGetUserAgentMappingsQuery } from "@/lib/store";
+import type { MCPToolLogEntry } from "@/lib/types/logs";
+import { cn } from "@/lib/utils";
+import { downloadAsJson } from "@/lib/utils/browser-download";
+import {
+	getMCPLogError,
+	getMCPLogPillTone,
+	getMCPLogPresentation,
+	getMCPLogTimeline,
+	getMCPReadKind,
+	type MCPLogPillTone,
+	splitMCPErrorMessage,
+} from "@/lib/utils/mcpLogPresentation";
+import { applyRedactionMappingToValue, hasRedactionMappingEntries, mergeRedactionMappings } from "@/lib/utils/redaction";
+import { RbacOperation, RbacResource, useRbac } from "@enterprise/lib";
+import { OsIcon } from "@enterprise/lib/constants/edgeApps";
+import { useGetDeviceQuery } from "@enterprise/lib/store/apis/edgeControlApi";
+import { Link } from "@tanstack/react-router";
+import { format, isValid } from "date-fns";
+import { ChevronDown, Clipboard, Download, Loader2, MoreVertical, Trash2 } from "lucide-react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useTranslation } from "react-i18next";
+import type { TFunction } from "i18next";
+import { toast } from "sonner";
+import { dateFnsLocale } from "@/lib/i18n/dateLocale";
+import { getLocale } from "@/lib/i18n";
+
+interface MCPLogDetailSheetProps {
+	log: MCPToolLogEntry | null;
+	open: boolean;
+	onOpenChange: (open: boolean) => void;
+	handleDelete?: (log: MCPToolLogEntry) => Promise<void>;
+	canReveal?: boolean;
+	onNavigate?: (direction: "prev" | "next") => void;
+	hasPrev?: boolean;
+	hasNext?: boolean;
+}
+
+interface MCPLogDetailViewProps {
+	log: MCPToolLogEntry | null;
+	/** Gates the detail fetches; an embedded view is always open. */
+	open?: boolean;
+	/** Called with false after a delete; omitted when the view is embedded. */
+	onOpenChange?: (open: boolean) => void;
+	handleDelete?: (log: MCPToolLogEntry) => Promise<void>;
+	canReveal?: boolean;
+	/** Rendered before the title, e.g. the sheet's prev/next buttons. */
+	headerStart?: ReactNode;
+	/** Rendered at the right end of the header, e.g. the trace view's "Open in MCP logs" link. */
+	headerEnd?: ReactNode;
+	/** "embedded" renders inside another surface (the agent trace tree): no sheet header, title or padding. */
+	variant?: "sheet" | "embedded";
+}
+
+const pillStyles: Record<MCPLogPillTone, string> = {
+	success: "border-chart-success/30 bg-chart-success/10 text-chart-success-ink",
+	error: "border-chart-error/30 bg-chart-error/10 text-chart-error-ink",
+	processing: "bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-950/40 dark:text-blue-400 dark:border-blue-900",
+	approved: "bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-950/40 dark:text-blue-400 dark:border-blue-900",
+	input: "bg-amber-50 text-amber-800 border-amber-200 dark:bg-amber-950/40 dark:text-amber-400 dark:border-amber-900",
+	neutral: "bg-gray-50 text-gray-700 border-gray-200 dark:bg-gray-900/40 dark:text-gray-400 dark:border-gray-800",
+};
+
+const pillDotStyles: Record<MCPLogPillTone, string> = {
+	success: "bg-chart-success",
+	error: "bg-chart-error",
+	processing: "bg-blue-500",
+	approved: "bg-blue-500",
+	input: "bg-amber-500",
+	neutral: "bg-gray-400",
+};
+
+function StatusPill({ label, tone }: { label: string; tone: MCPLogPillTone }) {
+	return (
+		<span
+			className={cn("inline-flex items-center gap-1.5 rounded-sm border px-2 py-0.5 text-[11px] font-semibold uppercase", pillStyles[tone])}
+		>
+			<span className={cn("h-1.5 w-1.5 rounded-sm", pillDotStyles[tone])} />
+			{label}
+		</span>
+	);
+}
+
+// Metadata keys Bifrost writes for MCP round trips and MCP Apps; shown in their own blocks, not the grid.
+const MCP_OWN_METADATA_KEYS = new Set(["input_responses", "retry_later", "mcp_apps", "app_only", "ui_resource_uri", "requested_name"]);
+
+// mcpAppsMarkers are the MCP Apps facts Bifrost recorded on an entry, as badge labels.
+function mcpAppsMarkers(log: MCPToolLogEntry, t: TFunction<"observability">): string[] {
+	const markers: string[] = [];
+	const metadata = log.metadata ?? {};
+	if (metadata.mcp_apps === true) markers.push(t("mcpLogs.detail.appsHost"));
+	if (metadata.app_only === true) markers.push(t("mcpLogs.detail.appOnly"));
+	if (typeof metadata.ui_resource_uri === "string") markers.push(t("mcpLogs.detail.opensUi", { uri: metadata.ui_resource_uri }));
+	if (typeof metadata.requested_name === "string") markers.push(t("mcpLogs.detail.calledAs", { name: metadata.requested_name }));
+	return markers;
+}
+
+function CopyInlineButton({ text, testId }: { text: string; testId?: string }) {
+	const { t } = useTranslation("observability");
+	const { copy } = useCopyToClipboard({ successMessage: t("labels.copied") });
+	return (
+		<button
+			type="button"
+			onClick={(e) => {
+				e.stopPropagation();
+				copy(text);
+			}}
+			className="text-muted-foreground hover:bg-muted hover:text-foreground inline-flex h-6 w-6 items-center justify-center rounded-sm transition"
+			aria-label={t("labels.copy")}
+			data-testid={testId}
+		>
+			<Clipboard className="h-3.5 w-3.5" />
+		</button>
+	);
+}
+
+function HeroStat({
+	label,
+	value,
+	sub,
+	mono = false,
+	valueClass,
+	hasRightBorder = false,
+}: {
+	label: string;
+	value: ReactNode;
+	sub?: ReactNode;
+	mono?: boolean;
+	valueClass?: string;
+	hasRightBorder?: boolean;
+}) {
+	return (
+		<div className={cn("border-border/70 min-w-0 border-b px-5 py-3 md:border-b-0", hasRightBorder && "md:border-r")}>
+			<div className="text-muted-foreground truncate text-[10.5px] font-semibold tracking-wider uppercase">{label}</div>
+			<div className={cn("mt-0.5 truncate text-[18px] font-semibold tabular-nums", mono && "font-mono text-[15px]", valueClass)}>
+				{value}
+			</div>
+			{sub ? <div className="text-muted-foreground mt-0.5 truncate text-[11px]">{sub}</div> : null}
+		</div>
+	);
+}
+
+function getPluginLogCount(pluginLogs?: string): number {
+	if (!pluginLogs) return 0;
+	try {
+		const parsed: unknown = JSON.parse(pluginLogs);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return 0;
+		return Object.values(parsed).reduce<number>((count, entries) => count + (Array.isArray(entries) ? entries.length : 0), 0);
+	} catch {
+		return 0;
+	}
+}
+
+export function MCPLogDetailSheet({
+	log,
+	open,
+	onOpenChange,
+	handleDelete,
+	canReveal = false,
+	onNavigate,
+	hasPrev = false,
+	hasNext = false,
+}: MCPLogDetailSheetProps) {
+	// Keyboard navigation: arrow up/down to navigate between logs
+	const { prev: prevKeys, next: nextKeys } = useSheetNavigation({
+		enabled: open,
+		hasPrev,
+		hasNext,
+		onNavigate: (direction) => onNavigate?.(direction),
+	});
+
+	if (!log) return null;
+
+	return (
+		<Sheet open={open} onOpenChange={onOpenChange}>
+			<SheetContent className="border-secondary flex w-full flex-col gap-2 overflow-x-hidden border p-0 sm:max-w-[60%]">
+				<MCPLogDetailView
+					log={log}
+					open={open}
+					onOpenChange={onOpenChange}
+					handleDelete={handleDelete}
+					canReveal={canReveal}
+					headerStart={
+						<SheetNavigationButtons
+							hasPrev={hasPrev}
+							hasNext={hasNext}
+							onNavigate={(dir) => onNavigate?.(dir)}
+							prevKeys={prevKeys}
+							nextKeys={nextKeys}
+							entityLabel="log"
+						/>
+					}
+				/>
+			</SheetContent>
+		</Sheet>
+	);
+}
+
+// MCPLogDetailView is the MCP log detail body, shared by MCPLogDetailSheet and the agent trace tree.
+export function MCPLogDetailView({
+	log,
+	open = true,
+	onOpenChange,
+	handleDelete,
+	canReveal = false,
+	headerStart,
+	headerEnd,
+	variant = "sheet",
+}: MCPLogDetailViewProps) {
+	const embedded = variant === "embedded";
+	const { t } = useTranslation("observability");
+	const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+	const [dropdownOpen, setDropdownOpen] = useState(false);
+	const { data: userAgentMappings } = useGetUserAgentMappingsQuery();
+	const [showRevealedValues, setShowRevealedValues] = useState(false);
+	const {
+		data: fullLog,
+		isLoading,
+		isError,
+	} = useGetMCPLogByIdQuery(log?.id ?? "", {
+		skip: !open || !log?.id,
+	});
+
+	// Device metadata (hostname, OS) comes from the Edge device registry; fall back to the raw id when absent,
+	// including for a caller without Devices:View, for whom the lookup is skipped.
+	const hasDevicesAccess = useRbac(RbacResource.Devices, RbacOperation.View);
+	const deviceId = fullLog?.device_id ?? log?.device_id ?? "";
+	const { data: deviceData } = useGetDeviceQuery(deviceId, { skip: !open || !deviceId || !hasDevicesAccess });
+	const device = deviceData?.device;
+
+	const isFullDataReady = Boolean(log) && (isError || (fullLog?.id === log?.id && !isLoading));
+	const displayLog = log ? (isFullDataReady && fullLog ? fullLog : log) : null;
+	const revealMapping = displayLog?.redaction_mapping;
+	const revealAvailable = canReveal && hasRedactionMappingEntries(revealMapping);
+	const revealEnabled = revealAvailable && showRevealedValues;
+	const inputRevealMapping = revealEnabled ? revealMapping?.input : undefined;
+	const outputRevealMapping = revealEnabled ? revealMapping?.output : undefined;
+	const mixedRevealMapping = revealEnabled ? mergeRedactionMappings(revealMapping) : undefined;
+
+	useEffect(() => {
+		setShowRevealedValues(false);
+	}, [displayLog?.id, revealAvailable]);
+
+	// Rounds of a call that asked its caller for input, grouped like agent logs' correlated tabs.
+	const roundTripID = displayLog?.round_trip_id ?? "";
+	const roundsCorrelation = useMemo(() => (roundTripID ? { round_trip_id: roundTripID } : null), [roundTripID]);
+	// While a paused round is open its call may still be answered, so its rounds refresh at the page's polling cadence.
+	const roundsPolling = open && displayLog?.status === "input_required" ? 10000 : 0;
+	const { data: roundsStats } = useGetMCPLogsStatsQuery(
+		{ filters: roundsCorrelation ?? {} },
+		{ skip: !open || !roundsCorrelation, pollingInterval: roundsPolling, refetchOnMountOrArgChange: true },
+	);
+	const roundsCount = roundsStats?.total_executions ?? 0;
+	const [activeTab, setActiveTab] = useState("execution");
+	useEffect(() => {
+		setActiveTab("execution");
+	}, [displayLog?.id]);
+
+	if (!log || !displayLog) return null;
+
+	if (!isFullDataReady) {
+		return (
+			<div className="flex h-full items-center justify-center p-4 md:p-8">
+				{embedded ? (
+					<span className="sr-only">{t("mcpLogs.loadingDetails")}</span>
+				) : (
+					<SheetTitle className="sr-only">{t("mcpLogs.loadingDetails")}</SheetTitle>
+				)}
+				<Loader2 className="text-muted-foreground h-6 w-6 animate-spin" />
+			</div>
+		);
+	}
+
+	const appKey = displayLog.app || displayLog.app_key;
+	const app = appKey ? mapAppToClientApp(appKey) : mapUserAgentToApp(displayLog.user_agent);
+	const mapping = userAgentMappings?.mappings.find((item) => item.app === appKey && item.logo && item.logo_mime);
+	const appIcon = mapping ? `data:${mapping.logo_mime};base64,${mapping.logo}` : app.icon;
+	const displayedArguments = applyRedactionMappingToValue(displayLog.arguments, inputRevealMapping);
+	const displayedResult = applyRedactionMappingToValue(displayLog.result, outputRevealMapping);
+	const displayedErrorDetails = applyRedactionMappingToValue(displayLog.error_details, mixedRevealMapping);
+	const errorCard = displayedErrorDetails ? getMCPLogError(displayedErrorDetails) : undefined;
+	const errorText = errorCard?.message ? splitMCPErrorMessage(errorCard.message) : undefined;
+	const pluginLogCount = getPluginLogCount(displayLog.plugin_logs);
+	const presentation = getMCPLogPresentation(displayLog, t);
+	const { durationMs, startTimestamp, endTimestamp } = getMCPLogTimeline(displayLog, presentation);
+	const durationLabel = presentation.durationLabel;
+	const endLabel = presentation.policy
+		? t("mcpLogs.detail.policyCheckTimestamp")
+		: displayLog.source === "native"
+			? t("mcpLogs.detail.observedTimestamp")
+			: t("mcpLogs.detail.endTimestamp");
+	const pillTone = getMCPLogPillTone(displayLog, presentation);
+	const requestId = displayLog.request_id || displayLog.id;
+	const durationSub = (() => {
+		const startStr = startTimestamp && isValid(startTimestamp) ? format(startTimestamp, "HH:mm:ss") : null;
+		const endStr = endTimestamp && isValid(endTimestamp) ? format(endTimestamp, "HH:mm:ss") : null;
+		if (startStr && endStr && startStr !== endStr) return `${startStr} → ${endStr}`;
+		return startStr ?? endStr ?? "";
+	})();
+	// Team, customer and business unit can hold more than one value for a request
+	// (a user in more than one team, say), so each carries its plural columns
+	// alongside the scalar. User, project and device stay scalar-only; their
+	// plural slots are just left empty. filterKey ships without its "_ids"
+	// suffix here so the pluralized filter always applies to every id, single
+	// value included.
+	const scopeLinks = (
+		[
+			[t("labels.user"), t("mcpLogs.detail.users"), "user_id", displayLog.user_name, displayLog.user_id, undefined, undefined],
+			[
+				t("labels.team"),
+				t("mcpLogs.detail.teams"),
+				"team_id",
+				displayLog.team_name,
+				displayLog.team_id,
+				displayLog.team_names,
+				displayLog.team_ids,
+			],
+			[
+				t("labels.customer"),
+				t("mcpLogs.detail.customers"),
+				"customer_id",
+				displayLog.customer_name,
+				displayLog.customer_id,
+				displayLog.customer_names,
+				displayLog.customer_ids,
+			],
+			[
+				t("labels.businessUnit"),
+				t("mcpLogs.detail.businessUnits"),
+				"business_unit_id",
+				displayLog.business_unit_name,
+				displayLog.business_unit_id,
+				displayLog.business_unit_names,
+				displayLog.business_unit_ids,
+			],
+			[
+				t("labels.project"),
+				t("mcpLogs.detail.projects"),
+				"project_id",
+				displayLog.project_name,
+				displayLog.project_id,
+				undefined,
+				undefined,
+			],
+			[t("labels.device"), t("mcpLogs.detail.devices"), "device_id", null, displayLog.device_id, undefined, undefined],
+		] as const
+	)
+		.map(([label, pluralLabel, idKey, name, id, names, ids]) => {
+			const items = ids?.length
+				? ids.map((entryId, i) => ({ id: entryId, name: names?.[i] || entryId }))
+				: id
+					? [{ id, name: name || id }]
+					: [];
+			return { label, pluralLabel, idKey, items };
+		})
+		.filter(({ items }) => items.length > 0);
+	const metadataEntries = Object.entries(displayLog.metadata ?? {}).filter(([key]) => !MCP_OWN_METADATA_KEYS.has(key));
+	const appsMarkers = mcpAppsMarkers(displayLog, t);
+	const inputResponses = displayLog.metadata?.input_responses;
+
+	const headerTitle = <span className="text-foreground text-sm font-medium">{t("mcpLogs.detail.requestDetails")}</span>;
+	const headerActions = (
+		<>
+			{revealAvailable && (
+				<div className="flex items-center gap-2 whitespace-nowrap">
+					<label htmlFor="mcplogdetails-reveal-toggle" className="text-muted-foreground text-[11px] font-medium">
+						{t("mcpLogs.showOriginal")}
+					</label>
+					<Switch
+						id="mcplogdetails-reveal-toggle"
+						checked={revealEnabled}
+						onCheckedChange={(checked) => setShowRevealedValues(checked && revealAvailable)}
+						data-testid="mcplogdetails-reveal-toggle"
+					/>
+				</div>
+			)}
+			<AlertDialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
+				<DropdownMenu open={dropdownOpen} onOpenChange={setDropdownOpen}>
+					<DropdownMenuTrigger asChild>
+						<Button variant="ghost" className="size-8" type="button">
+							<MoreVertical className="h-3 w-3" />
+						</Button>
+					</DropdownMenuTrigger>
+					<DropdownMenuContent align="end">
+						<DropdownMenuItem
+							data-testid="export-log-json"
+							onSelect={(e) => {
+								e.preventDefault();
+								downloadAsJson(displayLog, `mcp-log-${displayLog.id ?? "export"}.json`);
+								setDropdownOpen(false);
+							}}
+						>
+							<Download className="h-4 w-4" />
+							{t("mcpLogs.exportJson")}
+						</DropdownMenuItem>
+						{handleDelete ? (
+							<>
+								<DropdownMenuSeparator />
+								<DropdownMenuItem
+									variant="destructive"
+									onSelect={(e) => {
+										e.preventDefault();
+										setDeleteDialogOpen(true);
+										setDropdownOpen(false);
+									}}
+								>
+									<Trash2 className="h-4 w-4" />
+									{t("logs.detail.deleteLog")}
+								</DropdownMenuItem>
+							</>
+						) : null}
+					</DropdownMenuContent>
+				</DropdownMenu>
+				<AlertDialogContent>
+					<AlertDialogHeader>
+						<AlertDialogTitle>{t("mcpLogs.deleteConfirmTitle")}</AlertDialogTitle>
+						<AlertDialogDescription>{t("mcpLogs.deleteConfirmDesc")}</AlertDialogDescription>
+					</AlertDialogHeader>
+					<AlertDialogFooter>
+						<AlertDialogCancel>{t("labels.cancel")}</AlertDialogCancel>
+						<AlertDialogAction
+							onClick={async (e) => {
+								e.preventDefault();
+								if (!handleDelete) return;
+								try {
+									await handleDelete(displayLog);
+									setDeleteDialogOpen(false);
+									onOpenChange?.(false);
+								} catch (err) {
+									const errorMessage = err instanceof Error ? err.message : t("mcpLogs.detail.deleteFailed");
+									toast.error(errorMessage);
+									// Keep dialog open on error so user can see the error and retry
+								}
+							}}
+						>
+							{t("labels.delete")}
+						</AlertDialogAction>
+					</AlertDialogFooter>
+				</AlertDialogContent>
+			</AlertDialog>
+		</>
+	);
+
+	return (
+		<>
+			{embedded ? (
+				<div className="flex flex-row items-center gap-2 pb-2">
+					<div className="flex w-full items-center gap-2">
+						{headerStart}
+						{headerTitle}
+					</div>
+					{headerActions}
+					{headerEnd}
+				</div>
+			) : (
+				<SheetHeader
+					className="flex flex-row items-center px-0"
+					headerClassName="sticky -top-5 z-20 mx-4 mb-0 w-auto bg-card pt-4 pb-2 md:mx-8 md:pt-8"
+				>
+					<div className="flex w-full items-center gap-2">
+						{headerStart}
+						<SheetTitle className="flex w-fit items-center gap-2 font-medium">{headerTitle}</SheetTitle>
+					</div>
+					{headerActions}
+				</SheetHeader>
+			)}
+			<div className={cn("flex flex-col gap-2", !embedded && "px-4 pb-4 md:px-8 md:pb-8")}>
+				<div className="border-border rounded-sm border">
+					<div className="flex items-start justify-between gap-6 px-5 pt-5 pb-4">
+						<div className="min-w-0 flex-1">
+							<div className="flex flex-wrap items-center gap-2">
+								<Badge variant="outline" className="rounded-sm px-2 py-0.5 font-medium">
+									{displayLog.source === "native" ? t("mcpLogs.detail.nativeTool") : t("mcpLogs.detail.mcpTool")}
+								</Badge>
+								<StatusPill label={presentation.label} tone={pillTone} />
+								{presentation.policy ? (
+									<Badge variant="outline" className="bg-card text-muted-foreground rounded-sm px-2 py-0.5 font-normal">
+										{t("mcpLogs.detail.preExecutionCheck")}
+									</Badge>
+								) : null}
+							</div>
+							<div className="mt-3 flex items-center gap-2">
+								<div
+									className="text-muted-foreground w-24 shrink-0 text-[10.5px] font-semibold tracking-wider uppercase"
+									data-testid="mcplogdetails-tool-label"
+								>
+									{(() => {
+										const readKind = getMCPReadKind(displayLog);
+										if (readKind === "Prompt") return t("mcpLogs.detail.readKindPrompt");
+										if (readKind === "Resource") return t("mcpLogs.detail.readKindResource");
+										return t("mcpLogs.detail.tool");
+									})()}
+								</div>
+								<Link
+									to="/workspace/mcp-logs"
+									search={{ tool_names: [displayLog.tool_name] }}
+									className="truncate font-mono text-[13px] font-medium text-blue-600 hover:underline dark:text-blue-400"
+									title={displayLog.tool_name}
+									data-testid="mcplogdetails-tool-name-link"
+								>
+									{displayLog.tool_name}
+								</Link>
+								<CopyInlineButton text={displayLog.tool_name} testId="mcplogdetails-copy-tool-name-button" />
+							</div>
+							<div className="mt-1 flex items-center gap-2">
+								<div className="text-muted-foreground w-24 shrink-0 text-[10.5px] font-semibold tracking-wider uppercase">
+									{t("mcpLogs.detail.request")}
+								</div>
+								<code className="text-foreground truncate font-mono text-[13px]">{requestId || "—"}</code>
+								{requestId ? <CopyInlineButton text={requestId} testId="mcplogdetails-copy-request-id-button" /> : null}
+							</div>
+							{displayLog.session_id && (
+								<div className="mt-1 flex items-center gap-2">
+									<div className="text-muted-foreground w-24 shrink-0 text-[10.5px] font-semibold tracking-wider uppercase">
+										{t("labels.session")}
+									</div>
+									<code className="text-foreground truncate font-mono text-[13px]">{displayLog.session_id}</code>
+									<CopyInlineButton text={displayLog.session_id} testId="mcplogdetails-copy-session-id-button" />
+								</div>
+							)}
+							{displayLog.llm_request_id && (
+								<div className="mt-1 flex items-center gap-2">
+									<div className="text-muted-foreground w-24 shrink-0 text-[10.5px] font-semibold tracking-wider uppercase">
+										{t("mcpLogs.detail.llmRequest")}
+									</div>
+									<Link
+										to="/workspace/logs"
+										search={{ selected_log: displayLog.llm_request_id }}
+										className="truncate font-mono text-[13px] text-blue-600 hover:underline dark:text-blue-400"
+										data-testid="mcplogdetails-llm-request-id-link"
+									>
+										{displayLog.llm_request_id}
+									</Link>
+									<CopyInlineButton text={displayLog.llm_request_id} testId="mcplogdetails-copy-llm-request-id-button" />
+								</div>
+							)}
+						</div>
+						<div className="flex shrink-0 items-center gap-1.5 rounded-sm border bg-white px-2 py-1 text-[12px] font-medium dark:bg-zinc-900">
+							{appIcon && <img src={appIcon} alt={app.name} width={14} height={14} />}
+							<span>{app.name}</span>
+						</div>
+					</div>
+					<div className="border-border grid grid-cols-1 border-t sm:grid-cols-2 md:grid-cols-4">
+						<HeroStat
+							label={durationLabel}
+							valueClass="text-primary"
+							value={durationMs == null || isNaN(durationMs) ? "—" : formatLatency(durationMs)}
+							sub={durationSub}
+							hasRightBorder
+						/>
+						<HeroStat
+							label={t("labels.server")}
+							value={displayLog.source === "native" ? t("mcpLogs.local") : displayLog.server_label || "—"}
+							sub={displayLog.source === "native" ? t("mcpLogs.native").toLowerCase() : "mcp"}
+							valueClass="whitespace-normal overflow-visible break-all"
+							hasRightBorder
+						/>
+						<HeroStat
+							label={t("labels.user")}
+							value={displayLog.user_name || displayLog.user_id || "—"}
+							sub={displayLog.team_name || displayLog.team_id || ""}
+							valueClass={displayLog.user_name ? undefined : "font-mono text-[15px]"}
+							hasRightBorder
+						/>
+						<HeroStat
+							label={t("labels.device")}
+							mono={!device?.hostname}
+							value={
+								displayLog.device_id ? (
+									<Link
+										to="/workspace/mcp-logs"
+										search={(prev) => ({ ...prev, offset: 0, selected_log: "", device_ids: [displayLog.device_id!] })}
+										className="inline-flex max-w-full items-center gap-1.5 text-blue-600 hover:underline dark:text-blue-400"
+										title={displayLog.device_id}
+										data-testid="mcplogdetails-device-tile-link"
+									>
+										<OsIcon platform={device?.platform} className="h-4 w-4 shrink-0" />
+										<span className="truncate">{device?.hostname || displayLog.device_id}</span>
+									</Link>
+								) : (
+									"—"
+								)
+							}
+							sub={device ? [device.platform, device.os_version, device.arch].filter(Boolean).join(" · ") : ""}
+						/>
+					</div>
+				</div>
+				<details className="group bg-card rounded-sm border" open={false}>
+					<summary
+						className="hover:bg-muted/30 flex cursor-pointer items-center justify-between px-4 py-2.5 text-sm transition"
+						data-testid="mcplogdetails-more-details-toggle"
+					>
+						<span className="text-foreground font-medium">{t("mcpLogs.detail.moreDetails")}</span>
+						<span className="text-muted-foreground flex items-center gap-2 text-xs">
+							<span className="hidden md:inline">
+								{metadataEntries.length > 0 ? t("mcpLogs.detail.summaryWithMetadata") : t("mcpLogs.detail.summary")}
+							</span>
+							<ChevronDown className="h-3.5 w-3.5 transition-transform group-open:rotate-180" />
+						</span>
+					</summary>
+					<div className="space-y-4 border-t px-4 py-4 md:px-6">
+						{presentation.description && (
+							<>
+								<p className="text-muted-foreground text-sm" data-testid="mcplogdetails-status-description">
+									{presentation.description}
+								</p>
+								<DottedSeparator />
+							</>
+						)}
+						<div className="space-y-4">
+							<BlockHeader title={t("mcpLogs.detail.timings")} />
+							<div className="grid w-full grid-cols-1 items-center justify-between gap-4 md:grid-cols-3">
+								<LogEntryDetailsView
+									className="w-full"
+									label={t("mcpLogs.detail.startTimestamp")}
+									value={
+										startTimestamp && isValid(startTimestamp)
+											? format(startTimestamp, "yyyy-MM-dd hh:mm:ss aa", { locale: dateFnsLocale(getLocale()) })
+											: t("labels.nA")
+									}
+								/>
+								<LogEntryDetailsView
+									className="w-full"
+									label={endLabel}
+									value={
+										endTimestamp && isValid(endTimestamp)
+											? format(endTimestamp, "yyyy-MM-dd hh:mm:ss aa", { locale: dateFnsLocale(getLocale()) })
+											: t("labels.nA")
+									}
+								/>
+								<LogEntryDetailsView
+									className="w-full"
+									label={durationLabel}
+									value={durationMs == null || isNaN(durationMs) ? t("mcpLogs.notRecorded") : `${durationMs.toFixed(2)}ms`}
+								/>
+							</div>
+						</div>
+						<DottedSeparator />
+						<div className="space-y-4">
+							<BlockHeader title={t("mcpLogs.detail.requestDetails")} />
+							<div className="grid w-full grid-cols-1 items-start justify-between gap-4 md:grid-cols-3">
+								<LogEntryDetailsView className="col-span-3 w-full" label={t("mcpLogs.detail.requestId")} value={requestId} />
+								{displayLog.session_id && (
+									<LogEntryDetailsView
+										className="col-span-3 w-full"
+										label={t("mcpLogs.detail.sessionId")}
+										value={<code className="truncate font-mono text-xs">{displayLog.session_id}</code>}
+									/>
+								)}
+								<LogEntryDetailsView
+									className="w-full"
+									label={t("labels.app")}
+									value={
+										<div className="flex items-center gap-2">
+											{appIcon && <img src={appIcon} alt={app.name} width={14} height={14} />}
+											<span>{app.name}</span>
+										</div>
+									}
+								/>
+								{displayLog.user_email && (
+									<LogEntryDetailsView
+										className="w-full"
+										label={t("labels.userEmail")}
+										valueTooltip={displayLog.user_email}
+										value={<span data-testid="mcplogdetails-user-email">{displayLog.user_email}</span>}
+									/>
+								)}
+								{displayLog.client_ip && (
+									<LogEntryDetailsView
+										className="w-full"
+										label={t("labels.clientIp")}
+										valueTooltip={displayLog.client_ip}
+										value={
+											<span className="font-mono" data-testid="mcplogdetails-client-ip">
+												{displayLog.client_ip}
+											</span>
+										}
+									/>
+								)}
+								<LogEntryDetailsView
+									className="w-full"
+									label={t("mcpLogs.detail.toolName")}
+									value={<span className="font-mono">{displayLog.tool_name}</span>}
+								/>
+								<LogEntryDetailsView
+									className="w-full"
+									label={t("mcpLogs.detail.server")}
+									value={
+										displayLog.source === "native" ? (
+											<Badge variant="secondary">{t("mcpLogs.detail.localNative")}</Badge>
+										) : displayLog.server_label ? (
+											<Link
+												to="/workspace/mcp-logs"
+												search={{ server_labels: [displayLog.server_label] }}
+												data-testid="mcplogdetails-server-link"
+											>
+												<Badge variant="secondary" className="hover:underline">
+													{displayLog.server_label}
+												</Badge>
+											</Link>
+										) : (
+											"-"
+										)
+									}
+								/>
+								{scopeLinks.map(({ label, pluralLabel, idKey, items }) => (
+									<LogEntryDetailsView
+										key={idKey}
+										className="w-full"
+										label={items.length > 1 ? pluralLabel : label}
+										value={
+											<span className="inline-flex flex-wrap gap-x-1">
+												{items.map((item, i) => (
+													<Tooltip key={item.id}>
+														<TooltipTrigger asChild>
+															<Link
+																to="/workspace/mcp-logs"
+																search={(prev) => ({ ...prev, offset: 0, selected_log: "", [`${idKey}s`]: [item.id] })}
+																className={`text-sm font-normal text-blue-600 underline-offset-2 hover:underline dark:text-blue-400${item.name !== item.id ? "" : " font-mono"}`}
+																data-testid={`mcplogdetails-${idKey.replace("_id", "").replaceAll("_", "-")}-link-${item.id}`}
+															>
+																{item.name}
+																{i < items.length - 1 ? "," : ""}
+															</Link>
+														</TooltipTrigger>
+														<TooltipContent sideOffset={6}>
+															{item.name !== item.id ? item.id : t("mcpLogs.detail.filterBy", { label: label.toLowerCase() })}
+														</TooltipContent>
+													</Tooltip>
+												))}
+											</span>
+										}
+									/>
+								))}
+								{(displayLog.virtual_key || displayLog.virtual_key_id) && (
+									<LogEntryDetailsView
+										className="w-full"
+										label={t("mcpLogs.detail.virtualKey")}
+										valueTooltip={displayLog.virtual_key?.name || displayLog.virtual_key_name || displayLog.virtual_key_id}
+										value={
+											<Link
+												to="/workspace/governance/virtual-keys"
+												search={{ selected_vk: displayLog.virtual_key?.id || displayLog.virtual_key_id! }}
+												className="text-sm font-normal text-blue-600 underline-offset-2 hover:underline dark:text-blue-400"
+												data-testid="mcplogdetails-virtual-key-link"
+											>
+												{displayLog.virtual_key?.name || displayLog.virtual_key_name || displayLog.virtual_key_id}
+											</Link>
+										}
+									/>
+								)}
+								{displayLog.decision && (
+									<LogEntryDetailsView className="w-full" label={t("mcpLogs.detail.decision")} value={displayLog.decision} />
+								)}
+								{appsMarkers.length > 0 && (
+									<LogEntryDetailsView
+										className="col-span-3 w-full"
+										label={t("mcpLogs.detail.mcpApps")}
+										value={
+											<span className="inline-flex flex-wrap gap-1" data-testid="mcplogdetails-mcp-apps">
+												{appsMarkers.map((marker) => (
+													<Badge key={marker} variant="secondary" className="font-normal">
+														{marker}
+													</Badge>
+												))}
+											</span>
+										}
+									/>
+								)}
+							</div>
+						</div>
+						{metadataEntries.length > 0 && (
+							<>
+								<DottedSeparator />
+								<div className="space-y-4">
+									<BlockHeader title={t("mcpLogs.detail.metadata")} />
+									<div className="grid w-full grid-cols-1 items-start justify-between gap-4 md:grid-cols-3">
+										{metadataEntries.map(([key, value]) => (
+											<LogEntryDetailsView
+												key={key}
+												className="w-full"
+												label={key}
+												value={typeof value === "string" ? value : JSON.stringify(value)}
+											/>
+										))}
+									</div>
+								</div>
+							</>
+						)}
+					</div>
+				</details>
+
+				<Tabs key={displayLog.id} value={activeTab} onValueChange={setActiveTab} className="gap-2">
+					<TabsList className="bg-muted/60 h-10 w-fit">
+						<TabsTrigger value="execution" className="px-3">
+							{t("mcpLogs.execution")}
+						</TabsTrigger>
+						<TabsTrigger value="plugins" className="px-3">
+							{t("mcpLogs.pluginLogs")}
+							{pluginLogCount > 0 ? (
+								<span className="bg-background text-muted-foreground ml-1.5 rounded-sm border px-2 py-0.5 text-[10px] tabular-nums">
+									{pluginLogCount}
+								</span>
+							) : null}
+						</TabsTrigger>
+						{roundsCorrelation && roundsCount > 1 ? (
+							<TabsTrigger value="mcp-logs" className="px-3" data-testid="mcplogdetails-rounds-tab">
+								{t("mcpLogs.rounds")}{" "}
+								<span className="bg-background text-muted-foreground ml-1.5 rounded-sm border px-2 py-0.5 text-[10px] tabular-nums">
+									{roundsCount}
+								</span>
+							</TabsTrigger>
+						) : null}
+					</TabsList>
+
+					<TabsContent value="execution" className="space-y-4">
+						{/* Arguments */}
+						{displayedArguments && (
+							<div className="w-full rounded-sm border">
+								<div className="border-b px-4 py-2 text-sm font-medium md:px-6">{t("mcpLogs.arguments")}</div>
+								<CodeEditor
+									className="z-0 w-full"
+									shouldAdjustInitialHeight={true}
+									maxHeight={250}
+									wrap={true}
+									code={typeof displayedArguments === "string" ? displayedArguments : JSON.stringify(displayedArguments, null, 2)}
+									lang="json"
+									readonly={true}
+									options={{ scrollBeyondLastLine: false, collapsibleBlocks: true, lineNumbers: "off", alwaysConsumeMouseWheel: false }}
+								/>
+							</div>
+						)}
+
+						{/* What the caller answered, on the retry of an input_required round */}
+						{inputResponses != null && (
+							<div className="w-full rounded-sm border" data-testid="mcplogdetails-input-answered">
+								<div className="border-b px-4 py-2 text-sm font-medium md:px-6">{t("mcpLogs.inputAnswered")}</div>
+								<CodeEditor
+									className="z-0 w-full"
+									shouldAdjustInitialHeight={true}
+									maxHeight={250}
+									wrap={true}
+									code={JSON.stringify(inputResponses, null, 2)}
+									lang="json"
+									readonly={true}
+									options={{ scrollBeyondLastLine: false, collapsibleBlocks: true, lineNumbers: "off", alwaysConsumeMouseWheel: false }}
+								/>
+							</div>
+						)}
+
+						{displayLog.metadata?.retry_later === true && (
+							<div className="w-full rounded-sm border" data-testid="mcplogdetails-retry-later">
+								<div className="border-b px-4 py-2 text-sm font-medium md:px-6">{t("mcpLogs.presentation.retryLater")}</div>
+								<div className="text-muted-foreground px-4 py-3 text-sm md:px-6">{t("mcpLogs.retryLater")}</div>
+							</div>
+						)}
+
+						{/* Result, or what an input_required round asked the caller */}
+						{displayedResult && displayLog.status !== "processing" && (
+							<div
+								className="w-full rounded-sm border"
+								data-testid={displayLog.status === "input_required" ? "mcplogdetails-input-requested" : undefined}
+							>
+								<div className="border-b px-4 py-2 text-sm font-medium md:px-6">
+									{displayLog.status === "input_required" ? t("mcpLogs.inputRequested") : t("mcpLogs.result")}
+								</div>
+								<CodeEditor
+									className="z-0 w-full"
+									shouldAdjustInitialHeight={true}
+									maxHeight={350}
+									wrap={true}
+									code={typeof displayedResult === "string" ? displayedResult : JSON.stringify(displayedResult, null, 2)}
+									lang="json"
+									readonly={true}
+									options={{ scrollBeyondLastLine: false, collapsibleBlocks: true, lineNumbers: "off", alwaysConsumeMouseWheel: false }}
+								/>
+							</div>
+						)}
+
+						{errorCard && (
+							<LogErrorCard
+								message={errorText?.text || (errorText?.json ? "" : t("mcpLogs.errorNoMessage"))}
+								json={errorText?.json}
+								messageAfter={errorText?.textAfter}
+								copyText={errorCard.message}
+								details={errorCard.details}
+								testId="mcplogdetails-error"
+							/>
+						)}
+					</TabsContent>
+
+					<TabsContent value="plugins" className="space-y-3">
+						{displayLog.plugin_logs ? (
+							<PluginLogsView pluginLogs={displayLog.plugin_logs} />
+						) : (
+							<div className="text-muted-foreground rounded-sm border border-dashed p-5 text-center text-sm">
+								{t("mcpLogs.noPluginLogs")}
+							</div>
+						)}
+					</TabsContent>
+
+					{roundsCorrelation && roundsCount > 1 ? (
+						<CorrelatedLogsContent
+							key={`mcp:${roundTripID}`}
+							kind="mcp"
+							correlation={roundsCorrelation}
+							active={activeTab === "mcp-logs"}
+							pollingInterval={roundsPolling}
+						/>
+					) : null}
+				</Tabs>
+			</div>
+		</>
+	);
+}

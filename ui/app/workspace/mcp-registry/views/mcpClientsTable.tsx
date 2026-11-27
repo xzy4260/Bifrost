@@ -1,0 +1,1508 @@
+import PageTitle from "@/components/pageTitle";
+import ClientForm from "@/app/workspace/mcp-registry/views/mcpClientForm";
+import { PIN_SHADOW_RIGHT } from "@/components/table/columnPinning";
+import {
+	AlertDialog,
+	AlertDialogAction,
+	AlertDialogCancel,
+	AlertDialogContent,
+	AlertDialogDescription,
+	AlertDialogFooter,
+	AlertDialogHeader,
+	AlertDialogTitle,
+} from "@/components/ui/alertDialog";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdownMenu";
+import { Input } from "@/components/ui/input";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Switch } from "@/components/ui/switch";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useToast } from "@/hooks/use-toast";
+import {
+	getErrorMessage,
+	useDeleteMCPClientMutation,
+	useGetCoreConfigQuery,
+	useInitiateMCPClientVerificationMutation,
+	useReauthorizeMCPClientMutation,
+	useReregisterMCPClientMutation,
+	useReconnectMCPClientMutation,
+	useRefreshMCPClientToolsMutation,
+	useUpdateMCPClientMutation,
+	useVerifyMCPClientExchangeMutation,
+	useVerifyMCPClientHeadersMutation,
+} from "@/lib/store";
+import { getExternalBaseUrl } from "@/app/workspace/mcp-registry/views/mcpUsageGuide/utils";
+import { useCopyToClipboard } from "@/hooks/useCopyToClipboard";
+import { MCPClient } from "@/lib/types/mcp";
+import { supportsClientReregistration } from "@/lib/utils/mcpCredential";
+import { perUserDiscoveryOn } from "@/lib/utils/mcpPerUserDiscovery";
+import { RbacOperation, RbacResource, useRbac } from "@enterprise/lib";
+import { Link } from "@tanstack/react-router";
+import {
+	Box,
+	Check,
+	ChevronLeft,
+	ChevronRight,
+	Copy,
+	Info,
+	KeyRound,
+	ListRestart,
+	Loader2,
+	MoreHorizontal,
+	PencilIcon,
+	Plus,
+	RefreshCcw,
+	RotateCcwKey,
+	Search,
+	Trash2,
+	X,
+} from "lucide-react";
+import { ReactNode, useEffect, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { IconWrap, InfoBox } from "./authorizerUi";
+import MCPClientDetailsSheet from "./mcpClientDetailsSheet";
+import type { MCPClientAlertActionKind } from "./mcpClientDetailsSheet.utils";
+import MCPClientSheet from "./mcpClientSheet";
+import { authScopeLabel } from "./mcpClientFormFields";
+import { authTypeLabel, canReconnectMCPClient, connectionTypeLabel, exchangeVerifyCopy } from "./mcpClientsTable.utils";
+import { StateBadge } from "./mcpConnectionFailure";
+import { MCPHeadersAuthorizer } from "./mcpHeadersAuthorizer";
+import { MCPServersEmptyState } from "./mcpServersEmptyState";
+import { MCPUsageGuideSheet } from "./mcpUsageGuide";
+import { OAuth2Authorizer } from "./oauth2Authorizer";
+import { useActionParam } from "@/hooks/useActionParam";
+import { getLocale } from "@/lib/i18n";
+import { withBasePath } from "@/lib/utils/basePath";
+
+function MCPClientActionsMenu({
+	client,
+	hasUpdateAccess,
+	hasDeleteAccess,
+	isReconnecting,
+	isRefreshingTools,
+	isAuthorizing,
+	isReauthorizing,
+	isVerifyingExchange,
+	canReconnect,
+	triggerTestId,
+	onEdit,
+	onReconnect,
+	onRefreshTools,
+	onAuthorize,
+	onReauthorize,
+	onReregister,
+	onRefreshHeaders,
+	onVerifyExchange,
+	onDelete,
+}: {
+	client: MCPClient;
+	hasUpdateAccess: boolean;
+	hasDeleteAccess: boolean;
+	isReconnecting: boolean;
+	isRefreshingTools: boolean;
+	isAuthorizing: boolean;
+	isReauthorizing: boolean;
+	isVerifyingExchange: boolean;
+	canReconnect: boolean;
+	triggerTestId?: string;
+	onEdit?: (client: MCPClient) => void; // Omitted on the server's view sheet, which has no Edit entry
+	onReconnect: (client: MCPClient) => void;
+	onRefreshTools: (client: MCPClient) => void;
+	onAuthorize: (client: MCPClient) => void;
+	onReauthorize: (client: MCPClient) => void;
+	onReregister: (client: MCPClient) => void;
+	onRefreshHeaders: (client: MCPClient) => void;
+	onVerifyExchange: (client: MCPClient) => void;
+	onDelete: (client: MCPClient) => void;
+}) {
+	const { t } = useTranslation("mcp");
+	const { t: tCommon } = useTranslation("common");
+	const [isOpen, setIsOpen] = useState(false);
+	// A server with per_user_discovery on keeps no admin credential and no tool
+	// list of its own, so the actions that refresh either do not apply.
+	// Reregistering still does: callers sign in through the client it registers.
+	const perUserDiscovery = perUserDiscoveryOn(client.config);
+
+	return (
+		<DropdownMenu open={isOpen} onOpenChange={setIsOpen}>
+			<DropdownMenuTrigger asChild>
+				<Button
+					variant="ghost"
+					size="icon"
+					className="h-8 w-8"
+					aria-label={t("registry.actionsAria")}
+					data-testid={triggerTestId ?? `mcp-client-actions-${client.config.client_id}-btn`}
+					disabled={isReconnecting || isRefreshingTools || isReauthorizing || isVerifyingExchange}
+				>
+					{isReconnecting || isRefreshingTools || isAuthorizing || isReauthorizing || isVerifyingExchange ? (
+						<Loader2 className="h-4 w-4 animate-spin" />
+					) : (
+						<MoreHorizontal className="h-4 w-4" />
+					)}
+				</Button>
+			</DropdownMenuTrigger>
+			<DropdownMenuContent
+				align="end"
+				onCloseAutoFocus={(e) => {
+					// Edit opens a Sheet; letting the dropdown restore focus to its
+					// trigger fights the Sheet's autofocus and leaves focus outside
+					// the dialog — which breaks ESC-to-close. Hand focus off to the
+					// Sheet by skipping the dropdown's auto-restore.
+					e.preventDefault();
+				}}
+			>
+				{hasUpdateAccess && onEdit && (
+					<DropdownMenuItem
+						className="cursor-pointer"
+						data-testid={`mcp-client-edit-${client.config.client_id}-menu-item`}
+						onSelect={(e) => {
+							e.preventDefault();
+							onEdit(client);
+							setIsOpen(false);
+						}}
+					>
+						<PencilIcon className="h-4 w-4" />
+						{t("registry.actions.edit")}
+					</DropdownMenuItem>
+				)}
+				{hasUpdateAccess && client.state === "pending_verification" && (
+					<DropdownMenuItem
+						className="cursor-pointer"
+						disabled={isAuthorizing}
+						data-testid={`mcp-client-authorize-${client.config.client_id}-menu-item`}
+						onSelect={(e) => {
+							e.preventDefault();
+							onAuthorize(client);
+							setIsOpen(false);
+						}}
+					>
+						<KeyRound className="h-4 w-4" />
+						{t("registry.actions.authorize")}
+					</DropdownMenuItem>
+				)}
+				{hasUpdateAccess && canReconnect && (
+					<DropdownMenuItem
+						className="cursor-pointer"
+						disabled={
+							client.config.disabled || isReconnecting || client.state === "pending_verification" || client.state === "needs_reauth"
+						}
+						onSelect={(e) => {
+							e.preventDefault();
+							onReconnect(client);
+							setIsOpen(false);
+						}}
+					>
+						<RefreshCcw className="h-4 w-4" />
+						{t("registry.actions.reconnect")}
+					</DropdownMenuItem>
+				)}
+				{hasUpdateAccess && !perUserDiscovery && (
+					<DropdownMenuItem
+						className="cursor-pointer"
+						disabled={
+							client.config.disabled || isRefreshingTools || client.state === "pending_verification" || client.state === "needs_reauth"
+						}
+						data-testid={`mcp-client-refresh-tools-${client.config.client_id}-menu-item`}
+						onSelect={(e) => {
+							e.preventDefault();
+							onRefreshTools(client);
+							setIsOpen(false);
+						}}
+					>
+						<ListRestart className="h-4 w-4" />
+						{t("registry.actions.refreshTools")}
+					</DropdownMenuItem>
+				)}
+				{hasUpdateAccess &&
+					!perUserDiscovery &&
+					client.state !== "pending_verification" &&
+					client.state !== "disabled" &&
+					(client.config.auth_type === "oauth" || client.config.auth_type === "per_user_oauth") && (
+						<DropdownMenuItem
+							className="cursor-pointer"
+							disabled={isReauthorizing}
+							data-testid={`mcp-client-reauthorize-${client.config.client_id}-menu-item`}
+							onSelect={(e) => {
+								e.preventDefault();
+								onReauthorize(client);
+								setIsOpen(false);
+							}}
+						>
+							<KeyRound className="h-4 w-4" />
+							{client.config.auth_type === "per_user_oauth"
+								? t("registry.actions.refreshAdminCredential")
+								: t("registry.actions.reauthorize")}
+						</DropdownMenuItem>
+					)}
+				{hasUpdateAccess &&
+					client.state !== "pending_verification" &&
+					client.state !== "disabled" &&
+					supportsClientReregistration(client.config.auth_type) && (
+						<DropdownMenuItem
+							className="cursor-pointer"
+							disabled={isReauthorizing}
+							data-testid={`mcp-client-reregister-${client.config.client_id}-menu-item`}
+							onSelect={(e) => {
+								e.preventDefault();
+								onReregister(client);
+								setIsOpen(false);
+							}}
+						>
+							{/* Not KeyRound like the item above it: this one replaces the
+							    credential rather than redoing consent with it, and the two
+							    sat side by side with identical icons. */}
+							<RotateCcwKey className="h-4 w-4" />
+							{t("registry.actions.reauthorizeNewClient")}
+						</DropdownMenuItem>
+					)}
+				{hasUpdateAccess &&
+					!perUserDiscovery &&
+					client.state !== "pending_verification" &&
+					client.state !== "disabled" &&
+					client.config.auth_type === "per_user_headers" && (
+						<DropdownMenuItem
+							className="cursor-pointer"
+							data-testid={`mcp-client-refresh-headers-${client.config.client_id}-menu-item`}
+							onSelect={(e) => {
+								e.preventDefault();
+								onRefreshHeaders(client);
+								setIsOpen(false);
+							}}
+						>
+							<KeyRound className="h-4 w-4" />
+							{t("registry.actions.refreshAdminCredential")}
+						</DropdownMenuItem>
+					)}
+				{hasUpdateAccess &&
+					!perUserDiscovery &&
+					client.state !== "pending_verification" &&
+					client.state !== "disabled" &&
+					client.config.auth_type === "token_exchange" && (
+						<DropdownMenuItem
+							className="cursor-pointer"
+							disabled={isVerifyingExchange}
+							data-testid={`mcp-client-verify-exchange-${client.config.client_id}-menu-item`}
+							onSelect={(e) => {
+								e.preventDefault();
+								onVerifyExchange(client);
+								setIsOpen(false);
+							}}
+						>
+							<KeyRound className="h-4 w-4" />
+							{t("registry.actions.reverifyAsMe")}
+						</DropdownMenuItem>
+					)}
+				{hasDeleteAccess && (
+					<DropdownMenuItem
+						variant="destructive"
+						className="cursor-pointer"
+						onSelect={(e) => {
+							e.preventDefault();
+							onDelete(client);
+							setIsOpen(false);
+						}}
+					>
+						<Trash2 className="h-4 w-4" />
+						{tCommon("delete")}
+					</DropdownMenuItem>
+				)}
+			</DropdownMenuContent>
+		</DropdownMenu>
+	);
+}
+
+interface MCPClientsTableProps {
+	mcpClients: MCPClient[];
+	totalCount: number;
+	refetch?: () => void;
+	search: string;
+	debouncedSearch: string;
+	server: string;
+	/** Whether any sidebar facet filter (connection/auth/code-mode/status) is active. */
+	filtersActive?: boolean;
+	onSearchChange: (value: string) => void;
+	onServerFilterClear: () => void;
+	offset: number;
+	limit: number;
+	onOffsetChange: (offset: number) => void;
+	pageLoading?: boolean; // the requested page has not arrived; the list still holds the previous one
+}
+
+// ClientEndpointCell shows the /mcp/<slug> path and copies the full external URL on click.
+// Matches the Virtual MCPs table cell: the copy icon reveals on row hover (group-hover).
+function ClientEndpointCell({ slug, baseUrl }: { slug?: string; baseUrl: string }) {
+	const { t } = useTranslation("mcp");
+	const { copy, copied } = useCopyToClipboard({ successMessage: t("common.endpointCopied") });
+	if (!slug) return <span className="text-muted-foreground text-sm">-</span>;
+	return (
+		<Tooltip>
+			<TooltipTrigger asChild>
+				<button
+					type="button"
+					onClick={(e) => {
+						// The row opens the server's view sheet on click; copying must not.
+						e.stopPropagation();
+						copy(`${baseUrl}/mcp/${slug}`);
+					}}
+					className="text-muted-foreground hover:text-foreground flex w-full min-w-0 cursor-pointer items-center gap-1.5 font-mono text-sm transition-colors"
+					aria-label={t("registry.sheet.copyEndpointAria")}
+					data-testid={`mcp-client-endpoint-copy-${slug}`}
+				>
+					<span className="truncate">{withBasePath(`/mcp/${slug}`)}</span>
+					<span className="shrink-0 opacity-0 transition-opacity group-hover:opacity-100">
+						{copied ? <Check className="size-3.5 shrink-0" /> : <Copy className="size-3.5 shrink-0" />}
+					</span>
+				</button>
+			</TooltipTrigger>
+			<TooltipContent className="font-mono">{withBasePath(`/mcp/${slug}`)}</TooltipContent>
+		</Tooltip>
+	);
+}
+
+export default function MCPClientsTable({
+	mcpClients,
+	pageLoading = false,
+	totalCount,
+	refetch,
+	search,
+	debouncedSearch,
+	server,
+	filtersActive = false,
+	onSearchChange,
+	onServerFilterClear,
+	offset,
+	limit,
+	onOffsetChange,
+}: MCPClientsTableProps) {
+	const { t } = useTranslation("mcp");
+	const { t: tCommon } = useTranslation("common");
+	const [formOpen, setFormOpen] = useState(false);
+	const hasCreateMCPClientAccess = useRbac(RbacResource.MCPGateway, RbacOperation.Create);
+	const hasUpdateMCPClientAccess = useRbac(RbacResource.MCPGateway, RbacOperation.Update);
+	const hasDeleteMCPClientAccess = useRbac(RbacResource.MCPGateway, RbacOperation.Delete);
+	// Every item in a row's actions menu needs one of these, so without either
+	// the menu would open empty: the column is left out instead.
+	const hasRowActions = hasUpdateMCPClientAccess || hasDeleteMCPClientAccess;
+	// Externally reachable base URL, so the endpoint cell copies the full URL callers use.
+	const { data: coreConfig } = useGetCoreConfigQuery({ fromDB: true });
+	const baseUrl = getExternalBaseUrl(coreConfig?.client_config);
+	const [selectedMCPClient, setSelectedMCPClient] = useState<MCPClient | null>(null);
+	const [clientToDelete, setClientToDelete] = useState<MCPClient | null>(null);
+	// Drives the token_exchange "Re-verify as me" confirm dialog. Unlike
+	// per_user_oauth/per_user_headers, verify-exchange needs no popup or
+	// sample values — it fires as soon as confirmed — but admins still need
+	// the same "what does this touch, when do I need it" context those flows
+	// get from OAuth2Authorizer/MCPHeadersAuthorizer before we exchange their
+	// identity token.
+	const [exchangeVerifyClient, setExchangeVerifyClient] = useState<MCPClient | null>(null);
+	// Drives the "Reauthorize with a new client" confirm dialog. Confirmed
+	// rather than fired straight from the menu because registering a
+	// replacement client discards the current one, which signs out every
+	// credential bound to this server, not just the admin's.
+	const [reregisterTarget, setReregisterTarget] = useState<MCPClient | null>(null);
+	// Which of the two server sheets is open for selectedMCPClient: the read-only
+	// view a row click opens, or the edit sheet the actions menu's Edit opens.
+	const [openSheet, setOpenSheet] = useState<"view" | "edit" | null>(null);
+	const { toast } = useToast();
+
+	const [reconnectingClients, setReconnectingClients] = useState<string[]>([]);
+	const [refreshingToolsClients, setRefreshingToolsClients] = useState<string[]>([]);
+	const [authorizingClients, setAuthorizingClients] = useState<string[]>([]);
+	const [reauthorizingClients, setReauthorizingClients] = useState<string[]>([]);
+	const [verifyingExchangeClients, setVerifyingExchangeClients] = useState<string[]>([]);
+	const [togglingClientIds, setTogglingClientIds] = useState<Set<string>>(new Set());
+	// Drives the OAuth2Authorizer dialog for a config.json-bootstrapped client
+	// sitting in pending_verification, triggered from the row actions menu.
+	const [bootstrapAuthorize, setBootstrapAuthorize] = useState<{
+		authorizeUrl: string;
+		oauthConfigId: string;
+		flowId?: string;
+		expiresAt?: string;
+		mcpClientId: string;
+		isPerUserOauth: boolean;
+		perUserDiscovery: boolean;
+	} | null>(null);
+	// Drives the MCPHeadersAuthorizer dialog for a config.json-bootstrapped
+	// per_user_headers client sitting in pending_verification, triggered from
+	// the row actions menu.
+	const [bootstrapHeadersClient, setBootstrapHeadersClient] = useState<MCPClient | null>(null);
+	// Drives the OAuth2Authorizer dialog for a client redoing consent via
+	// POST /reauthorize, triggered from the row actions menu.
+	const [reauthorizeFlow, setReauthorizeFlow] = useState<{
+		authorizeUrl: string;
+		oauthConfigId: string;
+		flowId?: string;
+		expiresAt?: string;
+		mcpClientId: string;
+		isPerUserOauth: boolean;
+		perUserDiscovery: boolean;
+	} | null>(null);
+	// Drives the MCPHeadersAuthorizer dialog for a per_user_headers client
+	// refreshing its admin discovery credential, triggered from the row
+	// actions menu (mirrors reauthorizeFlow above for per_user_oauth).
+	const [headersRefreshFlow, setHeadersRefreshFlow] = useState<{
+		mcpClientId: string;
+		perUserHeaderKeys: string[];
+	} | null>(null);
+
+	// RTK Query mutations
+	const [reconnectMCPClient] = useReconnectMCPClientMutation();
+	const [refreshMCPClientTools] = useRefreshMCPClientToolsMutation();
+	const [reauthorizeMCPClient] = useReauthorizeMCPClientMutation();
+	const [reregisterMCPClient] = useReregisterMCPClientMutation();
+	const [verifyMCPClientExchange] = useVerifyMCPClientExchangeMutation();
+	const [deleteMCPClient] = useDeleteMCPClientMutation();
+	const [updateMCPClient] = useUpdateMCPClientMutation();
+	const [initiateVerification] = useInitiateMCPClientVerificationMutation();
+	const [verifyMCPClientHeaders] = useVerifyMCPClientHeadersMutation();
+
+	const handleCreate = () => {
+		setFormOpen(true);
+	};
+	useActionParam("create", handleCreate, { isOpen: formOpen, enabled: hasCreateMCPClientAccess });
+
+	const handleReconnect = async (client: MCPClient) => {
+		try {
+			setReconnectingClients((prev) => [...prev, client.config.client_id]);
+			await reconnectMCPClient(client.config.client_id).unwrap();
+			setReconnectingClients((prev) => prev.filter((id) => id !== client.config.client_id));
+			toast({ title: t("registry.toast.reconnected"), description: t("registry.toast.reconnectedDesc", { name: client.config.name }) });
+			if (refetch) {
+				await refetch();
+			}
+		} catch (error) {
+			setReconnectingClients((prev) => prev.filter((id) => id !== client.config.client_id));
+			toast({ title: tCommon("error"), description: getErrorMessage(error), variant: "destructive" });
+		}
+	};
+
+	// Re-discovers the client's tools from its upstream server immediately.
+	// Distinct from Reconnect, which recycles the connection and does not apply
+	// to per-call clients at all: this works for every client type, and is what
+	// an operator reaches for after adding or removing a tool upstream.
+	const handleRefreshTools = async (client: MCPClient) => {
+		setRefreshingToolsClients((prev) => [...prev, client.config.client_id]);
+		try {
+			const result = await refreshMCPClientTools(client.config.client_id).unwrap();
+			toast({
+				title: t("registry.toast.toolsRefreshed"),
+				description: t("registry.toast.toolsRefreshedDesc", { name: client.config.name, count: result.tool_count }),
+			});
+			if (refetch) {
+				await refetch();
+			}
+		} catch (error) {
+			toast({ title: tCommon("error"), description: getErrorMessage(error), variant: "destructive" });
+		} finally {
+			setRefreshingToolsClients((prev) => prev.filter((id) => id !== client.config.client_id));
+		}
+	};
+
+	const handleStartBootstrap = async (client: MCPClient) => {
+		// per_user_headers takes a synchronous form-based path, token_exchange
+		// opens the same "Re-verify as me" confirm dialog used to repair an
+		// already-verified client; OAuth-based types kick off the existing
+		// browser flow below.
+		if (client.config.auth_type === "per_user_headers") {
+			setBootstrapHeadersClient(client);
+			return;
+		}
+		if (client.config.auth_type === "token_exchange") {
+			handleRequestVerifyExchange(client);
+			return;
+		}
+		const isPerUserOauth = client.config.auth_type === "per_user_oauth";
+		// OAuth2Authorizer always shows a confirm step first and opens its own
+		// popup synchronously from that step's own "Continue" click, for both
+		// OAuth flavors — nothing to pre-open here. (This used to pre-open a
+		// blank popup for the shared-oauth case, based on a stale assumption
+		// that only per_user_oauth showed a confirm step; that left a stray
+		// blank tab open alongside the dialog on every shared-OAuth authorize.)
+		try {
+			setAuthorizingClients((prev) => [...prev, client.config.client_id]);
+			const response = await initiateVerification(client.config.client_id).unwrap();
+			if (response.status === "pending_oauth" && response.authorize_url) {
+				setBootstrapAuthorize({
+					authorizeUrl: response.authorize_url,
+					oauthConfigId: response.oauth_config_id,
+					// A client verifying on the registration it already has (per-caller
+					// discovery turned off) signs in through a flow: its config already
+					// reads "authorized", so the dialog has to poll the flow instead.
+					...(response.flow_id ? { flowId: response.flow_id, expiresAt: response.expires_at } : {}),
+					mcpClientId: client.config.client_id,
+					isPerUserOauth,
+					perUserDiscovery: perUserDiscoveryOn(client.config),
+				});
+			} else {
+				toast({
+					title: t("registry.toast.authorizationFailed"),
+					description: t("registry.toast.unexpectedResponse"),
+					variant: "destructive",
+				});
+			}
+		} catch (error) {
+			toast({ title: t("registry.toast.authorizationFailed"), description: getErrorMessage(error), variant: "destructive" });
+		} finally {
+			setAuthorizingClients((prev) => prev.filter((id) => id !== client.config.client_id));
+		}
+	};
+
+	// registerNewClient picks the endpoint: the plain one reuses the stored
+	// client_id, the other registers a replacement first. Both return the same
+	// pending_oauth payload and drive the same popup, so only the call differs.
+	const handleReauthorize = async (client: MCPClient, registerNewClient = false) => {
+		try {
+			setReauthorizingClients((prev) => [...prev, client.config.client_id]);
+			const response = registerNewClient
+				? await reregisterMCPClient(client.config.client_id).unwrap()
+				: await reauthorizeMCPClient(client.config.client_id).unwrap();
+			if (response.status === "pending_oauth" && response.authorize_url) {
+				setReauthorizeFlow({
+					authorizeUrl: response.authorize_url,
+					oauthConfigId: response.oauth_config_id,
+					flowId: response.flow_id,
+					expiresAt: response.expires_at,
+					mcpClientId: client.config.client_id,
+					isPerUserOauth: client.config.auth_type === "per_user_oauth",
+					perUserDiscovery: perUserDiscoveryOn(client.config),
+				});
+			} else {
+				toast({
+					title: t("registry.toast.reauthorizationFailed"),
+					description: t("registry.toast.unexpectedResponse"),
+					variant: "destructive",
+				});
+			}
+		} catch (error) {
+			toast({ title: t("registry.toast.reauthorizationFailed"), description: getErrorMessage(error), variant: "destructive" });
+		} finally {
+			setReauthorizingClients((prev) => prev.filter((id) => id !== client.config.client_id));
+		}
+	};
+
+	// Opens the MCPHeadersAuthorizer to refresh a per_user_headers client's
+	// admin discovery credential. Unlike OAuth's reauthorize, there's no
+	// server round-trip to kick off first — the dialog collects sample values
+	// itself and posts them directly to verify-headers.
+	const handleRefreshHeaders = (client: MCPClient) => {
+		setHeadersRefreshFlow({
+			mcpClientId: client.config.client_id,
+			perUserHeaderKeys: client.config.per_user_header_keys ?? [],
+		});
+	};
+
+	// Opens the "Re-verify as me" confirm dialog for a token_exchange client.
+	// The exchange call itself is synchronous and inputless — the backend
+	// exchanges the signed-in admin's own identity token, so there's nothing
+	// to collect — but admins still need the same "what does this touch, when
+	// do I need it" context OAuth2Authorizer/MCPHeadersAuthorizer give before
+	// their identity token gets used.
+	const handleRequestVerifyExchange = (client: MCPClient) => {
+		setExchangeVerifyClient(client);
+	};
+
+	const handleVerifyExchange = async (client: MCPClient) => {
+		try {
+			setVerifyingExchangeClients((prev) => [...prev, client.config.client_id]);
+			const response = await verifyMCPClientExchange(client.config.client_id).unwrap();
+			toast({ title: t("registry.toast.verified"), description: response.message });
+			if (refetch) {
+				await refetch();
+			}
+		} catch (error) {
+			toast({ title: t("registry.toast.verificationFailed"), description: getErrorMessage(error), variant: "destructive" });
+		} finally {
+			setVerifyingExchangeClients((prev) => prev.filter((id) => id !== client.config.client_id));
+		}
+	};
+
+	const handleDelete = async (client: MCPClient) => {
+		try {
+			await deleteMCPClient(client.config.client_id).unwrap();
+			toast({ title: t("registry.toast.deleted"), description: t("registry.toast.deletedDesc", { name: client.config.name }) });
+			if (refetch) {
+				await refetch();
+			}
+		} catch (error) {
+			toast({ title: tCommon("error"), description: getErrorMessage(error), variant: "destructive" });
+		}
+	};
+
+	const handleSaved = async () => {
+		setFormOpen(false);
+		if (refetch) {
+			await refetch();
+		}
+	};
+
+	const handleRowClick = (mcpClient: MCPClient) => {
+		setSelectedMCPClient(mcpClient);
+		setOpenSheet("view");
+	};
+
+	const handleEdit = (mcpClient: MCPClient) => {
+		setSelectedMCPClient(mcpClient);
+		setOpenSheet("edit");
+	};
+
+	const handleSheetClose = () => {
+		setOpenSheet(null);
+		setSelectedMCPClient(null);
+	};
+
+	const selectedMCPClientIndex = useMemo(
+		() => (selectedMCPClient ? mcpClients.findIndex((c) => c.config.client_id === selectedMCPClient.config.client_id) : -1),
+		[selectedMCPClient, mcpClients],
+	);
+
+	const [pendingEdgeNav, setPendingEdgeNav] = useState<"first" | "last" | null>(null);
+
+	// Prev/next past a page edge waits for the requested page: until it arrives the list still
+	// holds the page being left.
+	useEffect(() => {
+		if (pendingEdgeNav && !pageLoading && mcpClients.length > 0) {
+			const target = pendingEdgeNav === "first" ? mcpClients[0] : mcpClients[mcpClients.length - 1];
+			setSelectedMCPClient(target);
+			setPendingEdgeNav(null);
+		}
+	}, [pendingEdgeNav, pageLoading, mcpClients]);
+
+	const handleDetailNavigate = (direction: "prev" | "next") => {
+		const newIndex = direction === "prev" ? selectedMCPClientIndex - 1 : selectedMCPClientIndex + 1;
+		if (newIndex >= 0 && newIndex < mcpClients.length) {
+			setSelectedMCPClient(mcpClients[newIndex]);
+		} else if (direction === "next" && offset + limit < totalCount) {
+			onOffsetChange(offset + limit);
+			setPendingEdgeNav("first");
+		} else if (direction === "prev" && offset > 0) {
+			onOffsetChange(Math.max(0, offset - limit));
+			setPendingEdgeNav("last");
+		}
+	};
+
+	const handleEditSaved = async () => {
+		handleSheetClose();
+		if (refetch) {
+			await refetch();
+		}
+	};
+
+	// The view sheet shows the server as the latest poll or refetch has it, so a
+	// state change or a menu action lands on the open sheet. selectedMCPClient is
+	// only the fallback while prev/next is loading another page. The edit sheet
+	// keeps the object it opened with: a fresh one every poll would reset its form.
+	const viewedMCPClient = selectedMCPClient
+		? (mcpClients.find((c) => c.config.client_id === selectedMCPClient.config.client_id) ?? selectedMCPClient)
+		: null;
+
+	// A server that leaves the list while its view is open (deleted from the
+	// view's menu, or elsewhere) closes the view, unless prev/next is moving
+	// to another page and the list is about to be replaced.
+	useEffect(() => {
+		if (openSheet !== "view" || !selectedMCPClient || pendingEdgeNav) return;
+		if (!mcpClients.some((c) => c.config.client_id === selectedMCPClient.config.client_id)) {
+			setOpenSheet(null);
+			setSelectedMCPClient(null);
+		}
+	}, [openSheet, selectedMCPClient, pendingEdgeNav, mcpClients]);
+
+	// The view's alert offers the same fix as the actions menu, through the same handler.
+	const handleAlertAction = (client: MCPClient, kind: MCPClientAlertActionKind) => {
+		switch (kind) {
+			case "authorize":
+				void handleStartBootstrap(client);
+				return;
+			case "reauthorize":
+				void handleReauthorize(client);
+				return;
+			case "refresh_headers":
+				handleRefreshHeaders(client);
+				return;
+			case "verify_exchange":
+				handleRequestVerifyExchange(client);
+				return;
+			case "reconnect":
+				void handleReconnect(client);
+				return;
+		}
+	};
+
+	const isClientBusy = (clientId: string) =>
+		reconnectingClients.includes(clientId) ||
+		authorizingClients.includes(clientId) ||
+		reauthorizingClients.includes(clientId) ||
+		verifyingExchangeClients.includes(clientId);
+
+	const renderActionsMenu = (client: MCPClient, options: { onEdit?: (client: MCPClient) => void; triggerTestId?: string }) => (
+		<MCPClientActionsMenu
+			client={client}
+			hasUpdateAccess={hasUpdateMCPClientAccess}
+			hasDeleteAccess={hasDeleteMCPClientAccess}
+			isReconnecting={reconnectingClients.includes(client.config.client_id)}
+			isRefreshingTools={refreshingToolsClients.includes(client.config.client_id)}
+			isAuthorizing={authorizingClients.includes(client.config.client_id)}
+			isReauthorizing={reauthorizingClients.includes(client.config.client_id)}
+			isVerifyingExchange={verifyingExchangeClients.includes(client.config.client_id)}
+			canReconnect={canReconnectMCPClient(client.config)}
+			triggerTestId={options.triggerTestId}
+			onEdit={options.onEdit}
+			onReconnect={(c) => void handleReconnect(c)}
+			onRefreshTools={(c) => void handleRefreshTools(c)}
+			onAuthorize={(c) => void handleStartBootstrap(c)}
+			onReauthorize={(c) => void handleReauthorize(c)}
+			onReregister={(c) => setReregisterTarget(c)}
+			onRefreshHeaders={handleRefreshHeaders}
+			onVerifyExchange={handleRequestVerifyExchange}
+			onDelete={setClientToDelete}
+		/>
+	);
+
+	const hasActiveFilters = Boolean(debouncedSearch) || Boolean(server) || filtersActive;
+
+	// Rendered on the empty branch too, not just the populated one: PageTitle
+	// draws nothing inline, and leaving it out drops the topbar to the
+	// route-derived fallback, which for this route reads "MCP Registry".
+	const pageTitle = <PageTitle title={t("registry.title")}>{t("registry.description")}</PageTitle>;
+	const exchangeCopy = exchangeVerifyCopy(exchangeVerifyClient);
+
+	// True empty state: no servers at all (not just filtered to zero)
+	if (totalCount === 0 && !hasActiveFilters) {
+		return (
+			<>
+				{pageTitle}
+				{formOpen && <ClientForm open={formOpen} onClose={() => setFormOpen(false)} onSaved={handleSaved} />}
+				<MCPServersEmptyState onAddClick={handleCreate} canCreate={hasCreateMCPClientAccess} />
+			</>
+		);
+	}
+
+	return (
+		<div className="flex grow flex-col overflow-auto">
+			{openSheet === "view" && viewedMCPClient && (
+				<MCPClientDetailsSheet
+					mcpClient={viewedMCPClient}
+					onClose={handleSheetClose}
+					onNavigate={handleDetailNavigate}
+					hasPrev={selectedMCPClientIndex > 0 || offset > 0}
+					hasNext={(selectedMCPClientIndex >= 0 && selectedMCPClientIndex < mcpClients.length - 1) || offset + limit < totalCount}
+					actions={hasRowActions && renderActionsMenu(viewedMCPClient, { triggerTestId: "mcpclient-view-actions-btn" })}
+					onAlertAction={hasUpdateMCPClientAccess ? (kind) => handleAlertAction(viewedMCPClient, kind) : undefined}
+					alertActionBusy={isClientBusy(viewedMCPClient.config.client_id)}
+				/>
+			)}
+			{openSheet === "edit" && selectedMCPClient && (
+				<MCPClientSheet mcpClient={selectedMCPClient} onClose={handleSheetClose} onSubmitSuccess={handleEditSaved} />
+			)}
+			<AlertDialog open={!!reregisterTarget} onOpenChange={(open) => !open && setReregisterTarget(null)}>
+				<AlertDialogContent>
+					<AlertDialogHeader>
+						<AlertDialogTitle>{t("registry.reregister.title", { name: reregisterTarget?.config.name })}</AlertDialogTitle>
+						<AlertDialogDescription>
+							{t("registry.reregister.description")}{" "}
+							{reregisterTarget?.config.auth_type === "per_user_oauth" ? t("registry.reregister.perUser") : t("registry.reregister.shared")}{" "}
+							{perUserDiscoveryOn(reregisterTarget?.config)
+								? t("registry.reregister.perUserDiscovery")
+								: reregisterTarget?.state === "pending_verification"
+									? null
+									: t("registry.reregister.otherwise")}
+						</AlertDialogDescription>
+					</AlertDialogHeader>
+					<AlertDialogFooter>
+						<AlertDialogCancel>{tCommon("cancel")}</AlertDialogCancel>
+						<AlertDialogAction
+							data-testid="mcp-client-reregister-confirm"
+							onClick={() => {
+								const target = reregisterTarget;
+								setReregisterTarget(null);
+								if (target) void handleReauthorize(target, true);
+							}}
+						>
+							{t("registry.reregister.confirm")}
+						</AlertDialogAction>
+					</AlertDialogFooter>
+				</AlertDialogContent>
+			</AlertDialog>
+			<AlertDialog open={!!clientToDelete} onOpenChange={(open) => !open && setClientToDelete(null)}>
+				<AlertDialogContent>
+					<AlertDialogHeader>
+						<AlertDialogTitle>{t("registry.removeTitle")}</AlertDialogTitle>
+						<AlertDialogDescription>{t("registry.removeDescription", { name: clientToDelete?.config.name })}</AlertDialogDescription>
+					</AlertDialogHeader>
+					<AlertDialogFooter>
+						<AlertDialogCancel>{tCommon("cancel")}</AlertDialogCancel>
+						<AlertDialogAction
+							onClick={() => {
+								if (clientToDelete) void handleDelete(clientToDelete);
+							}}
+							className="bg-destructive hover:bg-destructive/90"
+						>
+							{tCommon("delete")}
+						</AlertDialogAction>
+					</AlertDialogFooter>
+				</AlertDialogContent>
+			</AlertDialog>
+			{bootstrapAuthorize && (
+				<OAuth2Authorizer
+					open={!!bootstrapAuthorize}
+					onClose={() => setBootstrapAuthorize(null)}
+					onSuccess={async () => {
+						toast({
+							title: t("common.success"),
+							description: bootstrapAuthorize.isPerUserOauth
+								? t("registry.toast.oauthVerifiedPerUser")
+								: t("registry.toast.clientConnected"),
+						});
+						setBootstrapAuthorize(null);
+						if (refetch) {
+							await refetch();
+						}
+					}}
+					onError={(error) => {
+						toast({ title: t("registry.toast.authorizationFailed"), description: error, variant: "destructive" });
+					}}
+					onConflict={(error) => {
+						setBootstrapAuthorize(null);
+						toast({ title: t("registry.toast.authorizationFailed"), description: error, variant: "destructive" });
+					}}
+					onRetry={
+						bootstrapAuthorize.flowId
+							? async () => {
+									// As for reauthorize: a timed-out or denied flow is dead
+									// server-side, so Retry starts a fresh one.
+									const response = await initiateVerification(bootstrapAuthorize.mcpClientId).unwrap();
+									setBootstrapAuthorize(
+										(prev) =>
+											prev && {
+												...prev,
+												authorizeUrl: response.authorize_url,
+												oauthConfigId: response.oauth_config_id,
+												flowId: response.flow_id,
+												expiresAt: response.expires_at,
+											},
+									);
+								}
+							: undefined
+					}
+					onRegisterNewClient={
+						bootstrapAuthorize.flowId
+							? () => {
+									// Signing in on the client the server kept fails for good
+									// once its provider forgets that client, so a failed sign-in
+									// offers the reregister confirmation the menu would.
+									const target = mcpClients.find((c) => c.config.client_id === bootstrapAuthorize.mcpClientId);
+									setBootstrapAuthorize(null);
+									if (target) setReregisterTarget(target);
+								}
+							: undefined
+					}
+					authorizeUrl={bootstrapAuthorize.authorizeUrl}
+					oauthConfigId={bootstrapAuthorize.oauthConfigId}
+					flowId={bootstrapAuthorize.flowId}
+					expiresAt={bootstrapAuthorize.expiresAt}
+					mcpClientId={bootstrapAuthorize.mcpClientId}
+					isPerUserOauth={bootstrapAuthorize.isPerUserOauth}
+					perUserDiscovery={bootstrapAuthorize.perUserDiscovery}
+				/>
+			)}
+			{bootstrapHeadersClient && (
+				<MCPHeadersAuthorizer
+					open={!!bootstrapHeadersClient}
+					onClose={() => setBootstrapHeadersClient(null)}
+					onSuccess={async () => {
+						toast({
+							title: t("common.success"),
+							description: t("registry.headersVerifiedDesc"),
+						});
+						setBootstrapHeadersClient(null);
+						if (refetch) {
+							await refetch();
+						}
+					}}
+					onError={() => {
+						/* error state rendered by the dialog itself */
+					}}
+					onConflict={async (error) => {
+						// 409: tools were already discovered (e.g. double submit or a
+						// concurrent verification) — the client is verified; refresh.
+						toast({ title: t("registry.toast.alreadyVerified"), description: error });
+						setBootstrapHeadersClient(null);
+						if (refetch) {
+							await refetch();
+						}
+					}}
+					perUserHeaderKeys={bootstrapHeadersClient.config.per_user_header_keys ?? []}
+					perUserDiscovery={perUserDiscoveryOn(bootstrapHeadersClient.config)}
+					submitHandler={async (values) => {
+						await verifyMCPClientHeaders({
+							id: bootstrapHeadersClient.config.client_id,
+							userHeaders: values,
+						}).unwrap();
+					}}
+				/>
+			)}
+
+			{/* Mirrors OAuth2Authorizer's confirm-step layout (icon header, muted
+			    info box, outline-cancel + default-continue footer) so token_exchange
+			    reverification reads as the same kind of admin-credential action,
+			    not a destructive one. */}
+			<Dialog
+				open={!!exchangeVerifyClient}
+				onOpenChange={(next) => {
+					// Keep the dialog open (with a spinner) for the duration of the
+					// verify call itself, so there's visible feedback while the
+					// backend does the token exchange + live connect + tools/list
+					// round trip, instead of closing immediately on "Continue" and
+					// leaving nothing on screen until the toast lands.
+					if (!next && !(exchangeVerifyClient && verifyingExchangeClients.includes(exchangeVerifyClient.config.client_id))) {
+						setExchangeVerifyClient(null);
+					}
+				}}
+			>
+				<DialogContent className="gap-0 overflow-hidden p-0 sm:max-w-md">
+					<DialogHeader className="border-b px-5 py-4 text-left">
+						<div className="flex items-start gap-3">
+							<IconWrap
+								variant={
+									exchangeVerifyClient && verifyingExchangeClients.includes(exchangeVerifyClient.config.client_id) ? "info" : "muted"
+								}
+								icon={
+									exchangeVerifyClient && verifyingExchangeClients.includes(exchangeVerifyClient.config.client_id) ? (
+										<Loader2 className="size-4 animate-spin" />
+									) : (
+										<KeyRound className="size-4" />
+									)
+								}
+							/>
+							<div className="min-w-0 space-y-0.5">
+								<DialogTitle className="text-sm leading-snug font-medium">{exchangeCopy.title}</DialogTitle>
+								<DialogDescription className="text-xs leading-relaxed">{exchangeCopy.description}</DialogDescription>
+							</div>
+						</div>
+					</DialogHeader>
+					<div className="space-y-3 px-5 py-4">
+						<InfoBox icon={<KeyRound className="size-4" />}>
+							<p>{exchangeCopy.body}</p>
+							<p className="text-muted-foreground/80 text-xs">{exchangeCopy.detail}</p>
+						</InfoBox>
+						<div className="flex justify-end gap-2">
+							<Button
+								size="sm"
+								variant="outline"
+								disabled={exchangeVerifyClient ? verifyingExchangeClients.includes(exchangeVerifyClient.config.client_id) : false}
+								onClick={() => setExchangeVerifyClient(null)}
+								data-testid="verify-exchange-cancel-btn"
+							>
+								{tCommon("cancel")}
+							</Button>
+							<Button
+								size="sm"
+								disabled={exchangeVerifyClient ? verifyingExchangeClients.includes(exchangeVerifyClient.config.client_id) : false}
+								onClick={async () => {
+									if (!exchangeVerifyClient) return;
+									const client = exchangeVerifyClient;
+									await handleVerifyExchange(client);
+									setExchangeVerifyClient(null);
+								}}
+								data-testid="verify-exchange-confirm-btn"
+							>
+								{exchangeVerifyClient && verifyingExchangeClients.includes(exchangeVerifyClient.config.client_id) ? (
+									<Loader2 className="size-3.5 animate-spin" />
+								) : null}
+								{exchangeVerifyClient && verifyingExchangeClients.includes(exchangeVerifyClient.config.client_id)
+									? t("registry.verify.verifying")
+									: t("common.continue")}
+							</Button>
+						</div>
+					</div>
+				</DialogContent>
+			</Dialog>
+
+			{/* Mirrors OAuth2Authorizer's confirm-step layout (icon header, muted
+			    info box, outline-cancel + default-continue footer) so token_exchange
+			    reverification reads as the same kind of admin-credential action,
+			    not a destructive one. */}
+			<Dialog
+				open={!!exchangeVerifyClient}
+				onOpenChange={(next) => {
+					// Keep the dialog open (with a spinner) for the duration of the
+					// verify call itself, so there's visible feedback while the
+					// backend does the token exchange + live connect + tools/list
+					// round trip, instead of closing immediately on "Continue" and
+					// leaving nothing on screen until the toast lands.
+					if (!next && !(exchangeVerifyClient && verifyingExchangeClients.includes(exchangeVerifyClient.config.client_id))) {
+						setExchangeVerifyClient(null);
+					}
+				}}
+			>
+				<DialogContent className="gap-0 overflow-hidden p-0 sm:max-w-md">
+					<DialogHeader className="border-b px-5 py-4 text-left">
+						<div className="flex items-start gap-3">
+							<IconWrap
+								variant={
+									exchangeVerifyClient && verifyingExchangeClients.includes(exchangeVerifyClient.config.client_id) ? "info" : "muted"
+								}
+								icon={
+									exchangeVerifyClient && verifyingExchangeClients.includes(exchangeVerifyClient.config.client_id) ? (
+										<Loader2 className="size-4 animate-spin" />
+									) : (
+										<KeyRound className="size-4" />
+									)
+								}
+							/>
+							<div className="min-w-0 space-y-0.5">
+								<DialogTitle className="text-sm leading-snug font-medium">{exchangeCopy.title}</DialogTitle>
+								<DialogDescription className="text-xs leading-relaxed">{exchangeCopy.description}</DialogDescription>
+							</div>
+						</div>
+					</DialogHeader>
+					<div className="space-y-3 px-5 py-4">
+						<InfoBox icon={<KeyRound className="size-4" />}>
+							<p>{exchangeCopy.body}</p>
+							<p className="text-muted-foreground/80 text-xs">{exchangeCopy.detail}</p>
+						</InfoBox>
+						<div className="flex justify-end gap-2">
+							<Button
+								size="sm"
+								variant="outline"
+								disabled={exchangeVerifyClient ? verifyingExchangeClients.includes(exchangeVerifyClient.config.client_id) : false}
+								onClick={() => setExchangeVerifyClient(null)}
+								data-testid="verify-exchange-cancel-btn"
+							>
+								{tCommon("cancel")}
+							</Button>
+							<Button
+								size="sm"
+								disabled={exchangeVerifyClient ? verifyingExchangeClients.includes(exchangeVerifyClient.config.client_id) : false}
+								onClick={async () => {
+									if (!exchangeVerifyClient) return;
+									const client = exchangeVerifyClient;
+									await handleVerifyExchange(client);
+									setExchangeVerifyClient(null);
+								}}
+								data-testid="verify-exchange-confirm-btn"
+							>
+								{exchangeVerifyClient && verifyingExchangeClients.includes(exchangeVerifyClient.config.client_id) ? (
+									<Loader2 className="size-3.5 animate-spin" />
+								) : null}
+								{exchangeVerifyClient && verifyingExchangeClients.includes(exchangeVerifyClient.config.client_id)
+									? t("registry.verify.verifying")
+									: t("common.continue")}
+							</Button>
+						</div>
+					</div>
+				</DialogContent>
+			</Dialog>
+
+			{/* Toolbar: Search + Actions */}
+			<div className="mb-4 flex flex-wrap items-center gap-3">
+				{pageTitle}
+
+				<div className="relative max-w-sm flex-1">
+					<Search className="text-muted-foreground absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2" />
+					<Input
+						aria-label={t("registry.searchAria")}
+						placeholder={t("registry.searchPlaceholder")}
+						value={search}
+						onChange={(e) => onSearchChange(e.target.value)}
+						className="pl-9"
+						data-testid="mcp-clients-search-input"
+					/>
+				</div>
+				{server && (
+					<Button
+						variant="outline"
+						size="sm"
+						className="h-8 gap-2"
+						onClick={onServerFilterClear}
+						data-testid="mcp-client-server-filter-clear-btn"
+					>
+						{t("registry.serverFilter")}
+						<X className="size-3" />
+					</Button>
+				)}
+
+				<div className="flex gap-2 sm:ml-auto">
+					<MCPUsageGuideSheet />
+					<Button asChild variant="outline" data-testid="mcp-library-link-btn" className="h-8">
+						{/* The label is hidden below sm, leaving a bare icon. */}
+						<Link to="/workspace/mcp-registry/library" aria-label={t("registry.libraryAria")}>
+							<Box />
+							<span className="hidden sm:inline">{t("common.library")}</span>
+						</Link>
+					</Button>
+					<Button
+						onClick={handleCreate}
+						disabled={!hasCreateMCPClientAccess}
+						data-testid="create-mcp-client-btn"
+						aria-label={t("registry.addServer")}
+						className="h-8 gap-2"
+					>
+						<Plus />
+						<span className="hidden sm:inline">{t("registry.addServer")}</span>
+					</Button>
+				</div>
+			</div>
+
+			<div className="flex grow flex-col overflow-hidden">
+				<div className="mb-2 grow overflow-hidden rounded-sm border">
+					<Table data-testid="mcp-clients-table" containerClassName="h-full overflow-auto" className="w-full min-w-[1516px] table-fixed">
+						<TableHeader className="bg-muted sticky top-0 z-20">
+							<TableRow>
+								<TableHead className="w-[260px] font-semibold">{t("registry.columns.name")}</TableHead>
+								<TableHead className="w-[180px] font-semibold">{t("registry.columns.endpoint")}</TableHead>
+								<TableHead className="w-[150px] font-semibold">{t("registry.columns.connectionType")}</TableHead>
+								<TableHead className="w-[150px] font-semibold">{t("registry.columns.authType")}</TableHead>
+								<TableHead className="w-[140px] font-semibold">{t("registry.columns.authScope")}</TableHead>
+								<TableHead className="w-[120px] font-semibold">{t("registry.columns.codeMode")}</TableHead>
+								<TableHead className="w-[150px] font-semibold">{t("registry.columns.access")}</TableHead>
+								<TableHead className="w-[130px] font-semibold">{t("registry.columns.enabledTools")}</TableHead>
+								<TableHead className="w-[160px] font-semibold">{t("registry.columns.autoExecuteTools")}</TableHead>
+								<TableHead className="w-[140px] font-semibold">
+									<HeaderWithTooltip
+										label={t("registry.columns.state")}
+										tooltip={
+											<>
+												<p>{t("registry.stateColumnHelp")}</p>
+												<a
+													data-testid="mcp-client-state-link"
+													href="https://docs.getbifrost.ai/mcp/connections"
+													target="_blank"
+													rel="noreferrer"
+													className="text-primary mt-2 inline-block underline"
+												>
+													{t("registry.seeAllConnectionStates")}
+												</a>
+											</>
+										}
+									/>
+								</TableHead>
+								<TableHead className="w-[90px] font-semibold">{t("registry.columns.status")}</TableHead>
+								{hasRowActions && <TableHead className={`bg-muted sticky right-0 z-10 w-14 text-right ${PIN_SHADOW_RIGHT}`}></TableHead>}
+							</TableRow>
+						</TableHeader>
+						<TableBody>
+							{mcpClients.length === 0 ? (
+								<TableRow>
+									<TableCell colSpan={hasRowActions ? 12 : 11} className="h-24 text-center">
+										<span className="text-muted-foreground text-sm">{t("registry.noMatch")}</span>
+									</TableCell>
+								</TableRow>
+							) : (
+								mcpClients.map((c: MCPClient) => {
+									// Tool counts come from the last successful discovery, which is
+									// deliberately retained across a failed connection check, so an
+									// "unstable" (or degraded/needs_reauth) client still has a real
+									// tool list to report. Gate on the list itself rather than on
+									// "healthy" so only the states that genuinely have no discovered
+									// tools (pending_verification, error, a disabled shared client)
+									// fall back to a dash.
+									//
+									// Both lists are matched against the discovered names: nothing
+									// prunes a tool name from the config when the upstream server
+									// stops exposing it, so an unfiltered length can exceed the
+									// number of tools that actually exist. Auto-execute is further
+									// narrowed to the enabled set, mirroring canAutoExecuteTool,
+									// which requires a tool to pass tools_to_execute first.
+									const discoveredToolNames = new Set(c.tools?.map((tool) => tool.name) ?? []);
+									const enabledToolNames = c.config.tools_to_execute?.includes("*")
+										? discoveredToolNames
+										: new Set((c.config.tools_to_execute ?? []).filter((name) => discoveredToolNames.has(name)));
+									const autoExecuteToolNames = c.config.tools_to_auto_execute?.includes("*")
+										? enabledToolNames
+										: new Set((c.config.tools_to_auto_execute ?? []).filter((name) => enabledToolNames.has(name)));
+									const toolCount = discoveredToolNames.size;
+									const hasDiscoveredTools = toolCount > 0;
+									const enabledToolsCount = enabledToolNames.size;
+									const autoExecuteToolsCount = autoExecuteToolNames.size;
+									return (
+										<TableRow
+											key={c.config.client_id}
+											className="group hover:bg-muted/50 cursor-pointer transition-colors"
+											onClick={() => handleRowClick(c)}
+											data-testid={`mcp-client-row-${c.config.client_id}`}
+										>
+											<TableCell className="font-medium">
+												{/* The row opens the details on click; the name is the same thing as a
+												    button, so it can be reached and opened from the keyboard. */}
+												<button
+													type="button"
+													className="focus-visible:ring-ring block max-w-full cursor-pointer truncate rounded-sm text-left outline-none hover:underline focus-visible:ring-1 focus-visible:ring-offset-1"
+													title={c.config.name}
+													onClick={(e) => {
+														e.stopPropagation();
+														handleRowClick(c);
+													}}
+													data-testid={`mcp-client-name-${c.config.client_id}`}
+												>
+													{c.config.name}
+												</button>
+											</TableCell>
+											<TableCell>
+												<ClientEndpointCell slug={c.config.endpoint_slug} baseUrl={baseUrl} />
+											</TableCell>
+											<TableCell data-testid="mcp-client-connection-type">
+												<Badge variant="outline" className="font-mono">
+													{connectionTypeLabel(c.config.connection_type)}
+												</Badge>
+											</TableCell>
+											<TableCell data-testid="mcp-client-auth-type">{authTypeLabel(c.config.auth_type)}</TableCell>
+											<TableCell data-testid="mcp-client-auth-scope">{authScopeLabel(c.config.auth_type)}</TableCell>
+											<TableCell data-testid="mcp-client-code-mode">
+												{/* Pure config, valid whatever the connection state is: a server
+												    that can't be reached right now is still configured for code
+												    mode or not. */}
+												<Badge
+													className={
+														c.config.is_code_mode_client
+															? "bg-green-100 text-green-800 dark:bg-green-950/40 dark:text-green-300"
+															: "dark:bg-muted dark:text-muted-foreground bg-gray-100 text-gray-800"
+													}
+												>
+													{c.config.is_code_mode_client ? t("common.enabled") : t("common.disabled")}
+												</Badge>
+											</TableCell>
+											<TableCell data-testid="mcp-client-vk-access">
+												{c.config.allow_by_default
+													? t("registry.filter.allowedByDefault")
+													: c.vk_configs?.length
+														? t("registry.vkCount", { count: c.vk_configs.length })
+														: t("registry.filter.none")}
+											</TableCell>
+											<TableCell data-testid="mcp-client-enabled-tools">
+												{hasDiscoveredTools ? (
+													<>
+														{enabledToolsCount}/{toolCount}
+													</>
+												) : (
+													"-"
+												)}
+											</TableCell>
+											<TableCell data-testid="mcp-client-auto-execute-tools">
+												{hasDiscoveredTools ? (
+													<>
+														{autoExecuteToolsCount}/{toolCount}
+													</>
+												) : (
+													"-"
+												)}
+											</TableCell>
+											<TableCell onClick={(e) => e.stopPropagation()}>
+												{/* Every state (healthy/unstable/needs_reauth/pending_verification)
+												    now carries a real, meaningful signal for per-user clients too,
+												    the connection checker's periodic admin-discovery check for
+												    per-user auth types, so this is just the badge uniformly,
+												    same as shared clients. Column-header tooltip above explains
+												    that "unstable" reflects Bifrost's own connection checks, not
+												    caller traffic. Any state with a recorded reason (or a
+												    per-instance breakdown) gets a drill-down, see StateBadge in
+												    mcpConnectionFailure.tsx. */}
+												<StateBadge client={c} />
+											</TableCell>
+											<TableCell onClick={(e) => e.stopPropagation()}>
+												<Switch
+													data-testid={`mcp-client-enabled-switch-${c.config.client_id}`}
+													checked={!c.config.disabled}
+													size="md"
+													disabled={!hasUpdateMCPClientAccess || togglingClientIds.has(c.config.client_id)}
+													onAsyncCheckedChange={async (checked) => {
+														setTogglingClientIds((prev) => new Set(prev).add(c.config.client_id));
+														// PUT has PATCH semantics: omitted fields keep their stored value.
+														// Send only `disabled` — echoing back fields from the GET response
+														// re-submits them in the response's units, which differ from the
+														// units PUT expects (e.g. tool_sync_interval is ns out, minutes in).
+														await updateMCPClient({
+															id: c.config.client_id,
+															data: {
+																disabled: !checked,
+															},
+														})
+															.unwrap()
+															.then(() => {
+																toast({ title: checked ? t("registry.toast.serverEnabled") : t("registry.toast.serverDisabled") });
+																if (refetch) refetch();
+															})
+															.catch((err) => {
+																toast({ title: tCommon("error"), description: getErrorMessage(err), variant: "destructive" });
+															})
+															.finally(() => {
+																setTogglingClientIds((prev) => {
+																	const next = new Set(prev);
+																	next.delete(c.config.client_id);
+																	return next;
+																});
+															});
+													}}
+												/>
+											</TableCell>
+											{hasRowActions && (
+												<TableCell
+													className={`bg-card group-hover:bg-muted/50 sticky right-0 z-10 text-right ${PIN_SHADOW_RIGHT}`}
+													onClick={(e) => e.stopPropagation()}
+												>
+													{renderActionsMenu(c, { onEdit: handleEdit })}
+												</TableCell>
+											)}
+										</TableRow>
+									);
+								})
+							)}
+						</TableBody>
+					</Table>
+				</div>
+
+				{/* Pagination */}
+				{totalCount > 0 && (
+					<div className="flex shrink-0 items-center justify-between text-xs" data-testid="pagination">
+						<div className="text-muted-foreground flex items-center gap-2">
+							{t("common.ofEntries", {
+								from: (offset + 1).toLocaleString(getLocale()),
+								to: Math.min(offset + limit, totalCount).toLocaleString(getLocale()),
+								total: totalCount.toLocaleString(getLocale()),
+							})}
+						</div>
+
+						<div className="flex items-center gap-2">
+							<Button
+								variant="ghost"
+								size="sm"
+								onClick={() => onOffsetChange(Math.max(0, offset - limit))}
+								disabled={offset === 0}
+								data-testid="mcp-clients-pagination-prev-btn"
+								aria-label={t("common.previousPage")}
+							>
+								<ChevronLeft className="size-3" />
+							</Button>
+
+							<div className="flex items-center gap-1">
+								<span>{t("common.page")}</span>
+								<span>{Math.floor(offset / limit) + 1}</span>
+								<span>{t("common.ofPages", { total: Math.ceil(totalCount / limit) })}</span>
+							</div>
+
+							<Button
+								variant="ghost"
+								size="sm"
+								onClick={() => onOffsetChange(offset + limit)}
+								disabled={offset + limit >= totalCount}
+								data-testid="mcp-clients-pagination-next-btn"
+								aria-label={t("common.nextPage")}
+							>
+								<ChevronRight className="size-3" />
+							</Button>
+						</div>
+					</div>
+				)}
+			</div>
+
+			{formOpen && <ClientForm open={formOpen} onClose={() => setFormOpen(false)} onSaved={handleSaved} />}
+			{reauthorizeFlow && (
+				<OAuth2Authorizer
+					open={!!reauthorizeFlow}
+					onClose={() => setReauthorizeFlow(null)}
+					onSuccess={() => {
+						toast({
+							title: t("common.success"),
+							description: reauthorizeFlow.perUserDiscovery
+								? t("registry.toast.perUserDiscoveryReregistered")
+								: reauthorizeFlow.isPerUserOauth
+									? t("registry.toast.adminCredentialRefreshed")
+									: t("registry.toast.reauthorized"),
+						});
+						setReauthorizeFlow(null);
+						if (refetch) void refetch();
+					}}
+					onError={(error) => {
+						toast({ title: t("registry.toast.reauthorizationFailed"), description: error, variant: "destructive" });
+					}}
+					onConflict={(error) => {
+						// 409: the server refused to complete because the consent
+						// never actually finished (the flow is still pending, or no
+						// fresh credential was written). Nothing was repaired, so
+						// say so instead of claiming success.
+						toast({ title: t("registry.toast.reauthorizationDidNotComplete"), description: error, variant: "destructive" });
+						setReauthorizeFlow(null);
+						if (refetch) void refetch();
+					}}
+					onRetry={async () => {
+						// A timed-out or denied flow is dead server-side. Start a
+						// fresh one so the confirm step reopens on a live authorize
+						// URL with a new flow id and deadline.
+						const response = await reauthorizeMCPClient(reauthorizeFlow.mcpClientId).unwrap();
+						setReauthorizeFlow(
+							(prev) =>
+								prev && {
+									...prev,
+									authorizeUrl: response.authorize_url,
+									oauthConfigId: response.oauth_config_id,
+									flowId: response.flow_id,
+									expiresAt: response.expires_at,
+								},
+						);
+					}}
+					authorizeUrl={reauthorizeFlow.authorizeUrl}
+					oauthConfigId={reauthorizeFlow.oauthConfigId}
+					flowId={reauthorizeFlow.flowId}
+					expiresAt={reauthorizeFlow.expiresAt}
+					mcpClientId={reauthorizeFlow.mcpClientId}
+					isPerUserOauth={reauthorizeFlow.isPerUserOauth}
+					perUserDiscovery={reauthorizeFlow.perUserDiscovery}
+					isReauthorize
+				/>
+			)}
+			{headersRefreshFlow && (
+				<MCPHeadersAuthorizer
+					open={!!headersRefreshFlow}
+					onClose={() => setHeadersRefreshFlow(null)}
+					onSuccess={() => {
+						toast({ title: t("common.success"), description: t("registry.toast.adminCredentialRefreshed") });
+						setHeadersRefreshFlow(null);
+						if (refetch) void refetch();
+					}}
+					onError={() => {
+						/* error state rendered by the dialog itself */
+					}}
+					onConflict={(error) => {
+						// 409: the flow's completion raced (double submit / concurrent
+						// verification) or the credential no longer needed a refresh;
+						// either way the client is fine, so treat it as success.
+						toast({ title: t("registry.toast.alreadyVerified"), description: error });
+						setHeadersRefreshFlow(null);
+						if (refetch) void refetch();
+					}}
+					perUserHeaderKeys={headersRefreshFlow.perUserHeaderKeys}
+					submitHandler={async (values) => {
+						await verifyMCPClientHeaders({
+							id: headersRefreshFlow.mcpClientId,
+							userHeaders: values,
+						}).unwrap();
+					}}
+				/>
+			)}
+		</div>
+	);
+}
+
+function HeaderWithTooltip({ label, tooltip }: { label: string; tooltip: ReactNode }) {
+	const { t } = useTranslation("mcp");
+	return (
+		<Popover>
+			<PopoverTrigger asChild>
+				<button
+					type="button"
+					aria-label={t("registry.columnGuidanceAria", { label })}
+					data-testid="mcp-client-state-info-trigger"
+					className="inline-flex cursor-help items-center gap-2"
+				>
+					{label}
+					<Info className="text-muted-foreground size-3" />
+				</button>
+			</PopoverTrigger>
+			<PopoverContent className="w-xs text-xs" align="start">
+				{tooltip}
+			</PopoverContent>
+		</Popover>
+	);
+}

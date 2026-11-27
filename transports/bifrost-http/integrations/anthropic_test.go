@@ -1,0 +1,1022 @@
+package integrations
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/bytedance/sonic"
+	bifrost "github.com/maximhq/bifrost/core"
+	"github.com/maximhq/bifrost/core/providers/anthropic"
+	"github.com/maximhq/bifrost/core/providers/openai"
+	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
+	"github.com/valyala/fasthttp"
+)
+
+func TestAnthropicMessagesBillingHeaderNormalizedBeforeDispatch(t *testing.T) {
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	header := "x-anthropic-billing-header: cc_version=2.1.270.42c; cc_entrypoint=cli;"
+	var incoming anthropic.AnthropicMessageRequest
+	raw := []byte(`{"model":"openai/gpt-4o-mini","max_tokens":64,"system":[{"type":"text","text":"` + header + `"},{"type":"text","text":"Stable instructions"}],"messages":[{"role":"user","content":"Hello"}]}`)
+	if err := sonic.Unmarshal(raw, &incoming); err != nil {
+		t.Fatal(err)
+	}
+	for _, route := range createAnthropicMessagesRouteConfig("/anthropic", nil) {
+		request, err := route.RequestConverter(ctx, &incoming)
+		if err != nil {
+			t.Fatal(err)
+		}
+		blocks := request.ResponsesRequest.Input[0].Content.ContentBlocks
+		if len(blocks) != 1 || blocks[0].Text == nil || *blocks[0].Text != "Stable instructions" {
+			t.Fatalf("billing header survived ingress: %+v", blocks)
+		}
+		restored := request.ResponsesRequest.WithAnthropicBillingHeader()
+		if got := *restored.Input[0].Content.ContentBlocks[0].Text; got != header {
+			t.Fatalf("billing header not retained for Anthropic fallback: %q", got)
+		}
+	}
+	// Normalization only owns the newly converted slices, not the parsed source.
+	if len(incoming.System.ContentBlocks) != 2 || *incoming.System.ContentBlocks[0].Text != header {
+		t.Fatal("parsed Anthropic request was mutated")
+	}
+}
+
+// TestAnthropicMessagesBillingHeaderAfterEffortOnlySystemMessage is a regression test for
+// 2.2.6: once per-message output_config was kept, an effort-only system message ahead of a
+// system billing header pushed the header out of the first slot and it survived ingress, so
+// guardrails evaluated it and non-Anthropic fallbacks received it.
+func TestAnthropicMessagesBillingHeaderAfterEffortOnlySystemMessage(t *testing.T) {
+	header := "x-anthropic-billing-header: cc_version=2.1.286; cc_entrypoint=cli;"
+	for name, headerContent := range map[string]string{
+		"string": `"` + header + `"`,
+		"blocks": `[{"type":"text","text":"` + header + `"}]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			var incoming anthropic.AnthropicMessageRequest
+			raw := []byte(`{"model":"claude-opus-5-5","max_tokens":64,"messages":[` +
+				`{"role":"system","content":[],"output_config":{"effort":"high"}},` +
+				`{"role":"system","content":` + headerContent + `},` +
+				`{"role":"user","content":"alpha"}]}`)
+			if err := sonic.Unmarshal(raw, &incoming); err != nil {
+				t.Fatal(err)
+			}
+			for _, route := range createAnthropicMessagesRouteConfig("/anthropic", nil) {
+				request, err := route.RequestConverter(ctx, &incoming)
+				if err != nil {
+					t.Fatal(err)
+				}
+				input := request.ResponsesRequest.Input
+				normalized, err := schemas.MarshalSorted(input)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if strings.Contains(string(normalized), "x-anthropic-billing-header:") {
+					t.Fatalf("billing header survived ingress behind an effort-only message: %s", normalized)
+				}
+				if len(input) != 2 || !input[0].IsEffortOnlySystemItem() {
+					t.Fatalf("effort-only message must stay first with the user turn after it: %s", normalized)
+				}
+
+				restored := request.ResponsesRequest.WithAnthropicBillingHeader().Input
+				if len(restored) != 3 || !restored[0].IsEffortOnlySystemItem() {
+					t.Fatalf("restored input lost its shape: %+v", restored)
+				}
+				content := restored[1].Content
+				got := ""
+				if content.ContentStr != nil {
+					got = *content.ContentStr
+				} else if len(content.ContentBlocks) == 1 && content.ContentBlocks[0].Text != nil {
+					got = *content.ContentBlocks[0].Text
+				}
+				if got != header {
+					t.Fatalf("billing header not restored in place for Anthropic: %q", got)
+				}
+			}
+
+			// Raw forwarding sends the native body, so a rewrite of the user turn's text
+			// must land on it while the header and the effort-only message stay as sent.
+			rewritten, err := rewriteAnthropicRawRequestBody(append([]byte(nil), raw...), map[string]string{"alpha": "[MASKED]"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := gjson.GetBytes(rewritten, "messages.2.content").String(); got != "[MASKED]" {
+				t.Fatalf("raw rewrite missed the user turn: %q", got)
+			}
+			for _, path := range []string{"messages.0", "messages.1"} {
+				if got, want := gjson.GetBytes(rewritten, path).Raw, gjson.GetBytes(raw, path).Raw; got != want {
+					t.Fatalf("raw rewrite changed %s: %s", path, got)
+				}
+			}
+		})
+	}
+}
+
+// TestRewriteAnthropicRawRequestBodyRedactsOnlyContentFields verifies native redaction covers conversation content and tool argument values without touching request metadata.
+func TestRewriteAnthropicRawRequestBodyRedactsOnlyContentFields(t *testing.T) {
+	rawBody := []byte(`{
+		"model":"claude-sonnet-4-5",
+		"prompt":"legacy alice@example.com",
+		"system":[{"type":"text","text":"system alice@example.com"}],
+		"messages":[
+			{"role":"user","content":"first alice@example.com"},
+			{"role":"assistant","content":[
+				{"type":"thinking","thinking":"reason alice@example.com","signature":"alice@example.com"},
+				{"type":"redacted_thinking","data":"alice@example.com"},
+				{"type":"compaction","content":"summary alice@example.com"},
+				{"type":"text","text":"answer alice@example.com"},
+				{"type":"tool_use","id":"call_1","name":"lookup","input":{"email":"alice@example.com"}}
+			]},
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"call_1","content":"tool alice@example.com"},
+				{"type":"mcp_tool_result","tool_use_id":"call_2","content":[{"type":"text","text":"nested alice@example.com"}]}
+			]}
+		],
+		"metadata":{"user_id":"alice@example.com"},
+		"tools":[{"name":"lookup","description":"alice@example.com","input_schema":{"type":"object"}}]
+	}`)
+
+	got, err := rewriteAnthropicRawRequestBody(rawBody, map[string]string{"alice@example.com": "[EMAIL]"})
+	if err != nil {
+		t.Fatalf("rewriteAnthropicRawRequestBody() error = %v", err)
+	}
+
+	redactedPaths := []string{
+		"messages.1.content.4.input.email",
+		"prompt",
+		"system.0.text",
+		"messages.0.content",
+		"messages.1.content.3.text",
+		"messages.2.content.0.content",
+		"messages.2.content.1.content.0.text",
+	}
+	for _, path := range redactedPaths {
+		if value := gjson.GetBytes(got, path).String(); strings.Contains(value, "alice@example.com") || !strings.Contains(value, "[EMAIL]") {
+			t.Errorf("%s = %q, want redacted content", path, value)
+		}
+	}
+
+	untouchedPaths := map[string]string{
+		"messages.1.content.0.thinking":  "reason alice@example.com",
+		"messages.1.content.0.signature": "alice@example.com",
+		"messages.1.content.1.data":      "alice@example.com",
+		"messages.1.content.2.content":   "summary alice@example.com",
+		"metadata.user_id":               "alice@example.com",
+		"tools.0.description":            "alice@example.com",
+	}
+	for path, expected := range untouchedPaths {
+		if value := gjson.GetBytes(got, path).String(); value != expected {
+			t.Errorf("%s = %q, want untouched %q", path, value, expected)
+		}
+	}
+}
+
+// TestRewriteAnthropicRawRequestBodyRejectsUnmappedLiteral verifies a normalized runtime mutation cannot silently leave native content unredacted.
+func TestRewriteAnthropicRawRequestBodyRejectsUnmappedLiteral(t *testing.T) {
+	_, err := rewriteAnthropicRawRequestBody(
+		[]byte(`{"messages":[{"role":"user","content":"hello"}]}`),
+		map[string]string{"alice@example.com": "[EMAIL]"},
+	)
+	if err == nil {
+		t.Fatal("rewriteAnthropicRawRequestBody() error = nil, want unmapped literal error")
+	}
+}
+
+// TestRewriteAnthropicRawRequestBodyMatchesEscapedArgumentLiterals verifies a literal cut from escaped argument JSON
+// text, as tool-call arguments are scanned, redacts the decoded tool_use input value it stands for.
+func TestRewriteAnthropicRawRequestBodyMatchesEscapedArgumentLiterals(t *testing.T) {
+	got, err := rewriteAnthropicRawRequestBody(
+		[]byte(`{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"write","input":{"content":"head\nkey line one\nkey line two\ntail","quote":"say \"alex@example.com\""}}]}]}`),
+		map[string]string{`key line one\nkey line two`: "[SECRET]", `\"alex@example.com\"`: "[EMAIL]"},
+	)
+	require.NoError(t, err)
+	input := gjson.GetBytes(got, "messages.0.content.0.input")
+	require.Equal(t, "head\n[SECRET]\ntail", input.Get("content").String())
+	require.Equal(t, "say [EMAIL]", input.Get("quote").String())
+}
+
+// TestRewriteAnthropicRawRequestBodyReportsLiteralsNotFound verifies the rewriter names, through a typed error whose
+// message stays generic, exactly the literals no owned field holds.
+func TestRewriteAnthropicRawRequestBodyReportsLiteralsNotFound(t *testing.T) {
+	_, err := rewriteAnthropicRawRequestBody(
+		[]byte(`{"messages":[{"role":"user","content":"mail alice@example.com"}]}`),
+		map[string]string{"alice@example.com": "[EMAIL]", "bob@example.com": "[EMAIL]"},
+	)
+	var notFound *schemas.RawRequestLiteralsNotFoundError
+	require.ErrorAs(t, err, &notFound)
+	require.Equal(t, []string{"bob@example.com"}, notFound.Literals)
+	require.NotContains(t, err.Error(), "bob@example.com")
+}
+
+// TestRewriteAnthropicRawRequestBodyRejectsMalformedJSON verifies native rewrites never repair or forward a malformed body.
+func TestRewriteAnthropicRawRequestBodyRejectsMalformedJSON(t *testing.T) {
+	_, err := rewriteAnthropicRawRequestBody([]byte(`{"messages":`), map[string]string{"alice@example.com": "[EMAIL]"})
+	if err == nil {
+		t.Fatal("rewriteAnthropicRawRequestBody() error = nil, want malformed JSON error")
+	}
+}
+
+// TestRewriteAnthropicRawRequestBodyRejectsDuplicateKeys prevents parser precedence from selecting an unredacted duplicate value.
+func TestRewriteAnthropicRawRequestBodyRejectsDuplicateKeys(t *testing.T) {
+	_, err := rewriteAnthropicRawRequestBody(
+		[]byte(`{"messages":[{"role":"user","content":"alice@example.com","content":"alice@example.com"}]}`),
+		map[string]string{"alice@example.com": "[EMAIL]"},
+	)
+	if err == nil {
+		t.Fatal("rewriteAnthropicRawRequestBody() error = nil, want duplicate-key error")
+	}
+}
+
+// TestMustConvertInPassthrough pins the passthrough routing decision that fixes
+// the Claude Code advisor/server-tool streaming bug: server tools (advisor,
+// web_search, web_fetch, code_execution) expand one Responses item into several
+// Anthropic content blocks with re-numbered indices, so their frames — and every
+// output_item.added (to keep the converter's block counter in lockstep) — must be
+// rendered by the converter instead of forwarded raw. Computer, plain messages,
+// and function/mcp tool calls stream one block each and stay on the raw path.
+//
+// core/providers/anthropic passthroughstream_test.go mirrors this rule for its
+// end-to-end index-consistency test; keep the two in sync.
+func TestMustConvertInPassthrough(t *testing.T) {
+	itemDone := func(mt schemas.ResponsesMessageType) *schemas.BifrostResponsesStreamResponse {
+		return &schemas.BifrostResponsesStreamResponse{
+			Type: schemas.ResponsesStreamResponseTypeOutputItemDone,
+			Item: &schemas.ResponsesMessage{Type: &mt},
+		}
+	}
+	typed := func(rt schemas.ResponsesStreamResponseType) *schemas.BifrostResponsesStreamResponse {
+		return &schemas.BifrostResponsesStreamResponse{Type: rt}
+	}
+
+	cases := []struct {
+		name string
+		resp *schemas.BifrostResponsesStreamResponse
+		want bool
+	}{
+		// output_item.added always converts (keeps the block counter in lockstep).
+		{"added_message", &schemas.BifrostResponsesStreamResponse{
+			Type: schemas.ResponsesStreamResponseTypeOutputItemAdded,
+			Item: &schemas.ResponsesMessage{Type: schemas.Ptr(schemas.ResponsesMessageTypeMessage)},
+		}, true},
+		{"added_advisor", &schemas.BifrostResponsesStreamResponse{
+			Type: schemas.ResponsesStreamResponseTypeOutputItemAdded,
+			Item: &schemas.ResponsesMessage{Type: schemas.Ptr(schemas.ResponsesMessageTypeAdvisorCall)},
+		}, true},
+		{"added_nil_item", typed(schemas.ResponsesStreamResponseTypeOutputItemAdded), true},
+
+		// output_item.done: only result-block-synthesizing server tools convert.
+		{"done_advisor", itemDone(schemas.ResponsesMessageTypeAdvisorCall), true},
+		{"done_web_search", itemDone(schemas.ResponsesMessageTypeWebSearchCall), true},
+		{"done_web_fetch", itemDone(schemas.ResponsesMessageTypeWebFetchCall), true},
+		{"done_code_interpreter", itemDone(schemas.ResponsesMessageTypeCodeInterpreterCall), true},
+		{"done_computer", itemDone(schemas.ResponsesMessageTypeComputerCall), false},
+		{"done_message", itemDone(schemas.ResponsesMessageTypeMessage), false},
+		{"done_function_call", itemDone(schemas.ResponsesMessageTypeFunctionCall), false},
+		{"done_mcp_call", itemDone(schemas.ResponsesMessageTypeMCPCall), false},
+		{"done_nil_item", typed(schemas.ResponsesStreamResponseTypeOutputItemDone), false},
+
+		// Server-tool lifecycle events convert (they collapse to nothing, dropping
+		// the duplicate raw content_block frame they would otherwise carry).
+		{"web_search_in_progress", typed(schemas.ResponsesStreamResponseTypeWebSearchCallInProgress), true},
+		{"web_search_completed", typed(schemas.ResponsesStreamResponseTypeWebSearchCallCompleted), true},
+		{"web_fetch_completed", typed(schemas.ResponsesStreamResponseTypeWebFetchCallCompleted), true},
+		{"code_interpreter_code_done", typed(schemas.ResponsesStreamResponseTypeCodeInterpreterCallCodeDone), true},
+		{"code_interpreter_completed", typed(schemas.ResponsesStreamResponseTypeCodeInterpreterCallCompleted), true},
+
+		// Everything else stays on the raw passthrough path.
+		{"text_delta", typed(schemas.ResponsesStreamResponseTypeOutputTextDelta), false},
+		{"function_args_delta", typed(schemas.ResponsesStreamResponseTypeFunctionCallArgumentsDelta), false},
+		{"content_part_added", typed(schemas.ResponsesStreamResponseTypeContentPartAdded), false},
+		{"created", typed(schemas.ResponsesStreamResponseTypeCreated), false},
+		{"completed", typed(schemas.ResponsesStreamResponseTypeCompleted), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mustConvertInPassthrough(tc.resp); got != tc.want {
+				t.Errorf("mustConvertInPassthrough(%s) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// A user message containing a container_upload block must survive the full
+// Anthropic integration request pipeline (parse → Bifrost → normalize → Anthropic
+// wire) with its file_id intact, and must NOT be replaced by the "..." empty-content
+// placeholder that normalizeBifrostInputContentBlocks backfills for otherwise-empty
+// user messages.
+func TestAnthropicContainerUploadSurvivesNormalization(t *testing.T) {
+	ctx, cancel := schemas.NewBifrostContextWithCancel(context.Background())
+	defer cancel()
+
+	fileID := "file_011CcpBQA2BV1gthmNPSYzkh"
+	req := &anthropic.AnthropicMessageRequest{
+		Model:     "anthropic/claude-sonnet-4-6",
+		MaxTokens: 1024,
+		Messages: []anthropic.AnthropicMessage{
+			{
+				Role: anthropic.AnthropicMessageRoleUser,
+				Content: anthropic.AnthropicContent{
+					ContentBlocks: []anthropic.AnthropicContentBlock{
+						{Type: anthropic.AnthropicContentBlockTypeText, Text: schemas.Ptr("analyse and share model names")},
+						{Type: anthropic.AnthropicContentBlockTypeContainerUpload, FileID: &fileID},
+					},
+				},
+			},
+		},
+	}
+
+	bifrostReq := req.ToBifrostResponsesRequest(ctx)
+	normalizeBifrostInputContentBlocks(bifrostReq)
+
+	out, err := anthropic.ToAnthropicResponsesRequest(ctx, bifrostReq)
+	if err != nil {
+		t.Fatalf("ToAnthropicResponsesRequest: %v", err)
+	}
+
+	var containerFileID *string
+	sawPlaceholder := false
+	for _, m := range out.Messages {
+		for _, b := range m.Content.ContentBlocks {
+			switch b.Type {
+			case anthropic.AnthropicContentBlockTypeContainerUpload:
+				containerFileID = b.FileID
+			case anthropic.AnthropicContentBlockTypeText:
+				if b.Text != nil && *b.Text == "..." {
+					sawPlaceholder = true
+				}
+			}
+		}
+	}
+
+	if sawPlaceholder {
+		t.Errorf("container_upload was replaced by the \"...\" empty-content placeholder")
+	}
+	if containerFileID == nil {
+		t.Fatalf("container_upload block missing from Anthropic request")
+	}
+	if *containerFileID != fileID {
+		t.Errorf("file_id = %q, want %q", *containerFileID, fileID)
+	}
+}
+
+// TestCheckAnthropicPassthrough_OutputConfigEscapeHatch verifies that a Claude Code
+// request carrying a raw output_config.format is forced off the raw-passthrough path
+// (UseRawRequestBody=false) for every provider whose native Anthropic endpoint rejects
+// that field (Vertex, Bedrock Mantle, Azure), so the field gets converted/stripped
+// downstream instead of being forwarded verbatim. Anthropic itself supports the field
+// natively and must stay on the raw path.
+func TestCheckAnthropicPassthrough_OutputConfigEscapeHatch(t *testing.T) {
+	cases := []struct {
+		name       string
+		model      string
+		wantRawOff bool
+	}{
+		{"vertex", "vertex/claude-haiku-4-5", true},
+		{"bedrock_mantle", "bedrock_mantle/claude-haiku-4-5", true},
+		{"azure", "azure/claude-haiku-4-5", true},
+		{"anthropic", "anthropic/claude-haiku-4-5", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reqCtx := &fasthttp.RequestCtx{}
+			reqCtx.Request.Header.SetMethod(fasthttp.MethodPost)
+			reqCtx.Request.Header.Set("user-agent", "claude-code/1.0")
+			reqCtx.Request.Header.Set("x-api-key", "sk-ant-test")
+
+			bifrostCtx, cancel := schemas.NewBifrostContextWithCancel(context.Background())
+			defer cancel()
+
+			req := &anthropic.AnthropicMessageRequest{
+				Model:     tc.model,
+				MaxTokens: 1024,
+				OutputConfig: &anthropic.AnthropicOutputConfig{
+					Format: []byte(`{"type":"json_schema","json_schema":{"name":"my_schema"}}`),
+				},
+			}
+
+			if err := checkAnthropicPassthrough(reqCtx, bifrostCtx, req); err != nil {
+				t.Fatalf("checkAnthropicPassthrough: %v", err)
+			}
+
+			useRaw, _ := bifrostCtx.Value(schemas.BifrostContextKeyUseRawRequestBody).(bool)
+			if tc.wantRawOff && useRaw {
+				t.Errorf("expected UseRawRequestBody=false for %s (output_config.format unsupported natively), got true", tc.model)
+			}
+			if !tc.wantRawOff && !useRaw {
+				t.Errorf("expected UseRawRequestBody to stay true for %s, got false", tc.model)
+			}
+			_, hasRewriter := bifrostCtx.Value(schemas.BifrostContextKeyRawRequestBodyTextRewriter).(schemas.RawRequestBodyTextRewriter)
+			if tc.wantRawOff && hasRewriter {
+				t.Errorf("expected raw request body text rewriter to remain unset for %s", tc.model)
+			}
+			if !tc.wantRawOff && !hasRewriter {
+				t.Errorf("expected Anthropic raw request body text rewriter for %s", tc.model)
+			}
+		})
+	}
+}
+
+// TestCheckAnthropicPassthrough_VertexBetaKeepsNativeResponseForwarding verifies
+// request-only Vertex escape hatches do not disable native Messages response forwarding.
+func TestCheckAnthropicPassthrough_VertexBetaKeepsNativeResponseForwarding(t *testing.T) {
+	betaHeaders := []string{
+		anthropic.AnthropicPromptCachingScopeBetaHeader,
+		anthropic.AnthropicFastModeBetaHeader,
+	}
+
+	for _, betaHeader := range betaHeaders {
+		t.Run(betaHeader, func(t *testing.T) {
+			reqCtx := &fasthttp.RequestCtx{}
+			reqCtx.Request.Header.SetMethod(fasthttp.MethodPost)
+			reqCtx.Request.Header.Set("user-agent", "claude-code/1.0")
+			reqCtx.Request.Header.Set("x-api-key", "sk-ant-test")
+			reqCtx.Request.Header.Set(anthropic.AnthropicBetaHeader, betaHeader)
+
+			bifrostCtx, cancel := schemas.NewBifrostContextWithCancel(context.Background())
+			defer cancel()
+
+			req := &anthropic.AnthropicMessageRequest{
+				Model:     "vertex/claude-opus-4-6",
+				MaxTokens: 1024,
+			}
+			if err := checkAnthropicPassthrough(reqCtx, bifrostCtx, req); err != nil {
+				t.Fatalf("checkAnthropicPassthrough() error = %v", err)
+			}
+
+			if useRaw, _ := bifrostCtx.Value(schemas.BifrostContextKeyUseRawRequestBody).(bool); useRaw {
+				t.Fatal("Vertex beta request kept raw request-body passthrough enabled")
+			}
+			if sendRaw, _ := bifrostCtx.Value(schemas.BifrostContextKeySendBackRawResponse).(bool); !sendRaw {
+				t.Fatal("Vertex beta request disabled native response forwarding")
+			}
+			if _, ok := bifrostCtx.Value(schemas.BifrostContextKeyRawRequestBodyTextRewriter).(schemas.RawRequestBodyTextRewriter); ok {
+				t.Fatal("Vertex beta request registered a raw request-body rewriter")
+			}
+		})
+	}
+}
+
+// TestCheckAnthropicPassthrough_OAuthHeaderRouting locks in the split that stopped Bifrost
+// leaking x-bf-vk upstream and breaking Bedrock's SigV4. In OAuth mode the caller's raw
+// headers must land ONLY in the Anthropic-only passthrough key; BifrostContextKeyExtraHeaders
+// is read by every provider, so anything placed there reaches Bedrock/Vertex/Azure too.
+func TestCheckAnthropicPassthrough_OAuthHeaderRouting(t *testing.T) {
+	reqCtx := &fasthttp.RequestCtx{}
+	reqCtx.Request.Header.SetMethod(fasthttp.MethodPost)
+	reqCtx.Request.Header.Set("user-agent", "claude-code/1.0")
+	// OAuth mode: an sk-ant-oat bearer and no x-api-key.
+	reqCtx.Request.Header.Set("Authorization", "Bearer sk-ant-oat01-caller-token")
+	reqCtx.Request.Header.Set("anthropic-beta", "interleaved-thinking-2025-05-14")
+	reqCtx.Request.Header.Set("x-bf-vk", "sk-bf-must-not-leak")
+	reqCtx.Request.Header.Set("x-forwarded-for", "10.30.10.147")
+	reqCtx.Request.Header.Set("x-claude-code-session-id", "sess-1")
+
+	bifrostCtx, cancel := schemas.NewBifrostContextWithCancel(context.Background())
+	defer cancel()
+	// Whatever x-bf-eh-* already put in ExtraHeaders must survive: the OAuth branch used to
+	// overwrite this key wholesale, silently dropping caller-requested forwarded headers.
+	bifrostCtx.SetValue(schemas.BifrostContextKeyExtraHeaders, map[string][]string{
+		"my-custom-header": {"kept"},
+	})
+
+	req := &anthropic.AnthropicMessageRequest{Model: "claude-opus-4-8", MaxTokens: 1024}
+	if err := checkAnthropicPassthrough(reqCtx, bifrostCtx, req); err != nil {
+		t.Fatalf("checkAnthropicPassthrough: %v", err)
+	}
+
+	// The transport must be able to write the reserved key (restricted writes gate plugins,
+	// not the transport). If this is empty, OAuth passthrough is dead.
+	passthrough, ok := bifrostCtx.Value(schemas.BifrostContextKeyPassthroughHeaders).(map[string][]string)
+	if !ok || len(passthrough) == 0 {
+		t.Fatalf("passthrough headers were not set — OAuth would lose the caller's credential")
+	}
+	// fasthttp canonicalizes header names, so look up case-insensitively (the product code
+	// does the same via strings.ToLower / EqualFold at every check).
+	lookup := func(m map[string][]string, name string) []string {
+		for k, v := range m {
+			if strings.EqualFold(k, name) {
+				return v
+			}
+		}
+		return nil
+	}
+	if got := lookup(passthrough, "authorization"); len(got) == 0 || got[0] != "Bearer sk-ant-oat01-caller-token" {
+		t.Errorf("caller OAuth token missing from passthrough set: %v", got)
+	}
+
+	extra, _ := bifrostCtx.Value(schemas.BifrostContextKeyExtraHeaders).(map[string][]string)
+	// x-bf-eh-* survives.
+	if got := lookup(extra, "my-custom-header"); len(got) == 0 || got[0] != "kept" {
+		t.Errorf("x-bf-eh-* header was clobbered: %v", extra)
+	}
+	// Nothing the caller sent may sit in the every-provider key.
+	for _, leaked := range []string{"authorization", "x-bf-vk", "x-forwarded-for", "x-claude-code-session-id"} {
+		if lookup(extra, leaked) != nil {
+			t.Errorf("%q reached BifrostContextKeyExtraHeaders — every provider forwards that key", leaked)
+		}
+	}
+}
+
+// TestIsClaudeModel_MultiFamilyProvidersResolveFamily locks in that the response-side raw
+// passthrough decision resolves the model family instead of sniffing names. An alias labelled
+// "claude-opus" on Bedrock Mantle may point at an OpenAI model; forwarding that provider's
+// Responses body verbatim to an Anthropic client produced a malformed HTTP 200 ("body is JSON
+// but not a Message") in Claude Code. The alias's ModelID — not its label — decides.
+func TestIsClaudeModel_MultiFamilyProvidersResolveFamily(t *testing.T) {
+	claudeAlias := &schemas.ResolvedAlias{
+		Key:    "claude-opus",
+		Config: &schemas.AliasConfig{ModelID: "openai.gpt-5.6-sol"},
+	}
+	neutralAlias := &schemas.ResolvedAlias{
+		Key:    "fast-model",
+		Config: &schemas.AliasConfig{ModelID: "anthropic.claude-sonnet-4-20250514-v1:0"},
+	}
+	// Azure deployment names / Vertex endpoint ids: the Claude identity lives in ModelName, not ModelID.
+	deploymentAlias := &schemas.ResolvedAlias{
+		Key:    "fast-model",
+		Config: &schemas.AliasConfig{ModelID: "prod-deployment-01", ModelName: schemas.Ptr("claude-sonnet-4")},
+	}
+
+	cases := []struct {
+		name     string
+		provider schemas.ModelProvider
+		model    string // ExtraFields.OriginalModelRequested
+		alias    string // ExtraFields.ResolvedModelUsed (the wire model)
+		resolved *schemas.ResolvedAlias
+		want     bool
+	}{
+		{"mantle claude-named alias to openai model", schemas.BedrockMantle, "claude-opus", "openai.gpt-5.6-sol", claudeAlias, false},
+		{"vertex claude-named alias to openai model", schemas.Vertex, "claude-opus", "openai.gpt-5.6-sol", claudeAlias, false},
+		{"azure claude-named alias to openai model", schemas.Azure, "claude-opus", "openai.gpt-5.6-sol", claudeAlias, false},
+		{"mantle neutral alias to claude model", schemas.BedrockMantle, "fast-model", "anthropic.claude-sonnet-4-20250514-v1:0", neutralAlias, true},
+		{"mantle unaliased claude model", schemas.BedrockMantle, "claude-sonnet-4-20250514", "claude-sonnet-4-20250514", nil, true},
+		{"mantle unaliased openai model", schemas.BedrockMantle, "gpt-5-6-luna", "gpt-5-6-luna", nil, false},
+		{
+			// Neither name looks Claude, so this keeps converting exactly as it did before the family
+			// check existed — the predicate must never newly enable raw passthrough.
+			name:     "azure deployment alias naming claude only in model_name",
+			provider: schemas.Azure,
+			model:    "fast-model",
+			alias:    "prod-deployment-01",
+			resolved: deploymentAlias,
+			want:     false,
+		},
+		{"anthropic provider always native", schemas.Anthropic, "claude-sonnet-4-20250514", "claude-sonnet-4-20250514", nil, true},
+		{"bedrock is never native", schemas.Bedrock, "claude-sonnet-4-20250514", "anthropic.claude-sonnet-4-20250514-v1:0", nil, false},
+		// Ingress: no alias is resolved yet, so the caller-sent model is all there is to go on.
+		{"ingress claude model", "", "claude-sonnet-5", "", nil, true},
+		{"ingress non-claude model", "", "gpt-5", "", nil, false},
+		{"ingress mantle claude model", schemas.BedrockMantle, "claude-haiku-4-5", "", nil, true},
+		{"ingress vertex claude model", schemas.Vertex, "claude-haiku-4-5", "", nil, true},
+		{"ingress azure claude model", schemas.Azure, "claude-haiku-4-5", "", nil, true},
+		{"ingress mantle openai model", schemas.BedrockMantle, "gpt-5-6-luna", "", nil, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := schemas.NewBifrostContextWithCancel(context.Background())
+			defer cancel()
+			if tc.resolved != nil {
+				ctx.SetValue(schemas.BifrostContextKeyResolvedAlias, tc.resolved)
+			}
+
+			if got := isClaudeModel(ctx, tc.model, tc.alias, string(tc.provider)); got != tc.want {
+				t.Errorf("isClaudeModel(%q, %q, %q) = %v, want %v", tc.model, tc.alias, tc.provider, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCheckAnthropicPassthrough_ProviderPrefixedClaudeModel pins the ingress half of the
+// passthrough decision for provider-prefixed Claude requests. TestCheckAnthropicPassthrough_
+// OutputConfigEscapeHatch cannot cover this: it asserts UseRawRequestBody ends up false for these
+// providers, which also holds when passthrough was never enabled at all.
+func TestCheckAnthropicPassthrough_ProviderPrefixedClaudeModel(t *testing.T) {
+	cases := []struct {
+		name      string
+		model     string
+		wantRawOn bool
+	}{
+		{"vertex claude", "vertex/claude-haiku-4-5", true},
+		{"bedrock_mantle claude", "bedrock_mantle/claude-haiku-4-5", true},
+		{"azure claude", "azure/claude-haiku-4-5", true},
+		{"bedrock_mantle openai", "bedrock_mantle/gpt-5-6-luna", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reqCtx := &fasthttp.RequestCtx{}
+			reqCtx.Request.Header.SetMethod(fasthttp.MethodPost)
+			reqCtx.Request.Header.Set("user-agent", "claude-code/1.0")
+			reqCtx.Request.Header.Set("x-api-key", "sk-ant-test")
+
+			bifrostCtx, cancel := schemas.NewBifrostContextWithCancel(context.Background())
+			defer cancel()
+
+			req := &anthropic.AnthropicMessageRequest{Model: tc.model, MaxTokens: 1024}
+			if err := checkAnthropicPassthrough(reqCtx, bifrostCtx, req); err != nil {
+				t.Fatalf("checkAnthropicPassthrough: %v", err)
+			}
+
+			useRaw, _ := bifrostCtx.Value(schemas.BifrostContextKeyUseRawRequestBody).(bool)
+			if useRaw != tc.wantRawOn {
+				t.Errorf("UseRawRequestBody = %v, want %v for %s", useRaw, tc.wantRawOn, tc.model)
+			}
+		})
+	}
+}
+
+// TestAnthropicMessagesRawResponseCarriesExtraFields verifies the verbatim Claude body keeps extra_fields unless Claude Code passthrough is active.
+func TestAnthropicMessagesRawResponseCarriesExtraFields(t *testing.T) {
+	converter := createAnthropicMessagesRouteConfig("/anthropic", nil)[0].ResponsesResponseConverter
+	rawResponse := `{"model":"claude-haiku-4-5-20251001","id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":1},"future_field":{"kept":true}}`
+	newResp := func(raw any) *schemas.BifrostResponsesResponse {
+		return &schemas.BifrostResponsesResponse{
+			ID: schemas.Ptr("msg_1"),
+			ExtraFields: schemas.BifrostResponseExtraFields{
+				Provider:    schemas.Anthropic,
+				RawRequest:  json.RawMessage(`{"model":"claude-haiku-4-5","max_tokens":16}`),
+				RawResponse: raw,
+			},
+		}
+	}
+
+	t.Run("raw capture requested", func(t *testing.T) {
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		out, err := converter(ctx, newResp(json.RawMessage(rawResponse)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := sonic.Marshal(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := gjson.GetBytes(body, "extra_fields.raw_request.model").String(); got != "claude-haiku-4-5" {
+			t.Fatalf("raw_request not echoed: %s", body)
+		}
+		if got := gjson.GetBytes(body, "extra_fields.raw_response.id").String(); got != "msg_1" {
+			t.Fatalf("raw_response not echoed: %s", body)
+		}
+		withoutExtraFields, err := sjson.DeleteBytes(body, "extra_fields")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(withoutExtraFields) != rawResponse {
+			t.Fatalf("Anthropic body changed:\n got %s\nwant %s", withoutExtraFields, rawResponse)
+		}
+	})
+
+	t.Run("claude code passthrough stays byte-identical", func(t *testing.T) {
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		ctx.SetValue(schemas.BifrostContextKeyPassthroughOverridesPresent, true)
+		out, err := converter(ctx, newResp(json.RawMessage(rawResponse)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := sonic.Marshal(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(body) != rawResponse {
+			t.Fatalf("passthrough body changed:\n got %s\nwant %s", body, rawResponse)
+		}
+	})
+
+	t.Run("no raw response uses the converted shape", func(t *testing.T) {
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		out, err := converter(ctx, newResp(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := out.(*anthropic.AnthropicMessageResponse); !ok {
+			t.Fatalf("expected converted AnthropicMessageResponse, got %T", out)
+		}
+	})
+}
+
+// TestAnthropicRefuseThreadContinue_EdgeCases exercises the short-circuit
+// directly: only a parsed messages request whose thread.type is "continue"
+// is refused; everything else falls through untouched so the provider's
+// raw-body strip handles the field.
+func TestAnthropicRefuseThreadContinue_EdgeCases(t *testing.T) {
+	parse := func(t *testing.T, body string) *anthropic.AnthropicMessageRequest {
+		t.Helper()
+		req := &anthropic.AnthropicMessageRequest{}
+		if err := sonic.Unmarshal([]byte(body), req); err != nil {
+			t.Fatalf("failed to parse request body: %v", err)
+		}
+		return req
+	}
+
+	cases := []struct {
+		name     string
+		path     string
+		req      interface{}
+		ctxSetup func(*schemas.BifrostContext)
+		refused  bool
+	}{
+		{
+			name:    "continue_is_refused",
+			path:    "/anthropic/v1/messages",
+			req:     parse(t, `{"model":"claude-opus-4-8","max_tokens":1,"messages":[],"thread":{"type":"continue","previous_message_id":"msg_1"}}`),
+			refused: true,
+		},
+		{
+			name:    "create_falls_through",
+			path:    "/anthropic/v1/messages",
+			req:     parse(t, `{"model":"claude-opus-4-8","max_tokens":1,"messages":[],"thread":{"type":"create"}}`),
+			refused: false,
+		},
+		{
+			name:    "no_thread_falls_through",
+			path:    "/anthropic/v1/messages",
+			req:     parse(t, `{"model":"claude-opus-4-8","max_tokens":1,"messages":[]}`),
+			refused: false,
+		},
+		{
+			name:    "malformed_thread_falls_through",
+			path:    "/anthropic/v1/messages",
+			req:     parse(t, `{"model":"claude-opus-4-8","max_tokens":1,"messages":[],"thread":"continue"}`),
+			refused: false,
+		},
+		{
+			name: "nil_extra_params_falls_through",
+			path: "/anthropic/v1/messages",
+			// Large-payload mode skips body parsing, leaving an almost-empty request.
+			req:     &anthropic.AnthropicMessageRequest{Model: "claude-opus-4-8"},
+			refused: false,
+		},
+		{
+			// Large-payload mode never parses the body, so the enterprise
+			// extractor surfaces the thread type through the routing metadata.
+			name: "large_payload_continue_refused_from_metadata",
+			path: "/anthropic/v1/messages",
+			req:  &anthropic.AnthropicMessageRequest{Model: "claude-opus-4-8"},
+			ctxSetup: func(ctx *schemas.BifrostContext) {
+				ctx.SetValue(schemas.BifrostContextKeyLargePayloadMode, true)
+				ctx.SetValue(schemas.BifrostContextKeyLargePayloadMetadata, &schemas.LargePayloadMetadata{ThreadType: "continue"})
+			},
+			refused: true,
+		},
+		{
+			name: "large_payload_create_falls_through",
+			path: "/anthropic/v1/messages",
+			req:  &anthropic.AnthropicMessageRequest{Model: "claude-opus-4-8"},
+			ctxSetup: func(ctx *schemas.BifrostContext) {
+				ctx.SetValue(schemas.BifrostContextKeyLargePayloadMode, true)
+				ctx.SetValue(schemas.BifrostContextKeyLargePayloadMetadata, &schemas.LargePayloadMetadata{ThreadType: "create"})
+			},
+			refused: false,
+		},
+		{
+			// An extractor that has not been taught about threads leaves the
+			// field empty; behavior must stay unchanged rather than refuse.
+			name: "large_payload_without_thread_metadata_falls_through",
+			path: "/anthropic/v1/messages",
+			req:  &anthropic.AnthropicMessageRequest{Model: "claude-opus-4-8"},
+			ctxSetup: func(ctx *schemas.BifrostContext) {
+				ctx.SetValue(schemas.BifrostContextKeyLargePayloadMode, true)
+				ctx.SetValue(schemas.BifrostContextKeyLargePayloadMetadata, &schemas.LargePayloadMetadata{Model: "claude-opus-4-8"})
+			},
+			refused: false,
+		},
+		{
+			// The parsed thread field wins over stale metadata: a normally
+			// parsed request must never consult large-payload metadata.
+			name: "parsed_thread_wins_over_metadata",
+			path: "/anthropic/v1/messages",
+			req:  parse(t, `{"model":"claude-opus-4-8","max_tokens":1,"messages":[],"thread":{"type":"create"}}`),
+			ctxSetup: func(ctx *schemas.BifrostContext) {
+				ctx.SetValue(schemas.BifrostContextKeyLargePayloadMode, true)
+				ctx.SetValue(schemas.BifrostContextKeyLargePayloadMetadata, &schemas.LargePayloadMetadata{ThreadType: "continue"})
+			},
+			refused: false,
+		},
+		{
+			name:    "wrong_request_type_falls_through",
+			path:    "/anthropic/v1/messages",
+			req:     &anthropic.AnthropicTextRequest{Model: "claude-haiku-4-5"},
+			refused: false,
+		},
+		{
+			// The count_tokens endpoint has its own static route without this
+			// short-circuit; the path guard keeps the wildcard /v1/messages/{path:*}
+			// route from ever refusing token counting if registration changes.
+			name:    "count_tokens_path_never_refused",
+			path:    "/anthropic/v1/messages/count_tokens",
+			req:     parse(t, `{"model":"claude-opus-4-8","max_tokens":1,"messages":[],"thread":{"type":"continue","previous_message_id":"msg_1"}}`),
+			refused: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reqCtx := &fasthttp.RequestCtx{}
+			reqCtx.Request.Header.SetMethod(fasthttp.MethodPost)
+			reqCtx.Request.SetRequestURI(tc.path)
+			bifrostCtx, cancel := schemas.NewBifrostContextWithCancel(context.Background())
+			defer cancel()
+			if tc.ctxSetup != nil {
+				tc.ctxSetup(bifrostCtx)
+			}
+
+			handled, err := anthropicRefuseThreadContinue(reqCtx, bifrostCtx, tc.req)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if handled != tc.refused {
+				t.Fatalf("expected refused=%v, got handled=%v", tc.refused, handled)
+			}
+			if tc.refused {
+				if got := reqCtx.Response.StatusCode(); got != fasthttp.StatusBadRequest {
+					t.Errorf("expected 400, got %d", got)
+				}
+				if body := string(reqCtx.Response.Body()); !strings.Contains(body, "thread_unsupported_request") {
+					t.Errorf("expected thread_unsupported_request in body, got %s", body)
+				}
+			}
+		})
+	}
+}
+
+// Core can take an attempt off raw-body passthrough after the integration chose it
+// (injected tools, unsupported structured output). The response converters must then
+// re-encode Bifrost events instead of treating the reply as raw Anthropic passthrough.
+func TestResponsePassthroughFollowsCoreRawBodyDecision(t *testing.T) {
+	claudeCode := func() *schemas.BifrostContext {
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		ctx.SetValue(schemas.BifrostContextKeyUserAgent, "claude-cli/2.1.0 (external, cli)")
+		return ctx
+	}
+
+	ctx := claudeCode()
+	ctx.SetValue(schemas.BifrostContextKeyUseRawRequestBody, true)
+	if !responsePassthroughActive(ctx, schemas.Anthropic, "claude-sonnet-4-5", "") {
+		t.Error("a passthrough attempt answers in passthrough")
+	}
+
+	ctx = claudeCode()
+	if !responsePassthroughActive(ctx, schemas.Anthropic, "claude-sonnet-4-5", "") {
+		t.Error("unset keeps the integration's own decision")
+	}
+
+	ctx = claudeCode()
+	ctx.SetValue(schemas.BifrostContextKeyUseRawRequestBody, false)
+	if responsePassthroughActive(ctx, schemas.Anthropic, "claude-sonnet-4-5", "") {
+		t.Error("core turned raw-body passthrough off for this attempt, so the reply must be re-encoded")
+	}
+}
+
+// After provider-injected tools ran, the raw upstream reply is only the last of several
+// model turns. The Messages route must answer with the assembled response instead (the
+// router hands converters a copy without the raw bytes), while a single-turn Claude reply
+// still goes back as the provider's own bytes.
+func TestAnthropicMessagesResponsesConverterSkipsRawAfterInjectedTools(t *testing.T) {
+	var convert ResponsesResponseConverter
+	for _, route := range createAnthropicMessagesRouteConfig("", nil) {
+		if route.Path == "/v1/messages" {
+			convert = route.ResponsesResponseConverter
+		}
+	}
+	if convert == nil {
+		t.Fatal("no /v1/messages route")
+	}
+	raw := json.RawMessage(`{"raw":"turn 2 only"}`)
+	resp := func() *schemas.BifrostResponsesResponse {
+		return &schemas.BifrostResponsesResponse{
+			Output: []schemas.ResponsesMessage{{
+				Type:    schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+				Role:    schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+				Content: &schemas.ResponsesMessageContent{ContentStr: schemas.Ptr("Turn 1 text. Sunny.")},
+			}},
+			ExtraFields: schemas.BifrostResponseExtraFields{Provider: schemas.Anthropic, OriginalModelRequested: "claude-sonnet-4-5", RawResponse: raw},
+		}
+	}
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyPassthroughOverridesPresent, true)
+
+	single, err := convert(ctx, responsesResponseForConverter(ctx, resp()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := single.(json.RawMessage); string(got) != string(raw) {
+		t.Fatalf("a single-turn Claude reply goes back as the provider's bytes, got %T", single)
+	}
+
+	ctx.SetValue(schemas.BifrostContextKeyInjectedToolsExecuted, true)
+	assembled, err := convert(ctx, responsesResponseForConverter(ctx, resp()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := assembled.(json.RawMessage); ok && string(got) == string(raw) {
+		t.Fatal("after injected tools ran, the last turn's raw reply must not stand in for the answer")
+	}
+}
+
+// Claude Code keeps two system markers but moves the tool-result marker forward.
+// Explicit-only lookup would lose the previous turn's conversation boundary.
+func TestAnthropicMessagesGPTPromptCacheRollingMarker(t *testing.T) {
+	for _, model := range []string{
+		"openai/gpt-5.6-sol", "openai/gpt-6-sol", "azure/gpt-6-sol",
+		"bedrock/global.openai.gpt-5.6-sol", "bedrock/global.openai.gpt-6-sol",
+		"bedrock_mantle/openai.gpt-6-sol",
+	} {
+		t.Run(model, func(t *testing.T) {
+			ctx, cancel := schemas.NewBifrostContextWithCancel(context.Background())
+			defer cancel()
+			for _, turn := range []string{"first", "second"} {
+				messages := `{"role":"user","content":"Call echo."},
+     {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"echo","input":{"text":"hello"}}]},
+     {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"RESULT_ONE"MARKER}]} `
+				if turn == "first" {
+					messages = strings.ReplaceAll(messages, "MARKER", `,"cache_control":{"type":"ephemeral"}`)
+				} else {
+					messages = strings.ReplaceAll(messages, "MARKER", "") + `,
+      {"role":"assistant","content":[{"type":"tool_use","id":"call_2","name":"echo","input":{"text":"again"}}]},
+      {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_2","content":"RESULT_TWO","cache_control":{"type":"ephemeral"}}]}`
+				}
+				raw := `{"model":"MODEL","max_tokens":64,"system":[
+     {"type":"text","text":"SYSTEM_ONE","cache_control":{"type":"ephemeral"}},
+     {"type":"text","text":"SYSTEM_TWO","cache_control":{"type":"ephemeral"}}],
+     "messages":[MESSAGES]}`
+				raw = strings.ReplaceAll(strings.ReplaceAll(raw, "MODEL", model), "MESSAGES", messages)
+				var incoming anthropic.AnthropicMessageRequest
+				if err := sonic.Unmarshal([]byte(raw), &incoming); err != nil {
+					t.Fatal(err)
+				}
+				for _, route := range createAnthropicMessagesRouteConfig("/anthropic", nil) {
+					request, err := route.RequestConverter(ctx, &incoming)
+					if err != nil {
+						t.Fatal(err)
+					}
+					outgoing := openai.ToOpenAIResponsesRequest(ctx, request.ResponsesRequest)
+					body, err := outgoing.MarshalJSON()
+					if err != nil {
+						t.Fatal(err)
+					}
+					if gjson.GetBytes(body, "prompt_cache_options").Exists() {
+						t.Errorf("%s turn: rolling markers must keep implicit cache lookup: %s", turn, body)
+					}
+					var markers []string
+					gjson.GetBytes(body, "input").ForEach(func(_, item gjson.Result) bool {
+						for _, field := range []string{"content", "output"} {
+							item.Get(field).ForEach(func(_, block gjson.Result) bool {
+								if block.Get("cache_control").Exists() {
+									t.Errorf("Anthropic marker leaked onto wire: %s", body)
+								}
+								if block.Get("prompt_cache_breakpoint").Exists() {
+									if block.Get("prompt_cache_breakpoint.mode").String() != "explicit" {
+										t.Errorf("invalid block breakpoint: %s", body)
+									}
+									markers = append(markers, block.Get("text").String())
+								}
+								return true
+							})
+						}
+						return true
+					})
+					want := "SYSTEM_ONE,SYSTEM_TWO,RESULT_ONE"
+					if turn == "second" {
+						want = "SYSTEM_ONE,SYSTEM_TWO,RESULT_TWO"
+					}
+					if got := strings.Join(markers, ","); got != want {
+						t.Errorf("%s turn: markers = %q, want %q; body=%s", turn, got, want, body)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestAnthropicMessagesStreamDeclaresItsCleanup pins the wiring the stream
+// prompt-usage ledger depends on for an ORDINARY close.
+//
+// The ErrorConverter release covers a stream that failed, and rendering
+// message_stop covers one that finished. A stream whose upstream simply closes
+// without a terminal frame has neither, and before this hook its ledger entry
+// survived until the next stream opened and ran the sweep. handleStreaming now
+// calls StreamConfig.Cleanup from the producer's deferred cleanup, after the
+// chunk loop has drained, which is the ordering ReleaseStreamPromptUsage
+// requires. Dropping that field here puts the delayed reclaim back.
+func TestAnthropicMessagesStreamDeclaresItsCleanup(t *testing.T) {
+	routes := createAnthropicMessagesRouteConfig("/anthropic", bifrost.NewDefaultLogger(schemas.LogLevelError))
+	require.NotEmpty(t, routes)
+
+	var streaming int
+	for _, route := range routes {
+		if route.StreamConfig == nil {
+			continue
+		}
+		streaming++
+		require.NotNil(t, route.StreamConfig.ErrorConverter,
+			"route %s: the error path must keep its own release", route.Path)
+		require.NotNil(t, route.StreamConfig.Cleanup,
+			"route %s: a stream that closes without a terminal frame has no other release point", route.Path)
+	}
+	require.NotZero(t, streaming, "expected at least one streaming Anthropic messages route")
+}

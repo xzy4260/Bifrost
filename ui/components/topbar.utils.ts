@@ -1,0 +1,120 @@
+import type { ParseKeys } from "i18next";
+/**
+ * Gap between a topbar trigger and the menu it opens, in pixels. One tighter
+ * than the app-wide default of 4 that dropdownMenu/popover/hoverCard ship.
+ *
+ * Shared rather than repeated because Radix measures the offset from the
+ * trigger's bounding box: the topbar's triggers are all size-8 so that one
+ * offset lands every menu on the same line, and a lone override would visibly
+ * break the row.
+ */
+
+/** Path segments that are shouted rather than capitalised. */
+const titleAcronyms: Record<string, string> = {
+	a2a: "A2A",
+	ai: "AI",
+	api: "API",
+	llm: "LLM",
+	mcp: "MCP",
+	oauth: "OAuth",
+	rbac: "RBAC",
+	scim: "SCIM",
+	sdk: "SDK",
+	sso: "SSO",
+};
+
+function formatTitlePart(part: string) {
+	return titleAcronyms[part.toLowerCase()] ?? part.charAt(0).toUpperCase() + part.slice(1);
+}
+
+/**
+ * Routes whose slug does not produce the name the product actually uses.
+ *
+ * Only routes that have not yet moved to <PageTitle> belong here; a page that
+ * renders <PageTitle> always wins over this table, so migrating a page means
+ * deleting its row. Titles are taken from the sidebar label so the nav and the
+ * topbar agree, with one adjustment: where a sub-item's label is only
+ * meaningful under its parent ("Rules", "Approvals", "Connectors", "Settings"),
+ * the parent is folded in, because the topbar shows the title alone.
+ *
+ * English values are kept for deriveTitleFromPathname (and its unit tests).
+ * getRouteTitleI18nKey maps the same paths to shell.json keys for live UI.
+ */
+const routeTitleOverrides: Record<string, string> = {
+	"/workspace/adaptive-routing/settings": "Adaptive Routing Settings",
+	"/workspace/agent-logs": "Agent Logs",
+	"/workspace/alerting/channels": "Alert Channels",
+	"/workspace/alerting/history": "Alert History",
+	"/workspace/alerting/rules": "Alert Rules",
+	"/workspace/cluster/overview": "Cluster Nodes",
+	"/workspace/cluster/incidents": "Cluster Incidents",
+	"/workspace/cluster/settings": "Cluster Settings",
+	"/workspace/cluster/storage": "Cluster Storage",
+	"/workspace/config": "Settings",
+	"/workspace/config/license": "License Info",
+	"/workspace/edge-control/config": "Edge Settings",
+	"/workspace/edge-control/devices": "Edge Devices",
+	"/workspace/edge-control/inventory": "Edge Approvals",
+	"/workspace/governance/rbac": "Roles & Permissions",
+	"/workspace/guardrails/configuration": "Guardrail Rules",
+	"/workspace/guardrails/providers": "Guardrail Providers",
+	"/workspace/guardrails/incidents": "Guardrail Incidents",
+	"/workspace/logs": "LLM Logs",
+	"/workspace/logs/connectors": "Log Connectors",
+	"/workspace/observability": "Observability Connectors",
+	"/workspace/prompt-repo": "Prompt Repository",
+	"/workspace/providers": "Model Providers",
+	"/workspace/routing-rules/tree": "Routing Tree",
+	"/workspace/scim": "User Provisioning",
+};
+
+const routeTitleI18nKeys: Partial<Record<string, ParseKeys<"shell">>> = {
+	"/workspace/adaptive-routing/settings": "titles.adaptiveRoutingSettings",
+	"/workspace/alerting/channels": "titles.alertChannels",
+	"/workspace/alerting/history": "titles.alertHistory",
+	"/workspace/alerting/rules": "titles.alertRules",
+	"/workspace/cluster": "titles.clusterConfig",
+	"/workspace/config": "titles.settings",
+	"/workspace/config/license": "titles.licenseInfo",
+	"/workspace/edge-control/config": "titles.edgeSettings",
+	"/workspace/edge-control/devices": "titles.edgeDevices",
+	"/workspace/edge-control/inventory": "titles.edgeApprovals",
+	"/workspace/governance/rbac": "titles.rolesPermissions",
+	"/workspace/guardrails/configuration": "titles.guardrailRules",
+	"/workspace/guardrails/providers": "titles.guardrailProviders",
+	"/workspace/logs": "titles.llmLogs",
+	"/workspace/logs/connectors": "titles.logConnectors",
+	"/workspace/observability": "titles.observabilityConnectors",
+	"/workspace/prompt-repo": "titles.promptRepository",
+	"/workspace/providers": "titles.modelProviders",
+	"/workspace/routing-rules/tree": "titles.routingTree",
+	"/workspace/scim": "titles.userProvisioning",
+};
+
+function pathKey(pathname: string): string {
+	const segments = pathname.split("?")[0].split("/").filter(Boolean);
+	return `/${segments.join("/")}`;
+}
+
+/** shell.json key for a route override, or undefined when the slug fallback applies. */
+export function getRouteTitleI18nKey(pathname: string): ParseKeys<"shell"> | undefined {
+	return routeTitleI18nKeys[pathKey(pathname)];
+}
+
+/**
+ * Title for a route that does not name itself: an entry from
+ * routeTitleOverrides, else the last non-empty path segment
+ * ("/workspace/mcp-registry" -> "MCP Registry").
+ *
+ * The slug half is only ever a guess, which is why a page that renders
+ * <PageTitle> must render it on every branch, including its loading and empty
+ * states. Falling back there does not blank the topbar, it silently shows a
+ * different title.
+ */
+export function deriveTitleFromPathname(pathname: string): string {
+	// Trailing slashes and query-free paths both have to hit the same row.
+	const segments = pathname.split("?")[0].split("/").filter(Boolean);
+	const override = routeTitleOverrides[`/${segments.join("/")}`];
+	if (override) return override;
+	return (segments.at(-1) ?? "Dashboard").split("-").map(formatTitlePart).join(" ");
+}

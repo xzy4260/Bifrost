@@ -1,0 +1,1524 @@
+import BetaBadge from "@/components/betaBadge";
+import { FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
+import { HeadersTable } from "@/components/ui/headersTable";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { SecretVarInput } from "@/components/ui/secretVarInput";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { DottedSeparator } from "@/components/ui/separator";
+import { Switch } from "@/components/ui/switch";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Textarea } from "@/components/ui/textarea";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { IS_ENTERPRISE } from "@/lib/constants/config";
+import i18n from "@/lib/i18n";
+import { getErrorMessage, usePreviewOpenAPISpecMutation } from "@/lib/store";
+import {
+	CreateMCPClientRequest,
+	MCPAuthType,
+	MCPConnectionType,
+	MCPOpenAPIPreviewResponse,
+	MCPTLSConfig,
+	SecretVar,
+} from "@/lib/types/mcp";
+import {
+	hasPrivateKeySettingsWithoutKey,
+	hasSendMethodWithoutSecret,
+	isHTTPSOrLoopbackURL,
+	isSecretVarSet,
+	mcpOpenAPIConfigSchema,
+	privateKeyRequiredMessage,
+	secretRequiredForMethodMessage,
+} from "@/lib/types/schemas";
+import { parseArrayFromText } from "@/lib/utils/array";
+import { supportsPerUserDiscovery } from "@/lib/utils/mcpPerUserDiscovery";
+import { buildOAuthConfigPayload } from "./mcpClientOAuthPayload";
+import { RbacOperation, RbacResource, useRbac } from "@enterprise/lib";
+import { useGetSCIMProvidersQuery } from "@enterprise/lib/store/apis/scimApi";
+import { Info } from "lucide-react";
+import { useCallback, useRef, useState } from "react";
+import { Trans, useTranslation } from "react-i18next";
+import type { UseFormReturn } from "react-hook-form";
+import {
+	buildOpenAPIConfigPayload,
+	collapseToolSelection,
+	applyParsedPreview,
+	openAPIBaseUrlRequired,
+	mergePerUserHeaderKeys,
+	perUserSchemeHeaders,
+	specFingerprint,
+	supportedToolNames,
+	type OpenAPICredentialField,
+	type OpenAPISourceMode,
+} from "./mcpClientOpenApiUtils";
+import { MaxProtocolVersionSelect } from "./maxProtocolVersionSelect";
+import { OAuthAdvancedFields } from "./oauthAdvancedFields";
+import { OpenAPIPreviewPanel, type OpenAPIBaseUrlChoice } from "./openApiPreviewPanel";
+import { OpenAPISpecSource } from "./openApiSpecSource";
+import { CodeModeServerLabel, ServerTypeOnSlugLabel } from "./codeModeFields";
+import { SectionHeader } from "./sectionHeader";
+import { ServerTypeOnSlugSelect } from "./serverTypeOnSlugSelect";
+import { TLSConfigFields } from "./tlsConfigFields";
+import { exchangesAsSSOApplication, TokenExchangeFields, tokenExchangeProfilePayload } from "./tokenExchangeFields";
+
+/**
+ * Shared configuration body for creating an MCP client. Rendered identically by
+ * the catalog's "New MCP Server" sheet and the library's install sheet, so the
+ * two surfaces can never drift in layout, copy, or supported auth types. The
+ * install sheet passes `lockConnection` because its transport and target come
+ * from the library entry the form was seeded with.
+ */
+
+const emptySecretVar: SecretVar = { value: "", ref: "" };
+
+export type MCPAuthKind = "none" | "headers" | "oauth" | "token_exchange";
+export type MCPAuthScope = "shared" | "per_user";
+
+/** Resolve the wire `auth_type` back into the two dropdowns the UI splits it into. */
+export function authKindOf(authType: MCPAuthType | undefined): MCPAuthKind {
+	switch (authType) {
+		case "oauth":
+		case "per_user_oauth":
+			return "oauth";
+		case "headers":
+		case "per_user_headers":
+			return "headers";
+		case "token_exchange":
+			return "token_exchange";
+		default:
+			return "none";
+	}
+}
+
+export function authScopeOf(authType: MCPAuthType | undefined): MCPAuthScope {
+	return authType === "per_user_oauth" || authType === "per_user_headers" ? "per_user" : "shared";
+}
+
+// authScopeLabel is how the servers table and the server view name a scope.
+// token_exchange carries the caller's own token on every call, so it is
+// per-user even though the form does not expose a scope dropdown for it.
+// Everything else, including "none", resolves through authScopeOf so the
+// label agrees with the form.
+export function authScopeLabel(authType: MCPAuthType | undefined): string {
+	if (authType === "token_exchange") {
+		return i18n.t("registry.form.perUser", { ns: "mcp" });
+	}
+	return authScopeOf(authType) === "per_user"
+		? i18n.t("registry.form.perUser", { ns: "mcp" })
+		: i18n.t("registry.form.shared", { ns: "mcp" });
+}
+
+/**
+ * Form values that live outside react-hook-form: comma-separated text inputs
+ * whose parsed form is only needed at submit time, plus the auth scope half of
+ * the split auth dropdowns.
+ */
+export interface MCPClientFormSatellites {
+	argsText: string;
+	setArgsText: (value: string) => void;
+	envVars: Record<string, string>;
+	setEnvVars: (value: Record<string, string>) => void;
+	scopesText: string;
+	setScopesText: (value: string) => void;
+	tokenExchangeScopesText: string;
+	setTokenExchangeScopesText: (value: string) => void;
+	resourceText: string;
+	setResourceText: (value: string) => void;
+	perUserHeaderKeys: string[];
+	headerKeysInput: string;
+	setHeaderKeysInput: (value: string) => void;
+	allowedExtraHeadersText: string;
+	setAllowedExtraHeadersText: (value: string) => void;
+	authScope: MCPAuthScope;
+	setAuthScope: (value: MCPAuthScope) => void;
+	openapi: MCPOpenAPISatellites;
+	reset: (init?: MCPClientFormSatellitesInit) => void;
+}
+
+/**
+ * UI-only state of the OpenAPI connection type: which source tab is active,
+ * the parse result the operation picker is built from, and the fingerprint of
+ * the source it was computed from (an edit afterwards marks it stale until the
+ * user parses again). The wire fields themselves live in react-hook-form under
+ * `openapi_config` and `tools_to_execute`.
+ */
+export interface MCPOpenAPISatellites {
+	sourceMode: OpenAPISourceMode;
+	setSourceMode: (mode: OpenAPISourceMode) => void;
+	fileName: string | null;
+	setFileName: (name: string | null) => void;
+	preview: MCPOpenAPIPreviewResponse | null;
+	setPreview: (preview: MCPOpenAPIPreviewResponse | null) => void;
+	previewedFingerprint: string | null;
+	setPreviewedFingerprint: (fingerprint: string | null) => void;
+	baseUrlChoice: OpenAPIBaseUrlChoice;
+	setBaseUrlChoice: (choice: OpenAPIBaseUrlChoice) => void;
+	parseError: string | null;
+	setParseError: (error: string | null) => void;
+	schemeHeaders: Record<string, string>; // per-user header names typed per security scheme
+	setSchemeHeader: (scheme: string, header: string) => void;
+	/** Starts a parse and returns its token; reset() and the next parse supersede it. */
+	beginParse: () => number;
+	/** Whether token belongs to the latest parse, so its response may be applied. */
+	isCurrentParse: (token: number) => boolean;
+	reset: () => void;
+}
+
+export function useMCPOpenAPISatellites(): MCPOpenAPISatellites {
+	const [sourceMode, setSourceMode] = useState<OpenAPISourceMode>("paste");
+	const [fileName, setFileName] = useState<string | null>(null);
+	const [preview, setPreview] = useState<MCPOpenAPIPreviewResponse | null>(null);
+	const [previewedFingerprint, setPreviewedFingerprint] = useState<string | null>(null);
+	const [baseUrlChoice, setBaseUrlChoice] = useState<OpenAPIBaseUrlChoice>("server");
+	const [parseError, setParseError] = useState<string | null>(null);
+	const [schemeHeaders, setSchemeHeaders] = useState<Record<string, string>>(() => Object.create(null));
+	const setSchemeHeader = useCallback((scheme: string, header: string) => {
+		setSchemeHeaders((prev) => Object.assign(Object.create(null), prev, { [scheme]: header }));
+	}, []);
+	const parseGeneration = useRef(0);
+	const beginParse = useCallback(() => ++parseGeneration.current, []);
+	const isCurrentParse = useCallback((token: number) => token === parseGeneration.current, []);
+	const reset = useCallback(() => {
+		parseGeneration.current++;
+		setSourceMode("paste");
+		setFileName(null);
+		setPreview(null);
+		setPreviewedFingerprint(null);
+		setBaseUrlChoice("server");
+		setParseError(null);
+		setSchemeHeaders(Object.create(null));
+	}, []);
+	return {
+		sourceMode,
+		setSourceMode,
+		fileName,
+		setFileName,
+		preview,
+		setPreview,
+		previewedFingerprint,
+		setPreviewedFingerprint,
+		baseUrlChoice,
+		setBaseUrlChoice,
+		parseError,
+		setParseError,
+		schemeHeaders,
+		setSchemeHeader,
+		beginParse,
+		isCurrentParse,
+		reset,
+	};
+}
+
+export interface MCPClientFormSatellitesInit {
+	argsText?: string;
+	envVars?: Record<string, string>;
+	perUserHeaderKeys?: string[];
+	allowedExtraHeaders?: string[];
+	authScope?: MCPAuthScope;
+}
+
+export function useMCPClientFormSatellites(): MCPClientFormSatellites {
+	const [argsText, setArgsText] = useState("");
+	const [envVars, setEnvVars] = useState<Record<string, string>>({});
+	const [scopesText, setScopesText] = useState("");
+	const [tokenExchangeScopesText, setTokenExchangeScopesText] = useState("");
+	const [resourceText, setResourceText] = useState("");
+	const [headerKeysInput, setHeaderKeysInput] = useState("");
+	const [allowedExtraHeadersText, setAllowedExtraHeadersText] = useState("");
+	const [authScope, setAuthScope] = useState<MCPAuthScope>("shared");
+	const openapi = useMCPOpenAPISatellites();
+	const resetOpenAPI = openapi.reset;
+
+	const reset = useCallback(
+		(init?: MCPClientFormSatellitesInit) => {
+			setArgsText(init?.argsText ?? "");
+			setEnvVars(init?.envVars ?? {});
+			setScopesText("");
+			setTokenExchangeScopesText("");
+			setResourceText("");
+			setHeaderKeysInput((init?.perUserHeaderKeys ?? []).join(", "));
+			setAllowedExtraHeadersText((init?.allowedExtraHeaders ?? []).join(", "));
+			setAuthScope(init?.authScope ?? "shared");
+			resetOpenAPI();
+		},
+		[resetOpenAPI],
+	);
+
+	return {
+		argsText,
+		setArgsText,
+		envVars,
+		setEnvVars,
+		scopesText,
+		setScopesText,
+		tokenExchangeScopesText,
+		setTokenExchangeScopesText,
+		resourceText,
+		setResourceText,
+		// Derived rather than stored: the textarea is the single source of truth,
+		// so the parsed list can never fall out of sync with what's on screen.
+		perUserHeaderKeys: parseArrayFromText(headerKeysInput),
+		headerKeysInput,
+		setHeaderKeysInput,
+		allowedExtraHeadersText,
+		setAllowedExtraHeadersText,
+		authScope,
+		setAuthScope,
+		openapi,
+		reset,
+	};
+}
+
+/** Whether the parsed preview still describes the document currently in the form. */
+export function isOpenAPIPreviewCurrent(data: CreateMCPClientRequest, openapi: MCPOpenAPISatellites): boolean {
+	if (!openapi.preview || !openapi.previewedFingerprint) return false;
+	return (
+		openapi.previewedFingerprint ===
+		specFingerprint(openapi.sourceMode, data.openapi_config?.spec, data.openapi_config?.spec_url, data.name)
+	);
+}
+
+/** Strips empty TLS config so we don't send `{}` to the server. */
+export function buildTLSConfigPayload(tls: MCPTLSConfig | undefined): MCPTLSConfig | undefined {
+	if (!tls) return undefined;
+	const hasSkipVerify = tls.insecure_skip_verify === true;
+	const hasCACert = tls.ca_cert_pem?.value || tls.ca_cert_pem?.type === "env" || tls.ca_cert_pem?.type === "vault";
+	if (!hasSkipVerify && !hasCACert) return undefined;
+	return { insecure_skip_verify: tls.insecure_skip_verify, ca_cert_pem: hasCACert ? tls.ca_cert_pem : undefined };
+}
+
+export function isValidOAuthResourceURI(value: string): boolean {
+	try {
+		const parsed = new URL(value);
+		return parsed.protocol !== "" && parsed.hash === "";
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Live header validation shared by both sheets. Static headers ride on every
+ * auth type (the server persists them for "none" and the OAuth types too), so
+ * the gate is not scoped to one — otherwise an empty static header slips past
+ * client validation and reaches the server as a config it has to reject.
+ */
+export function getHeadersValidationError(headers: Record<string, SecretVar> | undefined): string | null {
+	if (!headers) return null;
+	for (const [key, secretVar] of Object.entries(headers)) {
+		if (!secretVar.value && !secretVar.ref) {
+			return i18n.t("registry.form.headerMustHaveValue", { ns: "mcp", key });
+		}
+	}
+	return null;
+}
+
+/**
+ * Submit-time validation shared by both sheets. Writes field errors onto the
+ * form and returns false when anything failed. `skipConnection` is set by the
+ * install sheet, whose transport and target are fixed by the library entry and
+ * therefore not user-editable.
+ */
+export function validateMCPClientForm({
+	data,
+	satellites,
+	form,
+	skipConnection,
+	onToast,
+}: {
+	data: CreateMCPClientRequest;
+	satellites: MCPClientFormSatellites;
+	form: UseFormReturn<CreateMCPClientRequest>;
+	skipConnection?: boolean;
+	onToast: (title: string, description: string) => void;
+}): boolean {
+	const { setError } = form;
+	const connectionType = data.connection_type;
+	const authType = data.auth_type;
+	let hasErrors = false;
+
+	if (!skipConnection && (connectionType === "http" || connectionType === "sse")) {
+		const connVal = data.connection_string?.value?.trim() || "";
+		const connRef = data.connection_string?.ref?.trim() || "";
+		const isSecret = data.connection_string?.type === "env" || data.connection_string?.type === "vault";
+		if (!connVal && !connRef) {
+			setError("connection_string", { message: i18n.t("registry.form.connectionUrlRequired", { ns: "mcp" }) });
+			hasErrors = true;
+		} else if (!isSecret && connVal && !/^https?:\/\/.+/.test(connVal)) {
+			setError("connection_string", { message: i18n.t("registry.form.connectionUrlHttp", { ns: "mcp" }) });
+			hasErrors = true;
+		}
+	}
+
+	if (!skipConnection && connectionType === "stdio") {
+		const cmd = data.stdio_config?.command || "";
+		if (!cmd.trim()) {
+			setError("stdio_config.command", { message: i18n.t("registry.form.commandRequiredStdio", { ns: "mcp" }) });
+			hasErrors = true;
+		} else if (/[<>|&;]/.test(cmd)) {
+			setError("stdio_config.command", { message: i18n.t("registry.form.commandShellChars", { ns: "mcp" }) });
+			hasErrors = true;
+		}
+	}
+
+	if (authType === "oauth" || authType === "per_user_oauth") {
+		if (data.oauth_config?.authorize_url && !/^https?:\/\/.+$/.test(data.oauth_config.authorize_url)) {
+			setError("oauth_config.authorize_url", { message: i18n.t("registry.form.authorizeUrlHttp", { ns: "mcp" }) });
+			hasErrors = true;
+		}
+		if (data.oauth_config?.token_url && !/^https?:\/\/.+$/.test(data.oauth_config.token_url)) {
+			setError("oauth_config.token_url", { message: i18n.t("registry.form.tokenUrlHttp", { ns: "mcp" }) });
+			hasErrors = true;
+		}
+		if (data.oauth_config?.registration_url && !/^https?:\/\/.+$/.test(data.oauth_config.registration_url)) {
+			setError("oauth_config.registration_url", { message: i18n.t("registry.form.registrationUrlHttp", { ns: "mcp" }) });
+			hasErrors = true;
+		}
+		if (satellites.resourceText.trim() && !isValidOAuthResourceURI(satellites.resourceText.trim())) {
+			onToast(i18n.t("registry.form.invalidResourceTitle", { ns: "mcp" }), i18n.t("registry.form.invalidResourceDesc", { ns: "mcp" }));
+			hasErrors = true;
+		}
+	}
+
+	if (authType === "token_exchange") {
+		if (!data.token_exchange?.audience?.trim()) {
+			setError("token_exchange.audience", { message: i18n.t("registry.form.audienceRequired", { ns: "mcp" }) });
+			hasErrors = true;
+		}
+		if (!data.token_exchange?.use_idp_credentials && data.token_exchange?.profile !== "id_jag") {
+			const exchangeClientId = data.token_exchange?.client_id;
+			if (!exchangeClientId?.value && !exchangeClientId?.ref) {
+				setError("token_exchange.client_id", { message: i18n.t("registry.form.exchangeClientIdRequired", { ns: "mcp" }) });
+				hasErrors = true;
+			}
+		}
+		if (data.token_exchange?.profile === "id_jag") {
+			if (!isSecretVarSet(data.token_exchange?.resource_client_id)) {
+				setError("token_exchange.resource_client_id", { message: i18n.t("registry.form.resourceClientIdRequired", { ns: "mcp" }) });
+				hasErrors = true;
+			}
+			if (isSecretVarSet(data.token_exchange?.resource_client_secret) && isSecretVarSet(data.token_exchange?.resource_private_key)) {
+				setError("token_exchange.resource_private_key", {
+					message: i18n.t("registry.form.resourceBothAuth", { ns: "mcp" }),
+				});
+				hasErrors = true;
+			}
+			if (hasPrivateKeySettingsWithoutKey(data.token_exchange)) {
+				setError("token_exchange.resource_private_key", { message: privateKeyRequiredMessage() });
+				hasErrors = true;
+			}
+			if (hasSendMethodWithoutSecret(data.token_exchange)) {
+				setError("token_exchange.resource_client_secret", { message: secretRequiredForMethodMessage() });
+				hasErrors = true;
+			}
+			const endpoint = data.token_exchange?.resource_token_endpoint?.trim();
+			if (endpoint && !isHTTPSOrLoopbackURL(endpoint)) {
+				setError("token_exchange.resource_token_endpoint", {
+					message: i18n.t("registry.form.resourceTokenEndpointHttps", { ns: "mcp" }),
+				});
+				hasErrors = true;
+			}
+			const assertionAudience = data.token_exchange?.resource_assertion_audience?.trim();
+			if (assertionAudience && !isHTTPSOrLoopbackURL(assertionAudience)) {
+				setError("token_exchange.resource_assertion_audience", {
+					message: i18n.t("registry.form.assertionAudienceHttps", { ns: "mcp" }),
+				});
+				hasErrors = true;
+			}
+		}
+	}
+
+	if (authType === "per_user_headers" && effectivePerUserHeaderKeys(data, satellites).length === 0) {
+		onToast(i18n.t("registry.form.headerKeysRequiredTitle", { ns: "mcp" }), i18n.t("registry.form.headerKeysRequiredDesc", { ns: "mcp" }));
+		hasErrors = true;
+	}
+
+	if (connectionType === "openapi") {
+		const { openapi } = satellites;
+		const oc = data.openapi_config;
+		const parsed = mcpOpenAPIConfigSchema.safeParse({
+			...oc,
+			spec: openapi.sourceMode === "url" ? undefined : oc?.spec,
+			spec_url: openapi.sourceMode === "url" ? oc?.spec_url : undefined,
+		});
+		if (!parsed.success) {
+			for (const issue of parsed.error.issues) {
+				const field = issue.path[0];
+				if (field === "spec" || field === "spec_url" || field === "base_url") {
+					setError(`openapi_config.${field}`, { message: issue.message });
+				}
+			}
+			hasErrors = true;
+		}
+		if (!isOpenAPIPreviewCurrent(data, openapi)) {
+			onToast(
+				i18n.t("registry.form.documentNotParsedTitle", { ns: "mcp" }),
+				openapi.sourceMode === "url"
+					? i18n.t("registry.form.documentNotParsedUrlDesc", { ns: "mcp" })
+					: i18n.t("registry.form.documentNotParsedDesc", { ns: "mcp" }),
+			);
+			hasErrors = true;
+		} else {
+			const supported = supportedToolNames(openapi.preview);
+			const selected = (data.tools_to_execute ?? []).filter((name) => supported.includes(name));
+			if (selected.length === 0) {
+				onToast(i18n.t("registry.form.selectOperationTitle", { ns: "mcp" }), i18n.t("registry.form.selectOperationDesc", { ns: "mcp" }));
+				hasErrors = true;
+			}
+			if (openAPIBaseUrlRequired(openapi.baseUrlChoice, openapi.preview) && !oc?.base_url?.trim()) {
+				setError("openapi_config.base_url", { message: i18n.t("registry.form.baseUrlRequired", { ns: "mcp" }) });
+				hasErrors = true;
+			}
+		}
+	}
+
+	// Mirrors the server's WhiteList validation, which rejects "*" alongside names.
+	// Skipped for STDIO, which hides the field and drops the value from the
+	// payload: text left over from a network transport must not block submit.
+	const allowedExtraHeaders = parseArrayFromText(satellites.allowedExtraHeadersText);
+	if (connectionType !== "stdio" && allowedExtraHeaders.includes("*") && allowedExtraHeaders.length > 1) {
+		onToast(
+			i18n.t("registry.form.invalidAllowedExtraHeadersTitle", { ns: "mcp" }),
+			i18n.t("registry.form.invalidAllowedExtraHeadersDesc", { ns: "mcp" }),
+		);
+		hasErrors = true;
+	}
+
+	return !hasErrors;
+}
+
+/**
+ * Assembles the POST /api/mcp/client body from the form values plus the
+ * satellite text inputs. Shared so a field wired into one sheet can never be
+ * silently dropped by the other.
+ */
+/**
+ * The header names each caller must supply: the Required Headers list, plus
+ * for an openapi server the per-user header each header-carried security
+ * scheme is taken from (forwarded upstream as is).
+ */
+function effectivePerUserHeaderKeys(data: CreateMCPClientRequest, satellites: MCPClientFormSatellites): string[] {
+	if (data.connection_type !== "openapi") return satellites.perUserHeaderKeys;
+	const schemeHeaders = perUserSchemeHeaders(satellites.openapi.preview, satellites.openapi.schemeHeaders);
+	return mergePerUserHeaderKeys(satellites.perUserHeaderKeys, Object.values(schemeHeaders));
+}
+
+export function buildMCPClientPayload(data: CreateMCPClientRequest, satellites: MCPClientFormSatellites): CreateMCPClientRequest {
+	const connectionType = data.connection_type;
+	const authType = data.auth_type;
+	const isStdio = connectionType === "stdio";
+	const isOpenAPI = connectionType === "openapi";
+
+	return {
+		...data,
+		// An openapi server's upstream is openapi_config.base_url, not a connection URL.
+		connection_string: isStdio || isOpenAPI ? undefined : data.connection_string,
+		openapi_config: isOpenAPI
+			? buildOpenAPIConfigPayload(
+					data.openapi_config,
+					satellites.openapi.sourceMode,
+					satellites.openapi.preview,
+					satellites.openapi.baseUrlChoice,
+					authType === "per_user_headers"
+						? Object.keys(perUserSchemeHeaders(satellites.openapi.preview, satellites.openapi.schemeHeaders))
+						: [],
+				)
+			: undefined,
+		stdio_config: isStdio
+			? {
+					command: data.stdio_config?.command || "",
+					args: parseArrayFromText(satellites.argsText),
+					// Each row becomes KEY=value, or a bare KEY when no value is given
+					// (read from Bifrost's host environment). Rows without a name are skipped.
+					envs: Object.entries(satellites.envVars)
+						.filter(([name]) => name.trim() !== "")
+						.map(([name, value]) => {
+							const trimmed = value.trim();
+							return trimmed ? `${name}=${trimmed}` : name;
+						}),
+				}
+			: undefined,
+		tls_config: isStdio ? undefined : buildTLSConfigPayload(data.tls_config),
+		oauth_config:
+			authType === "oauth" || authType === "per_user_oauth"
+				? buildOAuthConfigPayload(data.oauth_config, {
+						serverURL: data.connection_string?.value,
+						scopesText: satellites.scopesText,
+						resourceText: satellites.resourceText,
+					})
+				: undefined,
+		// Every network auth type can carry static admin headers on data.headers
+		// (per-user values are submitted separately by end users); STDIO has no
+		// request headers to send.
+		headers: !isStdio && data.headers && Object.keys(data.headers).length > 0 ? data.headers : undefined,
+		per_user_header_keys: authType === "per_user_headers" ? effectivePerUserHeaderKeys(data, satellites) : undefined,
+		// The switch only renders where the flag applies; a value chosen before
+		// switching to an auth type it does not apply to is dropped here.
+		per_user_discovery: supportsPerUserDiscovery(authType, connectionType) ? data.per_user_discovery : undefined,
+		token_exchange:
+			authType === "token_exchange"
+				? {
+						audience: data.token_exchange?.audience?.trim() || "",
+						use_idp_credentials: exchangesAsSSOApplication(data.token_exchange) || undefined,
+						client_id: exchangesAsSSOApplication(data.token_exchange) ? undefined : (data.token_exchange?.client_id ?? emptySecretVar),
+						client_secret: exchangesAsSSOApplication(data.token_exchange)
+							? undefined
+							: data.token_exchange?.client_secret?.value ||
+								  data.token_exchange?.client_secret?.type === "env" ||
+								  data.token_exchange?.client_secret?.type === "vault"
+								? data.token_exchange.client_secret
+								: undefined,
+						scopes: satellites.tokenExchangeScopesText.trim() ? parseArrayFromText(satellites.tokenExchangeScopesText) : undefined,
+						authorization_server_url: data.token_exchange?.authorization_server_url?.trim() || undefined,
+						...tokenExchangeProfilePayload(data.token_exchange),
+					}
+				: undefined,
+		// Network transports expose every tool the server reports; an openapi
+		// server exposes the operations ticked in the preview.
+		tools_to_execute: isOpenAPI
+			? collapseToolSelection(data.tools_to_execute ?? [], supportedToolNames(satellites.openapi.preview))
+			: ["*"],
+		// Extra headers only ride on the network transports.
+		allowed_extra_headers: isStdio ? undefined : parseArrayFromText(satellites.allowedExtraHeadersText),
+		// An openapi server is synthesized in process; there is no protocol to negotiate.
+		max_protocol_version: isOpenAPI ? undefined : data.max_protocol_version,
+	};
+}
+
+/**
+ * Warns that STDIO servers shell out to the host, and the official image ships
+ * no runtimes (npx, python) for them. Shown wherever a STDIO server is configured.
+ */
+export function StdioRuntimeNotice() {
+	const { t } = useTranslation("mcp");
+	return (
+		<div className="rounded-lg border border-amber-200 bg-amber-50 p-3" data-testid="stdio-docker-notice">
+			<div className="flex items-start gap-2">
+				<Info className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-700" />
+				<div className="flex-1">
+					<p className="text-xs font-medium text-amber-900">{t("registry.form.dockerNotice")}</p>
+					<p className="mt-0.5 text-xs text-amber-800">{t("registry.form.dockerNoticeBody")}</p>
+				</div>
+			</div>
+		</div>
+	);
+}
+
+interface MCPClientFormFieldsProps {
+	form: UseFormReturn<CreateMCPClientRequest>;
+	satellites: MCPClientFormSatellites;
+	headersValidationError: string | null;
+	/**
+	 * Renders the transport, target, and STDIO launch command read-only. Set by
+	 * the install sheet, where those values come from the library entry rather
+	 * than from the person filling in the form.
+	 */
+	lockConnection?: boolean;
+	/**
+	 * STDIO variable names declared by the library entry. When set, the env
+	 * table renders exactly these rows and only their values are editable.
+	 */
+	stdioEnvKeys?: string[];
+}
+
+export function MCPClientFormFields({ form, satellites, headersValidationError, lockConnection, stdioEnvKeys }: MCPClientFormFieldsProps) {
+	const { t } = useTranslation("mcp");
+	const { control, setValue, watch, clearErrors } = form;
+	const connectionType = watch("connection_type");
+	const authType = watch("auth_type");
+	const endpointSlug = watch("endpoint_slug");
+	const codeModeServer = watch("is_code_mode_client");
+
+	// Token exchange is backed by the deployment's identity-provider
+	// integration, so the option only renders when one is enabled. The exact
+	// exchange-client requirement is enforced server-side at create; a missing
+	// tokenExchangeClient section surfaces as the create error. Reading the
+	// providers needs UserProvisioning:View; without it the option stays hidden.
+	const hasUserProvisioningAccess = useRbac(RbacResource.UserProvisioning, RbacOperation.View);
+	const { data: scimProviders } = useGetSCIMProvidersQuery(undefined, { skip: !IS_ENTERPRISE || !hasUserProvisioningAccess });
+	const enabledScimProvider = scimProviders?.find((p) => (p as { enabled?: boolean }).enabled) as { name?: string } | undefined;
+	const idpConfigured = !!enabledScimProvider;
+	// Entra's on-behalf-of grant requires use_idp_credentials — see the
+	// Prerequisites warning in docs/mcp/auth/token-exchange.mdx for why a
+	// dedicated exchange app structurally can't work there.
+	const isEntraIdp = ["entra", "azure", "azuread"].includes((enabledScimProvider?.name ?? "").toLowerCase());
+
+	const authKind = authKindOf(authType);
+	const { authScope, setAuthScope } = satellites;
+	// A library entry can declare token_exchange, and the catalog sync does no
+	// auth-type validation, so the form can be seeded with an auth type this
+	// deployment can't offer. The Select would then show its placeholder while
+	// still submitting token_exchange, so surface the mismatch instead.
+	const tokenExchangeUnavailable = authKind === "token_exchange" && !(IS_ENTERPRISE && idpConfigured);
+
+	/**
+	 * The stickiness switch only renders for a shared http auth type. Picking an
+	 * auth type that hides it has to drop any value chosen while it was visible,
+	 * otherwise a stale `true` stays in form state and gets submitted. The
+	 * connection-type handler below applies the same reset for non-http
+	 * transports.
+	 */
+	const clearStickinessIfHidden = (kind: MCPAuthKind, scope: MCPAuthScope) => {
+		if (kind === "token_exchange" || (kind !== "none" && scope === "per_user")) {
+			setValue("needs_session_stickiness", undefined);
+		}
+	};
+
+	const applyAuthKind = (kind: MCPAuthKind) => {
+		clearErrors();
+		clearStickinessIfHidden(kind, authScope);
+		if (kind === "none" || kind === "token_exchange") {
+			setValue("auth_type", kind);
+			return;
+		}
+		if (kind === "oauth") {
+			setValue("auth_type", authScope === "per_user" ? "per_user_oauth" : "oauth");
+			return;
+		}
+		setValue("auth_type", authScope === "per_user" ? "per_user_headers" : "headers");
+	};
+
+	const applyAuthScope = (scope: MCPAuthScope) => {
+		setAuthScope(scope);
+		clearStickinessIfHidden(authKind, scope);
+		if (authKind === "oauth") {
+			setValue("auth_type", scope === "per_user" ? "per_user_oauth" : "oauth");
+		} else if (authKind === "headers") {
+			setValue("auth_type", scope === "per_user" ? "per_user_headers" : "headers");
+		}
+	};
+
+	const isRemote = connectionType === "http" || connectionType === "sse";
+	const isOpenAPI = connectionType === "openapi";
+	// Per-user auth and token exchange open a new streamable HTTP connection for each
+	// call, which an SSE stream cannot serve, so SSE offers the shared variants only. A
+	// library entry can still seed one of them on SSE: its option then stays listed so
+	// the trigger shows what will be submitted, and the server's refusal explains it.
+	const isSSE = connectionType === "sse";
+	// Auth and header sections apply to every transport that speaks HTTP to its
+	// target, which includes a synthesized openapi server's upstream API.
+	const hasNetworkAuth = isRemote || isOpenAPI;
+
+	// Picks the server source and transport together: the source switch maps
+	// "MCP server" back to the last transport used, and the transport select
+	// lists only real transports.
+	const lastTransport = useRef<MCPConnectionType>(connectionType && connectionType !== "openapi" ? connectionType : "http");
+	const applyConnectionType = (value: MCPConnectionType) => {
+		if (value === connectionType) return;
+		setValue("connection_type", value);
+		if (value !== "openapi") lastTransport.current = value;
+		if (value === "stdio") {
+			setValue("auth_type", "none");
+			setValue("headers", undefined);
+			setValue("oauth_config", undefined);
+		}
+		if (value === "sse") {
+			if (authKind === "token_exchange") {
+				setValue("auth_type", "none");
+				setValue("token_exchange", undefined);
+			} else if (authScope === "per_user") {
+				applyAuthScope("shared");
+			}
+		}
+		if (value === "openapi") {
+			// The upstream is the API described by the spec, not an
+			// MCP endpoint: no connection URL, and only the
+			// header-shaped auth types apply.
+			setValue("connection_string", undefined);
+			setValue("oauth_config", undefined);
+			setValue("token_exchange", undefined);
+			setValue("openapi_config", { spec: "", spec_url: "", base_url: "", security_credentials: {} });
+			setValue("tools_to_execute", []);
+			if (authKind === "oauth" || authKind === "token_exchange") {
+				setValue("auth_type", "none");
+			}
+		} else if (connectionType === "openapi") {
+			setValue("openapi_config", undefined);
+			setValue("tools_to_execute", undefined);
+			openapi.reset();
+		}
+		// needs_session_stickiness=false is rejected for
+		// non-http connection types; SSE/STDIO always keep
+		// a persistent connection regardless, so drop any
+		// explicit false picked while http was selected.
+		if (value !== "http") {
+			setValue("needs_session_stickiness", undefined);
+		}
+		clearErrors();
+	};
+
+	const { openapi } = satellites;
+	const openapiConfig = watch("openapi_config");
+	const clientName = watch("name");
+	const selectedTools = watch("tools_to_execute") ?? [];
+	const openapiErrors = form.formState.errors.openapi_config as
+		| { spec?: { message?: string }; spec_url?: { message?: string }; base_url?: { message?: string } }
+		| undefined;
+	const [previewOpenAPISpec, { isLoading: isParsingOpenAPI }] = usePreviewOpenAPISpecMutation();
+	const openapiPreviewCurrent =
+		!!openapi.preview &&
+		openapi.previewedFingerprint === specFingerprint(openapi.sourceMode, openapiConfig?.spec, openapiConfig?.spec_url, clientName);
+
+	const setOpenAPIField = (field: "spec" | "spec_url" | "base_url", value: string) => {
+		setValue("openapi_config", { ...(openapiConfig ?? {}), [field]: value }, { shouldDirty: true });
+		clearErrors(`openapi_config.${field}`);
+	};
+
+	// The parse handler applies its response against the latest satellite state,
+	// not the render it started in.
+	const openapiRef = useRef(openapi);
+	openapiRef.current = openapi;
+
+	// A response is applied only if no newer parse or reset superseded it, and
+	// against the form values as they are when it arrives: the picker, base URL
+	// and credential inputs stay editable while a parse is in flight.
+	const handleParseOpenAPI = async () => {
+		const oc = openapiConfig;
+		const mode = openapi.sourceMode;
+		const requestedName = form.getValues("name")?.trim() || undefined;
+		const token = openapi.beginParse();
+		openapi.setParseError(null);
+		try {
+			const response = await previewOpenAPISpec(
+				mode === "url"
+					? {
+							spec_url: oc?.spec_url?.trim(),
+							base_url: openapi.baseUrlChoice === "custom" ? oc?.base_url?.trim() || undefined : undefined,
+							client_name: requestedName,
+						}
+					: {
+							spec: oc?.spec,
+							base_url: openapi.baseUrlChoice === "custom" ? oc?.base_url?.trim() || undefined : undefined,
+							client_name: requestedName,
+						},
+			).unwrap();
+			if (!openapiRef.current.isCurrentParse(token)) return;
+			const latest = form.getValues();
+			const next = applyParsedPreview(
+				{
+					selection: latest.tools_to_execute ?? [],
+					baseUrl: latest.openapi_config?.base_url ?? "",
+					baseUrlChoice: openapiRef.current.baseUrlChoice,
+					credentials: latest.openapi_config?.security_credentials ?? {},
+				},
+				openapiRef.current.preview,
+				response,
+			);
+			setValue("tools_to_execute", next.selection, { shouldDirty: true });
+			openapi.setBaseUrlChoice(next.baseUrlChoice);
+			setValue("openapi_config.base_url", next.baseUrl);
+			setValue("openapi_config.security_credentials", next.credentials);
+			openapi.setPreview(response);
+			// The fingerprint is the source and client name this response describes;
+			// an edit to either meanwhile shows the preview as stale, since the name
+			// shortens long tool names.
+			openapi.setPreviewedFingerprint(specFingerprint(mode, oc?.spec, oc?.spec_url, requestedName));
+			clearErrors(["openapi_config.spec", "openapi_config.spec_url", "openapi_config.base_url", "tools_to_execute"]);
+		} catch (error) {
+			if (!openapiRef.current.isCurrentParse(token)) return;
+			openapi.setParseError(getErrorMessage(error));
+		}
+	};
+
+	const handleOpenAPICredentialChange = (scheme: string, field: OpenAPICredentialField, value: SecretVar) => {
+		const current = openapiConfig?.security_credentials ?? {};
+		setValue(
+			"openapi_config.security_credentials",
+			{ ...current, [scheme]: { ...(current[scheme] ?? {}), [field]: value } },
+			{ shouldDirty: true },
+		);
+	};
+
+	return (
+		<>
+			{/* Connection & Authentication */}
+			<div className="space-y-4">
+				<SectionHeader
+					title={isOpenAPI ? t("registry.form.openapiConnectionAuth") : t("registry.form.connectionAuth")}
+					description={
+						lockConnection
+							? t("registry.form.connectionAuthLocked")
+							: isOpenAPI
+								? t("registry.form.connectionAuthOpenapi")
+								: t("registry.form.connectionAuthOpen")
+					}
+				/>
+				<div className="space-y-4">
+					{!lockConnection && (
+						<FormItem className="w-full">
+							<FormLabel>{t("registry.form.serverSource")}</FormLabel>
+							<Tabs
+								value={isOpenAPI ? "openapi" : "mcp"}
+								onValueChange={(value) => applyConnectionType(value === "openapi" ? "openapi" : lastTransport.current)}
+							>
+								<TabsList data-testid="mcp-server-source-tabs">
+									<TabsTrigger value="mcp" data-testid="mcp-server-source-mcp">
+										{t("registry.form.sourceMcp")}
+									</TabsTrigger>
+									<TabsTrigger value="openapi" data-testid="mcp-server-source-openapi" className="gap-2">
+										{t("registry.form.sourceOpenapi")}
+										<BetaBadge />
+									</TabsTrigger>
+								</TabsList>
+							</Tabs>
+						</FormItem>
+					)}
+
+					{!isOpenAPI && (
+						<FormField
+							control={control}
+							name="connection_type"
+							render={({ field }) => (
+								<FormItem className="w-full">
+									<FormLabel>{t("registry.columns.connectionType")}</FormLabel>
+									<Select
+										value={field.value}
+										disabled={lockConnection}
+										onValueChange={(value: MCPConnectionType) => applyConnectionType(value)}
+									>
+										<FormControl>
+											<SelectTrigger className="w-full" data-testid="connection-type-select">
+												<SelectValue placeholder={t("registry.form.selectConnectionType")} />
+											</SelectTrigger>
+										</FormControl>
+										<SelectContent>
+											<SelectItem value="http" data-testid="connection-type-http">
+												{t("registry.form.httpStreamable")}
+											</SelectItem>
+											<SelectItem value="sse" data-testid="connection-type-sse">
+												{t("registry.form.sseLabel")}
+											</SelectItem>
+											<SelectItem value="stdio" data-testid="connection-type-stdio">
+												{t("registry.form.stdioLabel")}
+											</SelectItem>
+										</SelectContent>
+									</Select>
+									<FormMessage />
+								</FormItem>
+							)}
+						/>
+					)}
+
+					{isRemote && (
+						<>
+							{/* Connection URL */}
+							<FormField
+								control={control}
+								name="connection_string"
+								render={({ field }) => (
+									<FormItem>
+										<FormLabel>{t("registry.form.connectionUrl")}</FormLabel>
+										<SecretVarInput
+											value={field.value}
+											disabled={lockConnection}
+											onChange={(value) => {
+												field.onChange(value);
+												clearErrors("connection_string");
+											}}
+											placeholder={t("registry.form.connectionUrlPlaceholder")}
+											data-testid="connection-url-input"
+										/>
+										<FormMessage />
+									</FormItem>
+								)}
+							/>
+						</>
+					)}
+
+					{isOpenAPI && (
+						<div className="space-y-2">
+							<FormLabel>{t("registry.form.openapiDocument")}</FormLabel>
+							<OpenAPISpecSource
+								mode={openapi.sourceMode}
+								onModeChange={(mode) => {
+									openapi.setSourceMode(mode);
+									openapi.setParseError(null);
+								}}
+								specText={openapiConfig?.spec ?? ""}
+								onSpecTextChange={(text) => setOpenAPIField("spec", text)}
+								specUrl={openapiConfig?.spec_url ?? ""}
+								onSpecUrlChange={(url) => setOpenAPIField("spec_url", url)}
+								fileName={openapi.fileName}
+								onFileSelected={(file, text) => {
+									openapi.setFileName(file.name);
+									setOpenAPIField("spec", text);
+								}}
+								onParse={handleParseOpenAPI}
+								isParsing={isParsingOpenAPI}
+								parseError={openapi.parseError}
+								isStale={!!openapi.preview && !openapiPreviewCurrent}
+								isCurrent={openapiPreviewCurrent}
+								sourceKey={specFingerprint(openapi.sourceMode, openapiConfig?.spec, openapiConfig?.spec_url, clientName)}
+								specError={openapiErrors?.spec?.message}
+								specUrlError={openapiErrors?.spec_url?.message}
+							/>
+						</div>
+					)}
+
+					{hasNetworkAuth && (
+						<>
+							{/* Auth Type */}
+							<FormItem className="w-full">
+								<FormLabel>{t("registry.form.authenticationType")}</FormLabel>
+								<Select value={authKind} onValueChange={(value: MCPAuthKind) => applyAuthKind(value)}>
+									<FormControl>
+										<SelectTrigger className="w-full" data-testid="auth-type-select">
+											<SelectValue placeholder={t("registry.form.selectAuthType")} />
+										</SelectTrigger>
+									</FormControl>
+									<SelectContent>
+										<SelectItem value="none" data-testid="auth-type-none">
+											{t("registry.filter.none")}
+										</SelectItem>
+										<SelectItem value="headers" data-testid="auth-type-headers">
+											{t("registry.filter.headers")}
+										</SelectItem>
+										{/* A synthesized openapi server has no MCP handshake to run an
+										    OAuth or token-exchange flow against; the API's own security
+										    schemes are configured from the parsed document instead. */}
+										{!isOpenAPI && (
+											<SelectItem value="oauth" data-testid="auth-type-oauth">
+												{t("registry.form.oauth20")}
+											</SelectItem>
+										)}
+										{/* Also rendered when it is already the selected value, so the
+										    trigger shows the real auth type rather than a placeholder. */}
+										{!isOpenAPI &&
+											(!isSSE || authKind === "token_exchange") &&
+											((IS_ENTERPRISE && idpConfigured) || tokenExchangeUnavailable) && (
+												<SelectItem value="token_exchange" data-testid="auth-type-token-exchange">
+													{t("registry.form.tokenExchangeObo")}
+												</SelectItem>
+											)}
+									</SelectContent>
+								</Select>
+								{tokenExchangeUnavailable && (
+									<div
+										className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800"
+										data-testid="token-exchange-unavailable-notice"
+									>
+										<Info className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+										<p>{t("registry.form.tokenExchangeUnavailable")}</p>
+									</div>
+								)}
+							</FormItem>
+
+							{/* Auth Scope — only meaningful when there's an auth flow with a
+							    shared variant; token exchange is inherently per-caller */}
+							{authKind !== "none" && authKind !== "token_exchange" && (
+								<FormItem className="w-full">
+									<FormLabel>{t("registry.columns.authScope")}</FormLabel>
+									<Select value={authScope} onValueChange={(value: MCPAuthScope) => applyAuthScope(value)}>
+										<FormControl>
+											<SelectTrigger className="w-full" data-testid="auth-scope-select">
+												<SelectValue placeholder={t("registry.form.selectAuthScope")} />
+											</SelectTrigger>
+										</FormControl>
+										<SelectContent>
+											<SelectItem value="shared" data-testid="auth-scope-shared">
+												{t("registry.form.shared")}
+											</SelectItem>
+											{(!isSSE || authScope === "per_user") && (
+												<SelectItem value="per_user" data-testid="auth-scope-per-user">
+													{t("registry.form.perUser")}
+												</SelectItem>
+											)}
+										</SelectContent>
+									</Select>
+								</FormItem>
+							)}
+						</>
+					)}
+				</div>
+			</div>
+
+			{isOpenAPI && openapi.preview && (
+				<>
+					<DottedSeparator />
+					<OpenAPIPreviewPanel
+						preview={openapi.preview}
+						baseUrlChoice={openapi.baseUrlChoice}
+						onBaseUrlChoiceChange={openapi.setBaseUrlChoice}
+						baseUrl={openapiConfig?.base_url ?? ""}
+						onBaseUrlChange={(url) => setOpenAPIField("base_url", url)}
+						baseUrlError={openapiErrors?.base_url?.message}
+						credentials={openapiConfig?.security_credentials ?? {}}
+						onCredentialChange={handleOpenAPICredentialChange}
+						perUserHeaders={
+							authType === "per_user_headers" ? { typed: openapi.schemeHeaders, onChange: openapi.setSchemeHeader } : undefined
+						}
+						selectedTools={selectedTools}
+						onSelectedToolsChange={(names) => {
+							setValue("tools_to_execute", names, { shouldDirty: true });
+							clearErrors("tools_to_execute");
+						}}
+					/>
+				</>
+			)}
+
+			{hasNetworkAuth && (
+				<>
+					{authType !== "per_user_headers" && (
+						<>
+							<DottedSeparator />
+							<div className="space-y-4">
+								<SectionHeader
+									title={t("registry.filter.headers")}
+									description={isOpenAPI ? t("registry.form.headersOpenapiDesc") : t("registry.form.headersDesc")}
+								/>
+								<FormField
+									control={control}
+									name="headers"
+									render={({ field }) => (
+										<FormItem data-testid="mcp-headers-table">
+											<HeadersTable
+												value={field.value || {}}
+												onChange={field.onChange}
+												keyPlaceholder={t("registry.form.headerName")}
+												valuePlaceholder={t("registry.form.headerValue")}
+												label=""
+												useSecretVarInput
+											/>
+											{headersValidationError && <p className="text-destructive text-xs">{headersValidationError}</p>}
+											<FormMessage />
+										</FormItem>
+									)}
+								/>
+							</div>
+						</>
+					)}
+
+					{authType === "per_user_headers" && (
+						<>
+							<DottedSeparator />
+							<div className="space-y-4">
+								{/* Required header keys (admin schema). Same Textarea +
+								    comma-separated pattern as workspace/config security
+								    Required Headers, so the two surfaces stay visually
+								    consistent. End users supply values per-user at first
+								    tool use via the inline auth landing page. */}
+								<SectionHeader
+									title={t("registry.form.requiredHeaders")}
+									description={isOpenAPI ? t("registry.form.requiredHeadersOpenapiDesc") : t("registry.form.requiredHeadersDesc")}
+								/>
+								<div className="rounded-md border p-4">
+									<Textarea
+										id="per-user-header-keys"
+										data-testid="per-user-header-keys-textarea"
+										className="h-24"
+										placeholder={t("registry.form.headerKeysPlaceholder")}
+										value={satellites.headerKeysInput}
+										onChange={(e) => satellites.setHeaderKeysInput(e.target.value)}
+									/>
+								</div>
+							</div>
+
+							{/* Optional static admin headers (e.g. a fixed tenant header) */}
+							<div className="space-y-4">
+								<SectionHeader title={t("registry.form.staticHeaders")} description={t("registry.form.staticHeadersDesc")} />
+								<FormField
+									control={control}
+									name="headers"
+									render={({ field }) => (
+										<FormItem>
+											<HeadersTable
+												value={field.value || {}}
+												onChange={field.onChange}
+												keyPlaceholder={t("registry.form.headerName")}
+												valuePlaceholder={t("registry.form.headerValue")}
+												label=""
+												useSecretVarInput
+											/>
+											{headersValidationError && <p className="text-destructive text-xs">{headersValidationError}</p>}
+											<FormMessage />
+										</FormItem>
+									)}
+								/>
+							</div>
+
+							{/* Sample values are collected in the MCPHeadersAuthorizer
+							    dialog that opens on submit — mirrors the OAuth flow
+							    where the verification step is also a dialog, not an
+							    inline panel. */}
+						</>
+					)}
+
+					{authType === "token_exchange" && (
+						<>
+							<DottedSeparator />
+							<div className="space-y-4" data-testid="token-exchange-fields">
+								<SectionHeader
+									title={t("registry.form.tokenExchangeConfig")}
+									description={t("registry.form.tokenExchangeConfigDesc")}
+									testId="token-exchange-heading"
+								/>
+								<div className="space-y-4 rounded-md border p-4">
+									<TokenExchangeFields
+										control={control}
+										gridClassName="space-y-4"
+										audienceLabel={
+											<>
+												{t("registry.form.audience")} <span className="text-destructive">*</span>
+											</>
+										}
+										audienceTooltip={isEntraIdp ? t("registry.form.audienceTooltipEntra") : t("registry.form.audienceTooltip")}
+										audienceTestId="token-exchange-audience-input"
+										onAudienceTouched={() => clearErrors("token_exchange.audience")}
+										useIdPCredentialsLabel={t("registry.form.exchangeApplication")}
+										useIdPCredentialsDedicatedDescription={t("registry.form.dedicatedAppDesc")}
+										useIdPCredentialsIdPDescription={t("registry.form.idpAppDesc")}
+										useIdPCredentialsRequiredWarning={isEntraIdp && t("registry.form.entraDedicatedWarning")}
+										onUseIdPCredentialsToggled={(checked) => {
+											if (checked) clearErrors(["token_exchange.client_id", "token_exchange.client_secret"]);
+										}}
+										clientIdLabel={
+											<>
+												{t("registry.form.exchangeClientId")} <span className="text-destructive">*</span>
+											</>
+										}
+										clientIdTooltip={t("registry.form.exchangeClientIdTooltip")}
+										clientIdPlaceholder="bifrost-exchange or env.EXCHANGE_CLIENT_ID"
+										clientIdTestId="token-exchange-client-id-input"
+										onClientIdTouched={() => clearErrors("token_exchange.client_id")}
+										clientIdRedactNonEnvValue={false}
+										clientSecretLabel={t("registry.form.exchangeClientSecretOptional")}
+										clientSecretPlaceholder="env.EXCHANGE_CLIENT_SECRET"
+										clientSecretHelperText={t("registry.form.omitPublicClients")}
+										clientSecretTestId="token-exchange-client-secret-input"
+										clientSecretHideValueWhenEnv={false}
+										clientSecretMaskNonEnvValue={true}
+										clientSecretRedactNonEnvValue={false}
+										authServerUrlLabel={t("registry.form.authServerUrlOptional")}
+										authServerUrlTooltip={t("registry.form.authServerUrlTooltip")}
+										authServerUrlTestId="token-exchange-authorization-server-url-input"
+										scopes={{
+											variant: "textarea",
+											value: satellites.tokenExchangeScopesText,
+											onChange: satellites.setTokenExchangeScopesText,
+											label: t("registry.form.scopesOptional"),
+											helperText: (
+												<>
+													<Trans t={t} i18nKey="registry.form.scopesHelper" components={{ code: <code /> }} />
+													{isEntraIdp && <Trans t={t} i18nKey="registry.form.scopesHelperEntra" components={{ code: <code /> }} />}
+												</>
+											),
+											testId: "token-exchange-scopes-textarea",
+										}}
+									/>
+								</div>
+							</div>
+						</>
+					)}
+
+					{(authType === "oauth" || authType === "per_user_oauth") && (
+						<>
+							<DottedSeparator />
+							<div className="space-y-4">
+								<SectionHeader
+									title={t("registry.form.oauthConfig")}
+									description={t("registry.form.oauthConfigDesc")}
+									testId="oauth-advanced-heading"
+								/>
+								<div className="space-y-4 rounded-md border p-4">
+									<OAuthAdvancedFields
+										control={control}
+										scopesRaw={satellites.scopesText}
+										onScopesRawChange={satellites.setScopesText}
+										scopesLabel={t("registry.form.scopesOptionalComma")}
+										scopesTestId="mcp-oauth-scopes-input"
+										resource={{ mode: "raw", value: satellites.resourceText, onChange: satellites.setResourceText }}
+										resourceLabel={t("registry.form.resource")}
+										resourceTestId="mcp-oauth-resource-input"
+										clientIdLabel={t("registry.form.oauthClientIdOptional")}
+										clientIdPlaceholder={t("registry.form.oauthClientIdPlaceholder")}
+										clientIdHelperText={t("registry.form.oauthClientIdHelper")}
+										clientIdTooltip={t("registry.form.oauthClientIdTooltip")}
+										clientIdTestId="mcp-oauth-client-id"
+										clientMetadataDocumentTestId="mcp-oauth-use-client-metadata-document"
+										clientSecretLabel={t("registry.form.oauthClientSecretPkce")}
+										clientSecretPlaceholder={t("registry.form.oauthClientSecretPlaceholder")}
+										clientSecretHelperText={t("registry.form.oauthClientSecretHelper")}
+										clientSecretTestId="mcp-oauth-client-secret"
+										authorizeUrlLabel={t("registry.form.authorizeUrlOptional")}
+										authorizeUrlTestId="mcp-oauth-authorize-url"
+										tokenUrlLabel={t("registry.form.tokenUrlOptional")}
+										tokenUrlTestId="mcp-oauth-token-url"
+										registrationUrlLabel={t("registry.form.registrationUrlOptional")}
+										registrationUrlTestId="mcp-oauth-registration-url"
+										onFieldTouched={(field) => clearErrors(`oauth_config.${field}`)}
+									/>
+								</div>
+							</div>
+						</>
+					)}
+
+					<DottedSeparator />
+
+					{/* Allowed Extra Headers */}
+					<div className="space-y-4">
+						<SectionHeader title={t("registry.sheet.allowedExtraHeaders")} description={t("registry.sheet.allowedExtraHeadersDesc")} />
+						<Input
+							id="allowed-extra-headers-input"
+							value={satellites.allowedExtraHeadersText}
+							onChange={(e) => satellites.setAllowedExtraHeadersText(e.target.value)}
+							placeholder={t("registry.form.allowedExtraHeadersPlaceholder")}
+							data-testid="allowed-extra-headers-input"
+						/>
+					</div>
+				</>
+			)}
+
+			{connectionType === "stdio" && (
+				<>
+					<DottedSeparator />
+					<div className="space-y-4">
+						<SectionHeader
+							title={t("registry.form.launchCommand")}
+							description={lockConnection ? t("registry.form.launchCommandLocked") : t("registry.form.launchCommandOpen")}
+						/>
+						<div className="space-y-4 rounded-md border p-4">
+							<StdioRuntimeNotice />
+
+							{/* STDIO Command */}
+							<FormField
+								control={control}
+								name="stdio_config.command"
+								render={({ field }) => (
+									<FormItem>
+										<FormLabel>{t("common.command")}</FormLabel>
+										<FormControl>
+											<Input
+												{...field}
+												value={field.value ?? ""}
+												disabled={lockConnection}
+												onChange={(e) => {
+													field.onChange(e);
+													clearErrors("stdio_config.command");
+												}}
+												placeholder={t("registry.form.commandPlaceholder")}
+												data-testid="stdio-command-input"
+											/>
+										</FormControl>
+										<FormMessage />
+									</FormItem>
+								)}
+							/>
+
+							{/* Args (local state) */}
+							<div className="space-y-2">
+								<Label htmlFor="stdio-args-input">{t("registry.form.argsComma")}</Label>
+								<Input
+									id="stdio-args-input"
+									value={satellites.argsText}
+									disabled={lockConnection}
+									onChange={(e) => satellites.setArgsText(e.target.value)}
+									placeholder={t("registry.form.argsPlaceholder")}
+									data-testid="stdio-args-input"
+								/>
+							</div>
+
+							{/* Envs (local state) */}
+							<div className="space-y-2" role="group" aria-labelledby="stdio-envs-label">
+								<div className="flex items-center gap-2">
+									<Label id="stdio-envs-label">{t("registry.form.envVars")}</Label>
+									<TooltipProvider>
+										<Tooltip>
+											<TooltipTrigger asChild>
+												<Info className="text-muted-foreground h-4 w-4 cursor-help" />
+											</TooltipTrigger>
+											<TooltipContent className="max-w-xs">
+												<p>{t("registry.form.envVarsHelp")}</p>
+											</TooltipContent>
+										</Tooltip>
+									</TooltipProvider>
+								</div>
+								<HeadersTable
+									value={satellites.envVars}
+									onChange={satellites.setEnvVars}
+									fixedKeys={stdioEnvKeys}
+									keyPlaceholder="API_KEY"
+									valuePlaceholder={t("registry.form.envValuePlaceholder")}
+									label=""
+								/>
+							</div>
+						</div>
+					</div>
+				</>
+			)}
+
+			<DottedSeparator />
+
+			{/* Server Behavior */}
+			<div className="space-y-4">
+				<SectionHeader title={t("registry.form.serverBehavior")} description={t("registry.form.serverBehaviorDesc")} />
+				<div className="divide-y rounded-md border">
+					<FormField
+						control={control}
+						name="is_code_mode_client"
+						render={({ field }) => (
+							<FormItem className="flex flex-row items-center justify-between gap-4 px-4 py-3">
+								<CodeModeServerLabel htmlFor="code-mode" />
+								<FormControl>
+									<Switch id="code-mode" data-testid="code-mode-switch" checked={field.value || false} onCheckedChange={field.onChange} />
+								</FormControl>
+							</FormItem>
+						)}
+					/>
+					<FormField
+						control={control}
+						name="server_type_on_slug"
+						render={({ field }) => (
+							<FormItem className="flex flex-row items-center justify-between gap-4 px-4 py-3">
+								<ServerTypeOnSlugLabel slug={endpointSlug} />
+								<FormControl>
+									<ServerTypeOnSlugSelect value={field.value} onChange={field.onChange} codeModeServer={!!codeModeServer} />
+								</FormControl>
+							</FormItem>
+						)}
+					/>
+					<FormField
+						control={control}
+						name="is_ping_available"
+						render={({ field }) => (
+							<FormItem className="flex flex-row items-center justify-between gap-4 px-4 py-3">
+								<div className="flex items-center gap-2">
+									<FormLabel htmlFor="ping-available">{t("registry.form.pingAvailable")}</FormLabel>
+									<TooltipProvider>
+										<Tooltip>
+											<TooltipTrigger asChild>
+												<Info className="text-muted-foreground h-4 w-4 cursor-help" />
+											</TooltipTrigger>
+											<TooltipContent className="max-w-xs">
+												<p>{t("registry.form.pingAvailableHelp")}</p>
+											</TooltipContent>
+										</Tooltip>
+									</TooltipProvider>
+								</div>
+								<FormControl>
+									<Switch
+										id="ping-available"
+										data-testid="mcp-is-ping-available"
+										checked={field.value === true}
+										onCheckedChange={field.onChange}
+									/>
+								</FormControl>
+							</FormItem>
+						)}
+					/>
+					{connectionType === "http" &&
+						authType !== "per_user_oauth" &&
+						authType !== "per_user_headers" &&
+						authType !== "token_exchange" && (
+							<FormField
+								control={control}
+								name="needs_session_stickiness"
+								render={({ field }) => (
+									<FormItem className="flex flex-row items-center justify-between gap-4 px-4 py-3">
+										<div className="flex items-center gap-2">
+											<FormLabel htmlFor="needs-session-stickiness">{t("registry.form.persistentConnection")}</FormLabel>
+											<TooltipProvider>
+												<Tooltip>
+													<TooltipTrigger asChild>
+														<Info className="text-muted-foreground h-4 w-4 cursor-help" />
+													</TooltipTrigger>
+													<TooltipContent className="max-w-xs">
+														<p>{t("registry.form.persistentConnectionHelp")}</p>
+													</TooltipContent>
+												</Tooltip>
+											</TooltipProvider>
+										</div>
+										<FormControl>
+											<Switch
+												id="needs-session-stickiness"
+												data-testid="mcp-needs-session-stickiness"
+												checked={field.value === true}
+												onCheckedChange={field.onChange}
+											/>
+										</FormControl>
+									</FormItem>
+								)}
+							/>
+						)}
+					{supportsPerUserDiscovery(authType, connectionType) && (
+						<FormField
+							control={control}
+							name="per_user_discovery"
+							render={({ field }) => (
+								<FormItem className="flex flex-row items-center justify-between gap-4 px-4 py-3">
+									<div className="flex items-center gap-2">
+										<FormLabel htmlFor="per-user-discovery">{t("registry.form.perUserDiscovery")}</FormLabel>
+										<TooltipProvider>
+											<Tooltip>
+												<TooltipTrigger asChild>
+													<Info className="text-muted-foreground h-4 w-4 cursor-help" />
+												</TooltipTrigger>
+												<TooltipContent className="max-w-xs">
+													<p>{t("registry.form.perUserDiscoveryHelp")}</p>
+												</TooltipContent>
+											</Tooltip>
+										</TooltipProvider>
+									</div>
+									<FormControl>
+										<Switch
+											id="per-user-discovery"
+											data-testid="mcp-per-user-discovery"
+											checked={field.value === true}
+											onCheckedChange={field.onChange}
+										/>
+									</FormControl>
+								</FormItem>
+							)}
+						/>
+					)}
+					{!isOpenAPI && (
+						<FormField
+							control={control}
+							name="max_protocol_version"
+							render={({ field }) => (
+								<FormItem className="flex flex-row items-center justify-between gap-4 px-4 py-3">
+									<div className="flex items-center gap-2">
+										<FormLabel>{t("registry.form.maxProtocolVersion")}</FormLabel>
+										<TooltipProvider>
+											<Tooltip>
+												<TooltipTrigger asChild>
+													<Info className="text-muted-foreground h-4 w-4 cursor-help" />
+												</TooltipTrigger>
+												<TooltipContent className="max-w-xs">
+													<p>{t("registry.form.maxProtocolVersionTooltip")}</p>
+												</TooltipContent>
+											</Tooltip>
+										</TooltipProvider>
+									</div>
+									<FormControl>
+										<MaxProtocolVersionSelect value={field.value} onChange={field.onChange} />
+									</FormControl>
+								</FormItem>
+							)}
+						/>
+					)}
+				</div>
+			</div>
+
+			{hasNetworkAuth && (
+				<>
+					<DottedSeparator />
+
+					{/* TLS / Certificate */}
+					<div className="space-y-4">
+						<SectionHeader
+							title={t("registry.form.tlsCertificate")}
+							description={t("registry.form.tlsCertificateDesc")}
+							testId="tls-config-heading"
+						/>
+						<div className="space-y-4 rounded-md border p-4">
+							<TLSConfigFields control={control} />
+						</div>
+					</div>
+				</>
+			)}
+		</>
+	);
+}
+
+// Re-exported so the library sheets can build the same section scaffolding
+// without reaching past this module into the individual field fragments.
+export { SectionHeader };

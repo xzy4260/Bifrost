@@ -1,0 +1,632 @@
+package gemini
+
+import (
+	"strconv"
+	"strings"
+
+	"github.com/bytedance/sonic"
+	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
+	"github.com/maximhq/bifrost/core/schemas"
+)
+
+// IsInteractionsPassthroughPath reports whether a Gemini passthrough path targets the
+// Interactions API (/interactions, no colon action). It has no typed Bifrost equivalent, so
+// ClassifyPassthroughPath returns "" for it and callers that care check this first.
+func IsInteractionsPassthroughPath(path string) bool {
+	if idx := strings.IndexByte(path, '?'); idx >= 0 {
+		path = path[:idx]
+	}
+	return strings.Contains(path, "/interactions")
+}
+
+// interactionsPathRest returns what follows the /interactions segment of a passthrough path ("" for
+// the collection, "/{id}", "/{id}/cancel"), and false when the path does not address Interactions.
+func interactionsPathRest(path string) (string, bool) {
+	if idx := strings.IndexByte(path, '?'); idx >= 0 {
+		path = path[:idx]
+	}
+	path = strings.TrimRight(path, "/")
+	const segment = "/interactions"
+	idx := strings.LastIndex(path, segment)
+	if idx < 0 {
+		return "", false
+	}
+	rest := path[idx+len(segment):]
+	if rest != "" && rest[0] != '/' {
+		return "", false // e.g. "/interactionsFoo"
+	}
+	return rest, true
+}
+
+// IsInteractionsCreatePath reports whether a passthrough request creates an interaction: a POST to
+// the /interactions collection, whose body names the model or agent that runs.
+func IsInteractionsCreatePath(method, path string) bool {
+	rest, ok := interactionsPathRest(path)
+	return ok && rest == "" && method == "POST"
+}
+
+// IsInteractionsResourcePath reports whether a passthrough request reads, deletes or cancels an
+// existing interaction by id. These run nothing new: the model or agent was checked when the
+// interaction was created, and the request itself names none.
+func IsInteractionsResourcePath(method, path string) bool {
+	rest, ok := interactionsPathRest(path)
+	if !ok || len(rest) < 2 {
+		return false
+	}
+	id := rest[1:]
+	if strings.HasSuffix(id, "/cancel") || strings.HasSuffix(id, ":cancel") {
+		id = id[:len(id)-len("/cancel")]
+		return method == "POST" && id != "" && !strings.Contains(id, "/")
+	}
+	if strings.Contains(id, "/") {
+		return false
+	}
+	return method == "GET" || method == "DELETE"
+}
+
+// ClassifyPassthroughPath maps a Gemini/Vertex passthrough path to the Bifrost request type its
+// :action suffix addresses. :generateContent and :streamGenerateContent are Responses-shaped
+// (Bifrost routes GenAI generation through the Responses schema), :predict is Imagen and
+// :predictLongRunning is Veo. A query string is ignored; Interactions paths and unknown actions
+// return "". Usage extraction and passthrough log parsing both dispatch on this.
+func ClassifyPassthroughPath(path string) schemas.RequestType {
+	if idx := strings.IndexByte(path, '?'); idx >= 0 {
+		path = path[:idx]
+	}
+	if strings.Contains(path, "/interactions") {
+		return ""
+	}
+
+	action := passthroughAction(path)
+	switch action {
+	case "generateContent", "streamGenerateContent":
+		return schemas.ResponsesRequest
+	case "countTokens":
+		return schemas.CountTokensRequest
+	case "embedContent", "batchEmbedContents":
+		return schemas.EmbeddingRequest
+	case "predict":
+		// Vertex serves embedding models (text-embedding-*, multimodalembedding@*,
+		// gemini-embedding-*) on :predict as well as Imagen.
+		if strings.Contains(strings.ToLower(passthroughModelSegment(path)), "embedding") {
+			return schemas.EmbeddingRequest
+		}
+		return schemas.ImageGenerationRequest
+	case "predictLongRunning":
+		return schemas.VideoGenerationRequest
+	}
+	return ""
+}
+
+// passthroughAction returns the :action suffix of a query-free passthrough path ("" without one).
+func passthroughAction(path string) string {
+	if colonIdx := strings.LastIndexByte(path, ':'); colonIdx >= 0 {
+		return path[colonIdx+1:]
+	}
+	return ""
+}
+
+// passthroughModelSegment returns the model name of a query-free :action path: the segment after
+// the last "/" and before the ":action" suffix.
+func passthroughModelSegment(path string) string {
+	if colonIdx := strings.LastIndexByte(path, ':'); colonIdx >= 0 {
+		path = path[:colonIdx]
+	}
+	return path[strings.LastIndexByte(path, '/')+1:]
+}
+
+// ExtractGeminiPassthroughUsage extracts usage from a completed Gemini/Vertex
+// passthrough response. Handles both SSE streaming (last event) and plain JSON
+// (non-streaming) for all billable endpoint types.
+//
+// :generateContent handles all modalities — text, speech, transcription, and non-Imagen
+// image generation. Output modality detection routes to the correct BifrostPassthroughUsage
+// shape so the pricing engine uses the appropriate cost function.
+//
+// :predict is Imagen priced per-image. :predictLongRunning is Veo priced per-second.
+// /interactions paths use the Interactions API usage shape.
+func ExtractGeminiPassthroughUsage(path string, reqBody, body []byte) *schemas.BifrostPassthroughUsage {
+	if IsInteractionsPassthroughPath(path) {
+		return extractGeminiInteractionsUsage(body)
+	}
+	// :predict serves both embedding and Imagen models; extractGeminiPredictUsage tells them apart
+	// by the response shape, so every :predict bills through it whatever the path classifies as.
+	if idx := strings.IndexByte(path, '?'); idx >= 0 {
+		path = path[:idx]
+	}
+	if passthroughAction(path) == "predict" {
+		return extractGeminiPredictUsage(reqBody, body)
+	}
+
+	switch ClassifyPassthroughPath(path) {
+	case schemas.ResponsesRequest:
+		return extractGeminiGenerateContentUsage(body)
+	case schemas.EmbeddingRequest:
+		return extractGeminiEmbeddingUsage(body)
+	case schemas.VideoGenerationRequest:
+		// Veo video generation — priced per second of video.
+		return extractGeminiVeoUsage(reqBody)
+	}
+
+	// Unknown action (e.g. countTokens, generateVideos) — try usageMetadata as best-effort.
+	return extractGeminiGenerateContentUsage(body)
+}
+
+func HasGeminiPassthroughUsage(event []byte) bool {
+	return providerUtils.GetJSONField(event, "usageMetadata").Exists() ||
+		providerUtils.GetJSONField(event, "usage").Exists() ||
+		providerUtils.GetJSONField(event, "interaction.usage").Exists()
+}
+
+// ---- :generateContent / :streamGenerateContent ----
+
+type geminiPassthroughResp struct {
+	UsageMetadata *GenerateContentResponseUsageMetadata `json:"usageMetadata"`
+}
+
+// extractGeminiGenerateContentUsage routes to the correct BifrostPassthroughUsage shape
+// based on output modality from the response's candidatesTokensDetails:
+//
+//   - IMAGE tokens in output → ImageUsage + LLMUsage → ImageGenerationRequest → computeImageCost
+//   - AUDIO tokens in output → LLMUsage with CompletionTokensDetails.AudioTokens → ResponsesRequest → computeTextCost audio differential
+//   - TEXT / default → LLMUsage → ResponsesRequest → computeTextCost
+//
+// Gemini TTS bills by input tokens (not chars), so AUDIO output stays in the ResponsesRequest
+// path where computeTextCost applies the OutputCostPerAudioToken rate differential.
+func extractGeminiGenerateContentUsage(body []byte) *schemas.BifrostPassthroughUsage {
+	if len(body) == 0 {
+		return nil
+	}
+
+	var resp geminiPassthroughResp
+	if err := sonic.Unmarshal(body, &resp); err != nil || resp.UsageMetadata == nil {
+		return nil
+	}
+
+	// ConvertGeminiUsageMetadataToResponsesUsage handles thinking tokens, cached content,
+	// and per-modality breakdowns (text, audio, image) for all :generateContent request types.
+	ru := ConvertGeminiUsageMetadataToResponsesUsage(resp.UsageMetadata)
+	if ru == nil || ru.TotalTokens == 0 {
+		return nil
+	}
+
+	// IMAGE output → ImageUsage routes to computeImageCost via ImageGenerationRequest.
+	// LLMUsage is also set so the logging plugin can display tokens in/out.
+	if ru.OutputTokensDetails != nil && ru.OutputTokensDetails.ImageTokens != nil && *ru.OutputTokensDetails.ImageTokens > 0 {
+		imageUsage := &schemas.ImageUsage{
+			InputTokens:  ru.InputTokens,
+			OutputTokens: ru.OutputTokens,
+			TotalTokens:  ru.TotalTokens,
+			OutputTokensDetails: &schemas.ImageTokenDetails{
+				ImageTokens:     *ru.OutputTokensDetails.ImageTokens,
+				TextTokens:      ru.OutputTokensDetails.TextTokens,
+				ReasoningTokens: ru.OutputTokensDetails.ReasoningTokens,
+			},
+		}
+		if ru.InputTokensDetails != nil && (ru.InputTokensDetails.TextTokens > 0 || ru.InputTokensDetails.ImageTokens > 0) {
+			imageUsage.InputTokensDetails = &schemas.ImageTokenDetails{
+				TextTokens:  ru.InputTokensDetails.TextTokens,
+				ImageTokens: ru.InputTokensDetails.ImageTokens,
+			}
+		}
+		return &schemas.BifrostPassthroughUsage{
+			ImageUsage: imageUsage,
+			LLMUsage: &schemas.BifrostLLMUsage{
+				PromptTokens:     ru.InputTokens,
+				CompletionTokens: ru.OutputTokens,
+				TotalTokens:      ru.TotalTokens,
+			},
+		}
+	}
+
+	// TEXT / AUDIO / default → LLMUsage with full modality details for computeTextCost.
+	// For AUDIO output, CompletionTokensDetails.AudioTokens is set so computeTextCost applies
+	// the OutputCostPerAudioToken rate differential: cost = tokens * (audioRate - textRate).
+	usage := &schemas.BifrostLLMUsage{
+		PromptTokens:     ru.InputTokens,
+		CompletionTokens: ru.OutputTokens,
+		TotalTokens:      ru.TotalTokens,
+	}
+	if ru.InputTokensDetails != nil {
+		usage.PromptTokensDetails = &schemas.ChatPromptTokensDetails{
+			CachedReadTokens: ru.InputTokensDetails.CachedReadTokens,
+			TextTokens:       ru.InputTokensDetails.TextTokens,
+			AudioTokens:      ru.InputTokensDetails.AudioTokens,
+			ImageTokens:      ru.InputTokensDetails.ImageTokens,
+		}
+	}
+	if ru.OutputTokensDetails != nil {
+		usage.CompletionTokensDetails = &schemas.ChatCompletionTokensDetails{
+			ReasoningTokens: ru.OutputTokensDetails.ReasoningTokens,
+			AudioTokens:     ru.OutputTokensDetails.AudioTokens,
+		}
+	}
+
+	return &schemas.BifrostPassthroughUsage{LLMUsage: usage}
+}
+
+// ---- :embedContent / :batchEmbedContents ----
+
+func extractGeminiEmbeddingUsage(body []byte) *schemas.BifrostPassthroughUsage {
+	// Embeddings are never streamed, so body is plain JSON.
+	if len(body) == 0 {
+		return nil
+	}
+
+	var resp geminiPassthroughResp
+	if err := sonic.Unmarshal(body, &resp); err != nil || resp.UsageMetadata == nil {
+		return nil
+	}
+
+	m := resp.UsageMetadata
+	total := int(m.TotalTokenCount)
+	prompt := int(m.PromptTokenCount)
+	if total == 0 && prompt == 0 {
+		return nil
+	}
+	if total == 0 {
+		total = prompt
+	}
+	return &schemas.BifrostPassthroughUsage{
+		LLMUsage: &schemas.BifrostLLMUsage{
+			PromptTokens: prompt,
+			TotalTokens:  total,
+		},
+	}
+}
+
+// ---- /interactions (Interactions API) ----
+// Non-streaming: usage sits at top level.
+// Streaming InteractionCompletedEvent: usage is nested under "interaction".
+// Fields: total_input_tokens, total_output_tokens, total_thought_tokens (reasoning),
+// total_cached_tokens. service_tier "standard" is the default and is not forwarded.
+
+type geminiInteractionsUsage struct {
+	TotalTokens   int `json:"total_tokens"`
+	InputTokens   int `json:"total_input_tokens"`
+	OutputTokens  int `json:"total_output_tokens"`
+	ThoughtTokens int `json:"total_thought_tokens"`
+	CachedTokens  int `json:"total_cached_tokens"`
+}
+
+type geminiInteractionsRun struct {
+	ID          string                   `json:"id"`
+	Agent       string                   `json:"agent"`
+	Model       string                   `json:"model"`
+	Status      string                   `json:"status"`
+	Usage       *geminiInteractionsUsage `json:"usage"`
+	ServiceTier *string                  `json:"service_tier"`
+}
+
+type geminiInteractionsWrapper struct {
+	geminiInteractionsRun
+	InteractionID string `json:"interaction_id"` // interaction.status_update events name the run here
+	// Streaming interaction.created / interaction.completed events nest the interaction object.
+	Interaction *geminiInteractionsRun `json:"interaction"`
+}
+
+// InteractionsPassthroughInfo is what one Interactions response body or stream event says about
+// the run it belongs to. Usage is nil when the body reports none.
+type InteractionsPassthroughInfo struct {
+	ID     string
+	Model  string // the agent that ran, else the model
+	Status string
+	Usage  *schemas.BifrostPassthroughUsage
+}
+
+// terminal reports whether the run has stopped. A run still in progress (or waiting on a
+// continuation token) reports usage that a later read will report in full; a read that names no
+// status cannot say, so it is left for a poll to settle.
+func (i InteractionsPassthroughInfo) terminal() bool {
+	switch i.Status {
+	case "", "in_progress", "requires_continuation":
+		return false
+	}
+	return true
+}
+
+// ParseInteractionsPassthrough decodes an Interactions response body or SSE event once, for its
+// run id, agent or model, status and usage.
+func ParseInteractionsPassthrough(body []byte) InteractionsPassthroughInfo {
+	var info InteractionsPassthroughInfo
+	if len(body) == 0 {
+		return info
+	}
+	var w geminiInteractionsWrapper
+	if err := sonic.Unmarshal(body, &w); err != nil {
+		return info
+	}
+	run := w.geminiInteractionsRun
+	if w.Interaction != nil {
+		run = *w.Interaction
+	}
+	info.ID = run.ID
+	if info.ID == "" {
+		info.ID = w.InteractionID
+	}
+	info.Model = run.Agent
+	if info.Model == "" {
+		info.Model = run.Model
+	}
+	info.Status = run.Status
+	if info.Status == "" {
+		info.Status = w.Status
+	}
+	// Streaming takes priority: nested under "interaction" with a non-zero total.
+	u, tier := w.Usage, w.ServiceTier
+	if w.Interaction != nil && w.Interaction.Usage != nil && w.Interaction.Usage.TotalTokens > 0 {
+		u, tier = w.Interaction.Usage, w.Interaction.ServiceTier
+	}
+	info.Usage = interactionsUsage(u, tier)
+	return info
+}
+
+func extractGeminiInteractionsUsage(body []byte) *schemas.BifrostPassthroughUsage {
+	return ParseInteractionsPassthrough(body).Usage
+}
+
+func interactionsUsage(u *geminiInteractionsUsage, tier *string) *schemas.BifrostPassthroughUsage {
+	if u == nil || u.TotalTokens == 0 {
+		return nil
+	}
+
+	usage := &schemas.BifrostLLMUsage{
+		PromptTokens:     u.InputTokens,
+		CompletionTokens: u.OutputTokens + u.ThoughtTokens,
+		TotalTokens:      u.TotalTokens,
+	}
+	if u.CachedTokens > 0 {
+		usage.PromptTokensDetails = &schemas.ChatPromptTokensDetails{
+			CachedReadTokens: u.CachedTokens,
+		}
+	}
+	if u.ThoughtTokens > 0 {
+		usage.CompletionTokensDetails = &schemas.ChatCompletionTokensDetails{
+			ReasoningTokens: u.ThoughtTokens,
+		}
+	}
+
+	result := &schemas.BifrostPassthroughUsage{LLMUsage: usage}
+	// "standard" is the default tier — only forward non-standard values.
+	if tier != nil && *tier != "" && *tier != "standard" {
+		t := schemas.BifrostServiceTier(*tier)
+		result.ServiceTier = &t
+	}
+	return result
+}
+
+// interactionsRequest is the part of a passthrough request that decides whether its response
+// reports on a stored interaction, and how to read that interaction again.
+type interactionsRequest struct {
+	method     string
+	path       string
+	apiVersion string
+}
+
+func newInteractionsRequest(req *schemas.BifrostPassthroughRequest) interactionsRequest {
+	if req == nil {
+		return interactionsRequest{}
+	}
+	return interactionsRequest{method: req.Method, path: req.Path, apiVersion: req.APIVersion}
+}
+
+// job names the stored run a create, read or cancel reports on. A list, a delete and a body with no
+// run id report on none, and the usage of a response that names no run stays billable on the request.
+func (r interactionsRequest) job(info InteractionsPassthroughInfo) *schemas.BifrostPassthroughJob {
+	if info.ID == "" {
+		return nil
+	}
+	created := IsInteractionsCreatePath(r.method, r.path)
+	if !created && !IsInteractionsResourcePath(r.method, r.path) {
+		return nil
+	}
+	pollPath := interactionsPollPath(r.path, info.ID)
+	if pollPath == "" {
+		return nil
+	}
+	return &schemas.BifrostPassthroughJob{
+		ID:         info.ID,
+		Status:     info.Status,
+		Terminal:   info.terminal(),
+		Created:    created,
+		PollPath:   pollPath,
+		APIVersion: r.apiVersion,
+		Usage:      info.Usage,
+	}
+}
+
+// interactionsPollPath is the path that reads interaction id, built from the request's own path so
+// a Vertex project/location prefix is kept.
+func interactionsPollPath(path, id string) string {
+	if idx := strings.IndexByte(path, '?'); idx >= 0 {
+		path = path[:idx]
+	}
+	path = strings.TrimRight(path, "/")
+	const segment = "/interactions"
+	idx := strings.LastIndex(path, segment)
+	if idx < 0 {
+		return ""
+	}
+	return path[:idx+len(segment)] + "/" + id
+}
+
+// InteractionsPassthroughResult reads a non-streaming Interactions response for the agent or model
+// that ran and the run it reports on. Every read of a stored run repeats the run's full usage, so
+// that usage is returned on the job, to be settled once, and never as usage billable on this request.
+// A response that names no stored run returns its usage for the request as before.
+func InteractionsPassthroughResult(req *schemas.BifrostPassthroughRequest, body []byte) (*schemas.BifrostPassthroughUsage, string, *schemas.BifrostPassthroughJob) {
+	info := ParseInteractionsPassthrough(body)
+	if job := newInteractionsRequest(req).job(info); job != nil {
+		return nil, info.Model, job
+	}
+	return info.Usage, info.Model, nil
+}
+
+// HasInteractionsStreamInfo is the cheap gate for Interactions SSE events worth parsing: those that
+// carry usage, the interaction object (its id, agent and status) or a status update naming the run.
+func HasInteractionsStreamInfo(event []byte) bool {
+	return providerUtils.GetJSONField(event, "usage").Exists() ||
+		providerUtils.GetJSONField(event, "interaction").Exists() ||
+		providerUtils.GetJSONField(event, "interaction_id").Exists()
+}
+
+// InteractionsStreamObserver follows an Interactions SSE stream (a create with stream=true, or a GET
+// resuming one) for its run id, served model, status and usage.
+type InteractionsStreamObserver struct {
+	req  interactionsRequest
+	last InteractionsPassthroughInfo
+}
+
+// NewInteractionsStreamObserver starts observing the stream req opened.
+func NewInteractionsStreamObserver(req *schemas.BifrostPassthroughRequest) *InteractionsStreamObserver {
+	return &InteractionsStreamObserver{req: newInteractionsRequest(req)}
+}
+
+// Observe records one event and returns its usage, if any.
+func (o *InteractionsStreamObserver) Observe(event []byte) *schemas.BifrostPassthroughUsage {
+	info := ParseInteractionsPassthrough(event)
+	if info.ID != "" {
+		o.last.ID = info.ID
+	}
+	if info.Model != "" {
+		o.last.Model = info.Model
+	}
+	if info.Status != "" {
+		o.last.Status = info.Status
+	}
+	if info.Usage != nil {
+		o.last.Usage = info.Usage
+	}
+	return info.Usage
+}
+
+// Finalize names the model the stream reported running and moves the observed usage onto the run
+// it reports on. A stream that ended before the run did reports a job that is not terminal, so the
+// run is settled from a later read instead of from the partial usage seen here.
+func (o *InteractionsStreamObserver) Finalize(resp *schemas.BifrostPassthroughResponse) {
+	resp.ServedModel = o.last.Model
+	if job := o.req.job(o.last); job != nil {
+		resp.ProviderJob = job
+		resp.PassthroughUsage = nil
+	}
+}
+
+// ---- :predictLongRunning (Veo video generation) ----
+
+func extractGeminiVeoUsage(reqBody []byte) *schemas.BifrostPassthroughUsage {
+	// Default matches the native Gemini/Vertex path (schemas.DefaultVideoDuration).
+	secs := 8
+	if d, err := strconv.Atoi(schemas.DefaultVideoDuration); err == nil {
+		secs = d
+	}
+	if len(reqBody) > 0 {
+		if d := providerUtils.GetJSONField(reqBody, "parameters.durationSeconds"); d.Exists() && d.Int() > 0 {
+			secs = int(d.Int())
+		}
+	}
+	return &schemas.BifrostPassthroughUsage{VideoSeconds: &secs}
+}
+
+// ---- :predict dispatch (Vertex/Gemini prediction endpoint) ----
+// The :predict action is shared by embeddings and Imagen image generation, distinguished by
+// the per-prediction structure:
+//
+//   - embedding (text or multimodal): predictions[] carry an `embeddings` block (text, with
+//     statistics.token_count) or modality vectors (textEmbedding/imageEmbedding/videoEmbeddings,
+//     multimodal — no token count) → token usage
+//   - Imagen image gen: predictions[].bytesBase64Encoded → per-image count
+//
+// An embedding response carries only LLMUsage, so it resolves to EmbeddingRequest via
+// detectPassthroughRequestType's :predict mapping. Imagen sets ImageUsage and is resolved by
+// its usage shape before that fallback, so the fallback only ever classifies embeddings.
+type geminiPredictResponse struct {
+	Predictions []struct {
+		Embeddings *struct {
+			Statistics *struct {
+				TokenCount int `json:"token_count"`
+			} `json:"statistics"`
+		} `json:"embeddings"`
+		// Multimodal embedding modality vectors — used only to recognize the response as an
+		// embedding (multimodal responses carry no token count to bill).
+		TextEmbedding   []float64 `json:"textEmbedding"`
+		ImageEmbedding  []float64 `json:"imageEmbedding"`
+		VideoEmbeddings []any     `json:"videoEmbeddings"`
+	} `json:"predictions"`
+}
+
+func extractGeminiPredictUsage(reqBody, body []byte) *schemas.BifrostPassthroughUsage {
+	if len(body) > 0 {
+		var resp geminiPredictResponse
+		if err := sonic.Unmarshal(body, &resp); err == nil {
+			if u := resp.embeddingUsage(); u != nil {
+				return u
+			}
+		}
+	}
+	// Default: Imagen image generation (priced per image).
+	return extractGeminiImagenUsage(reqBody, body)
+}
+
+// embeddingUsage returns token usage when the :predict response is an embedding response
+// (text or multimodal), else nil. It returns non-nil for any embedding response — even when no
+// token count is present (multimodal) — so an embedding is billed as such rather than misrouted
+// to the Imagen per-image path.
+func (r *geminiPredictResponse) embeddingUsage() *schemas.BifrostPassthroughUsage {
+	total, isEmbedding := 0, false
+	for i := range r.Predictions {
+		p := r.Predictions[i]
+		if p.Embeddings != nil {
+			isEmbedding = true
+			if p.Embeddings.Statistics != nil {
+				total += p.Embeddings.Statistics.TokenCount
+			}
+		}
+		if len(p.TextEmbedding) > 0 || len(p.ImageEmbedding) > 0 || len(p.VideoEmbeddings) > 0 {
+			isEmbedding = true
+		}
+	}
+	if !isEmbedding {
+		return nil
+	}
+	return &schemas.BifrostPassthroughUsage{
+		LLMUsage: &schemas.BifrostLLMUsage{PromptTokens: total, TotalTokens: total},
+	}
+}
+
+// ---- :predict (Imagen) ----
+// Imagen is priced per image. Extract count from predictions in the response,
+// with the requested sampleCount from the request body as a fallback.
+
+func extractGeminiImagenUsage(reqBody, body []byte) *schemas.BifrostPassthroughUsage {
+	u := &schemas.BifrostPassthroughUsage{
+		ImageUsage: &schemas.ImageUsage{},
+	}
+
+	// Request body: sampleCount is the requested number of images.
+	if len(reqBody) > 0 {
+		var req GeminiImagenRequest
+		if err := sonic.Unmarshal(reqBody, &req); err == nil &&
+			req.Parameters.SampleCount != nil && *req.Parameters.SampleCount > 0 {
+			if u.ImageUsage.OutputTokensDetails == nil {
+				u.ImageUsage.OutputTokensDetails = &schemas.ImageTokenDetails{}
+			}
+			u.ImageUsage.OutputTokensDetails.NImages = *req.Parameters.SampleCount
+		}
+	}
+
+	// Response body: actual delivered predictions (may be fewer than requested).
+	if len(body) > 0 {
+		var resp GeminiImagenResponse
+		if err := sonic.Unmarshal(body, &resp); err == nil && len(resp.Predictions) > 0 {
+			if u.ImageUsage.OutputTokensDetails == nil {
+				u.ImageUsage.OutputTokensDetails = &schemas.ImageTokenDetails{}
+			}
+			u.ImageUsage.OutputTokensDetails.NImages = len(resp.Predictions)
+		}
+	}
+
+	if u.ImageUsage.OutputTokensDetails == nil || u.ImageUsage.OutputTokensDetails.NImages == 0 {
+		return nil
+	}
+	return u
+}

@@ -1,0 +1,761 @@
+import { LogsFilterSidebar } from "@/components/filters/logsFilterSidebar";
+import { DateTimePickerWithRange } from "@/components/ui/datePickerWithRange";
+import { ScrollArea } from "@/components/ui/scrollArea";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { useTimezonePreference } from "@/lib/hooks/useTimezonePreference";
+import { parseAsSafeArrayOf, parseAsSafeString } from "@/lib/queryParamsParser";
+import { useGetMCPAvailableFilterDataQuery } from "@/lib/store";
+import type { LogFilters, MCPToolLogFilters } from "@/lib/types/logs";
+import { dateUtils } from "@/lib/types/logs";
+import { parseMetadataFiltersParam } from "@/lib/utils/metadataFilters";
+import { getRangeForPeriod, TIME_PERIODS } from "@/lib/utils/timeRange";
+import { useLocation } from "@tanstack/react-router";
+import { parseAsBoolean, parseAsInteger, parseAsString, useQueryStates } from "nuqs";
+import { type RefObject, useCallback, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { type ChartType } from "./components/charts/chartTypeToggle";
+import { ModelFilterSelect } from "./components/charts/modelFilterSelect";
+import { ExportPopover } from "./components/exportPopover";
+import { type DimensionRankingsTabViewHandle, DimensionRankingsTabView } from "./components/tabViews/dimensionRankingsTabView";
+import { type MCPTabViewHandle, MCPTabView } from "./components/tabViews/mcpTabView";
+import { type ModelRankingsTabViewHandle, ModelRankingsTabView } from "./components/tabViews/modelRankingsTabView";
+import { type OverviewTabViewHandle, OverviewTabView } from "./components/tabViews/overviewTabView";
+import { type ProviderUsageTabViewHandle, ProviderUsageTabView } from "./components/tabViews/providerUsageTabView";
+import { type DashboardData, type DashboardTab, type ExportTab, DASHBOARD_EXPORT_TABS } from "./utils/exportUtils";
+
+const toChartType = (value: string): ChartType => (value === "line" ? "line" : "bar");
+
+/** Wait two frames: one for React to commit, one for the browser to lay the result out. */
+const nextFrames = () =>
+	new Promise<void>((resolve) => {
+		requestAnimationFrame(() => {
+			requestAnimationFrame(() => resolve());
+		});
+	});
+
+export default function DashboardPage() {
+	const { t } = useTranslation("observability");
+	// MCP filter data
+	const { data: mcpFilterData } = useGetMCPAvailableFilterDataQuery();
+
+	const defaultTimeRange = useMemo(() => dateUtils.getDefaultTimeRange(), []);
+
+	const [timezone, setTimezone] = useTimezonePreference();
+
+	const { search } = useLocation();
+	const hasExplicitTimeRange = (search as Record<string, unknown>)?.start_time && (search as Record<string, unknown>)?.end_time;
+
+	const [urlState, setUrlState] = useQueryStates(
+		{
+			period: parseAsString.withDefault(hasExplicitTimeRange ? "" : "1h").withOptions({ clearOnDefault: false }),
+			start_time: parseAsInteger.withDefault(defaultTimeRange.startTime),
+			end_time: parseAsInteger.withDefault(defaultTimeRange.endTime),
+			tab: parseAsString.withDefault("overview"),
+			virtual_key_ids: parseAsSafeArrayOf.withDefault([]),
+			providers: parseAsSafeArrayOf.withDefault([]),
+			models: parseAsSafeArrayOf.withDefault([]),
+			selected_key_ids: parseAsSafeArrayOf.withDefault([]),
+			objects: parseAsSafeArrayOf.withDefault([]),
+			status: parseAsSafeArrayOf.withDefault([]),
+			routing_rule_ids: parseAsSafeArrayOf.withDefault([]),
+			model_router_ids: parseAsSafeArrayOf.withDefault([]),
+			routing_engine_used: parseAsSafeArrayOf.withDefault([]),
+			stop_reasons: parseAsSafeArrayOf.withDefault([]),
+			tool_call_names: parseAsSafeArrayOf.withDefault([]),
+			cache_hit_types: parseAsSafeArrayOf.withDefault([]),
+			missing_cost_only: parseAsBoolean.withDefault(false),
+			metadata_filters: parseAsString.withDefault(""),
+			volume_chart: parseAsString.withDefault("bar"),
+			token_chart: parseAsString.withDefault("bar"),
+			model_chart: parseAsString.withDefault("bar"),
+			latency_chart: parseAsString.withDefault("bar"),
+			overhead_chart: parseAsString.withDefault("bar"),
+			throughput_chart: parseAsString.withDefault("bar"),
+			usage_model: parseAsString.withDefault("all"),
+			provider_token_chart: parseAsString.withDefault("bar"),
+			provider_latency_chart: parseAsString.withDefault("bar"),
+			provider_throughput_chart: parseAsString.withDefault("bar"),
+			provider_cost_provider: parseAsString.withDefault("all"),
+			provider_token_provider: parseAsString.withDefault("all"),
+			provider_latency_provider: parseAsString.withDefault("all"),
+			provider_throughput_provider: parseAsString.withDefault("all"),
+			mcp_volume_chart: parseAsString.withDefault("bar"),
+			mcp_cost_chart: parseAsString.withDefault("bar"),
+			mcp_tool_names: parseAsString.withDefault(""),
+			mcp_server_labels: parseAsString.withDefault(""),
+			parent_request_id: parseAsString.withDefault(""),
+			agent_names: parseAsSafeArrayOf.withDefault([]),
+			session_id: parseAsSafeString.withDefault(""),
+			agent_correlation_id: parseAsSafeString.withDefault(""),
+			user_ids: parseAsSafeArrayOf.withDefault([]),
+			team_ids: parseAsSafeArrayOf.withDefault([]),
+			customer_ids: parseAsSafeArrayOf.withDefault([]),
+			business_unit_ids: parseAsSafeArrayOf.withDefault([]),
+			project_ids: parseAsSafeArrayOf.withDefault([]),
+			aliases: parseAsSafeArrayOf.withDefault([]),
+			apps: parseAsSafeArrayOf.withDefault([]),
+			complexity_tiers: parseAsSafeArrayOf.withDefault([]),
+			complexity_mechanisms: parseAsSafeArrayOf.withDefault([]),
+			topic_ids: parseAsSafeArrayOf.withDefault([]),
+		},
+		{
+			history: "push",
+			shallow: false,
+		},
+	);
+
+	// Parse string-backed MCP filter values from URL state
+	const selectedMcpToolNames = useMemo(() => (urlState.mcp_tool_names ? [urlState.mcp_tool_names] : []), [urlState.mcp_tool_names]);
+	const selectedMcpServerLabels = useMemo(
+		() => (urlState.mcp_server_labels ? [urlState.mcp_server_labels] : []),
+		[urlState.mcp_server_labels],
+	);
+
+	const metadataFilters = useMemo(() => parseMetadataFiltersParam(urlState.metadata_filters), [urlState.metadata_filters]);
+
+	const filters: LogFilters = useMemo(
+		() => ({
+			...(urlState.period
+				? { period: urlState.period }
+				: {
+						start_time: dateUtils.toISOString(urlState.start_time),
+						end_time: dateUtils.toISOString(urlState.end_time),
+					}),
+			...(urlState.providers.length > 0 && { providers: urlState.providers }),
+			...(urlState.models.length > 0 && { models: urlState.models }),
+			...(urlState.selected_key_ids.length > 0 && { selected_key_ids: urlState.selected_key_ids }),
+			...(urlState.virtual_key_ids.length > 0 && {
+				virtual_key_ids: urlState.virtual_key_ids,
+			}),
+			...(urlState.objects.length > 0 && { objects: urlState.objects }),
+			...(urlState.status.length > 0 && { status: urlState.status }),
+			...(urlState.routing_rule_ids.length > 0 && {
+				routing_rule_ids: urlState.routing_rule_ids,
+			}),
+			...(urlState.model_router_ids.length > 0 && { model_router_ids: urlState.model_router_ids }),
+			...(urlState.routing_engine_used.length > 0 && {
+				routing_engine_used: urlState.routing_engine_used,
+			}),
+			...(urlState.stop_reasons.length > 0 && { stop_reasons: urlState.stop_reasons }),
+			...(urlState.tool_call_names.length > 0 && { tool_call_names: urlState.tool_call_names }),
+			...(urlState.cache_hit_types.length > 0 && { cache_hit_types: urlState.cache_hit_types }),
+			...(urlState.missing_cost_only && { missing_cost_only: true }),
+			...(metadataFilters &&
+				Object.keys(metadataFilters).length > 0 && {
+					metadata_filters: metadataFilters,
+				}),
+			...(urlState.parent_request_id && { parent_request_id: urlState.parent_request_id }),
+			...(urlState.agent_names.length > 0 && { agent_names: urlState.agent_names }),
+			...(urlState.session_id && { session_id: urlState.session_id }),
+			...(urlState.agent_correlation_id && { agent_correlation_id: urlState.agent_correlation_id }),
+			...(urlState.user_ids.length > 0 && { user_ids: urlState.user_ids }),
+			...(urlState.team_ids.length > 0 && { team_ids: urlState.team_ids }),
+			...(urlState.customer_ids.length > 0 && { customer_ids: urlState.customer_ids }),
+			...(urlState.business_unit_ids.length > 0 && { business_unit_ids: urlState.business_unit_ids }),
+			...(urlState.project_ids.length > 0 && { project_ids: urlState.project_ids }),
+			...(urlState.aliases.length > 0 && { aliases: urlState.aliases }),
+			...(urlState.apps.length > 0 && { apps: urlState.apps }),
+			...(urlState.complexity_tiers.length > 0 && { complexity_tiers: urlState.complexity_tiers }),
+			...(urlState.complexity_mechanisms.length > 0 && { complexity_mechanisms: urlState.complexity_mechanisms }),
+			...(urlState.topic_ids.length > 0 && { topic_ids: urlState.topic_ids }),
+		}),
+		[
+			urlState.period,
+			urlState.start_time,
+			urlState.end_time,
+			urlState.parent_request_id,
+			urlState.agent_names,
+			urlState.session_id,
+			urlState.agent_correlation_id,
+			urlState.providers,
+			urlState.models,
+			urlState.selected_key_ids,
+			urlState.virtual_key_ids,
+			urlState.objects,
+			urlState.status,
+			urlState.routing_rule_ids,
+			urlState.model_router_ids,
+			urlState.routing_engine_used,
+			urlState.stop_reasons,
+			urlState.tool_call_names,
+			urlState.cache_hit_types,
+			urlState.missing_cost_only,
+			metadataFilters,
+			urlState.user_ids,
+			urlState.team_ids,
+			urlState.customer_ids,
+			urlState.business_unit_ids,
+			urlState.project_ids,
+			urlState.aliases,
+			urlState.apps,
+			urlState.complexity_tiers,
+			urlState.complexity_mechanisms,
+			urlState.topic_ids,
+		],
+	);
+
+	const mcpFilters: MCPToolLogFilters = useMemo(
+		() => ({
+			...(urlState.period
+				? { period: urlState.period }
+				: {
+						start_time: dateUtils.toISOString(urlState.start_time),
+						end_time: dateUtils.toISOString(urlState.end_time),
+					}),
+			...(selectedMcpToolNames.length > 0 && {
+				tool_names: selectedMcpToolNames,
+			}),
+			...(selectedMcpServerLabels.length > 0 && {
+				server_labels: selectedMcpServerLabels,
+			}),
+			...(urlState.agent_names.length > 0 && { agent_names: urlState.agent_names }),
+			...(urlState.agent_correlation_id && { agent_correlation_id: urlState.agent_correlation_id }),
+			...(urlState.status.length > 0 && { status: urlState.status }),
+			...(urlState.virtual_key_ids.length > 0 && {
+				virtual_key_ids: urlState.virtual_key_ids,
+			}),
+		}),
+		[
+			urlState.period,
+			urlState.start_time,
+			urlState.end_time,
+			selectedMcpToolNames,
+			selectedMcpServerLabels,
+			urlState.agent_names,
+			urlState.agent_correlation_id,
+			urlState.status,
+			urlState.virtual_key_ids,
+		],
+	);
+
+	// Tab view refs for export data aggregation
+	const overviewRef = useRef<OverviewTabViewHandle>(null);
+	const providerRef = useRef<ProviderUsageTabViewHandle>(null);
+	const mcpRef = useRef<MCPTabViewHandle>(null);
+	const modelRankingsRef = useRef<ModelRankingsTabViewHandle>(null);
+	const buRankingsRef = useRef<DimensionRankingsTabViewHandle>(null);
+	const projectRankingsRef = useRef<DimensionRankingsTabViewHandle>(null);
+	const userRankingsRef = useRef<DimensionRankingsTabViewHandle>(null);
+	const virtualKeyRankingsRef = useRef<DimensionRankingsTabViewHandle>(null);
+	const appRankingsRef = useRef<DimensionRankingsTabViewHandle>(null);
+
+	const allRefs = [
+		overviewRef,
+		providerRef,
+		mcpRef,
+		modelRankingsRef,
+		buRankingsRef,
+		projectRankingsRef,
+		userRankingsRef,
+		virtualKeyRankingsRef,
+		appRankingsRef,
+	];
+
+	const getDashboardData = useCallback((): DashboardData => {
+		const merged: Partial<DashboardData> = {};
+		for (const r of allRefs) {
+			if (r.current) Object.assign(merged, r.current.getData());
+		}
+		return {
+			histogramData: null,
+			tokenData: null,
+			modelData: null,
+			latencyData: null,
+			providerTokenData: null,
+			providerLatencyData: null,
+			rankingsData: null,
+			buRankingsData: null,
+			projectRankingsData: null,
+			userRankingsData: null,
+			virtualKeyRankingsData: null,
+			appRankingsData: null,
+			mcpHistogramData: null,
+			mcpTopToolsData: null,
+			...merged,
+		};
+	}, []);
+
+	// Which scope the in-flight export covers; null when not exporting.
+	// "all" force-mounts every tab, a single tab exports only what is open.
+	const [exportScope, setExportScope] = useState<ExportTab | null>(null);
+	const exportingAll = exportScope === "all";
+	/** True while this tab is part of the running export, so rankings render their uncapped snapshot. */
+	const isExportingTab = (tab: DashboardTab) => exportingAll || exportScope === tab;
+
+	const handlePreloadData = useCallback(async (scope: ExportTab) => {
+		// For an all-tabs export, force-mount every tab before loading: Radix
+		// unmounts inactive TabsContent, so an inactive tab view has no ref yet
+		// and would never load its export snapshot - the report would only cover
+		// the tab that happened to be open. A single-tab export deliberately
+		// skips this, so only the open tab's data reaches the export.
+		setExportScope(scope);
+		await nextFrames();
+
+		const refsByTab: Record<DashboardTab, RefObject<{ loadData: () => Promise<void> } | null>> = {
+			overview: overviewRef,
+			"provider-usage": providerRef,
+			mcp: mcpRef,
+			rankings: modelRankingsRef,
+			"bu-rankings": buRankingsRef,
+			"project-rankings": projectRankingsRef,
+			"user-rankings": userRankingsRef,
+			"virtual-key-rankings": virtualKeyRankingsRef,
+			"app-rankings": appRankingsRef,
+		};
+
+		const refs = scope === "all" ? allRefs : [refsByTab[scope]];
+		await Promise.all(refs.map((r) => r.current?.loadData()));
+
+		// Let the loaded snapshots commit before the caller reads getData() or
+		// captures the DOM.
+		await nextFrames();
+	}, []);
+
+	// Tab change handler
+	const handleTabChange = useCallback(
+		(tab: string) => {
+			setUrlState({ tab });
+		},
+		[setUrlState],
+	);
+
+	// Chart type toggles
+	const handleVolumeChartToggle = useCallback((type: ChartType) => setUrlState({ volume_chart: type }), [setUrlState]);
+	const handleTokenChartToggle = useCallback((type: ChartType) => setUrlState({ token_chart: type }), [setUrlState]);
+	const handleModelChartToggle = useCallback((type: ChartType) => setUrlState({ model_chart: type }), [setUrlState]);
+	const handleLatencyChartToggle = useCallback((type: ChartType) => setUrlState({ latency_chart: type }), [setUrlState]);
+	const handleOverheadChartToggle = useCallback((type: ChartType) => setUrlState({ overhead_chart: type }), [setUrlState]);
+	const handleThroughputChartToggle = useCallback((type: ChartType) => setUrlState({ throughput_chart: type }), [setUrlState]);
+	const handleProviderTokenChartToggle = useCallback((type: ChartType) => setUrlState({ provider_token_chart: type }), [setUrlState]);
+	const handleProviderLatencyChartToggle = useCallback((type: ChartType) => setUrlState({ provider_latency_chart: type }), [setUrlState]);
+	const handleProviderThroughputChartToggle = useCallback(
+		(type: ChartType) => setUrlState({ provider_throughput_chart: type }),
+		[setUrlState],
+	);
+	const handleMcpVolumeChartToggle = useCallback((type: ChartType) => setUrlState({ mcp_volume_chart: type }), [setUrlState]);
+
+	// Model / provider filter changes
+	const handleUsageModelChange = useCallback((model: string) => setUrlState({ usage_model: model }), [setUrlState]);
+	const handleProviderTokenProviderChange = useCallback(
+		(provider: string) => setUrlState({ provider_token_provider: provider }),
+		[setUrlState],
+	);
+	const handleProviderLatencyProviderChange = useCallback(
+		(provider: string) => setUrlState({ provider_latency_provider: provider }),
+		[setUrlState],
+	);
+	const handleProviderThroughputProviderChange = useCallback(
+		(provider: string) => setUrlState({ provider_throughput_provider: provider }),
+		[setUrlState],
+	);
+
+	// Adapter: converts a full LogFilters object to dashboard URL state
+	const setFilters = useCallback(
+		(newFilters: LogFilters) => {
+			// The sidebar/header only manage dimension filters, never the time range: in
+			// period mode `newFilters` carries no start/end, so only touch time when an
+			// explicit range is actually provided — otherwise we'd clear the active period.
+			const hasExplicitTime = !!newFilters.start_time && !!newFilters.end_time;
+			const newStartTime = hasExplicitTime ? dateUtils.toUnixTimestamp(new Date(newFilters.start_time!)) : undefined;
+			const newEndTime = hasExplicitTime ? dateUtils.toUnixTimestamp(new Date(newFilters.end_time!)) : undefined;
+			const timeChanged = hasExplicitTime && (newStartTime !== urlState.start_time || newEndTime !== urlState.end_time);
+			setUrlState({
+				...(timeChanged && { period: "", start_time: newStartTime, end_time: newEndTime }),
+				providers: newFilters.providers || [],
+				models: newFilters.models || [],
+				selected_key_ids: newFilters.selected_key_ids || [],
+				virtual_key_ids: newFilters.virtual_key_ids || [],
+				objects: newFilters.objects || [],
+				status: newFilters.status || [],
+				routing_rule_ids: newFilters.routing_rule_ids || [],
+				model_router_ids: newFilters.model_router_ids || [],
+				routing_engine_used: newFilters.routing_engine_used || [],
+				stop_reasons: newFilters.stop_reasons || [],
+				tool_call_names: newFilters.tool_call_names || [],
+				cache_hit_types: newFilters.cache_hit_types || [],
+				missing_cost_only: newFilters.missing_cost_only ?? false,
+				metadata_filters:
+					newFilters.metadata_filters && Object.keys(newFilters.metadata_filters).length > 0
+						? JSON.stringify(newFilters.metadata_filters)
+						: "",
+				parent_request_id: newFilters.parent_request_id || "",
+				agent_names: newFilters.agent_names || [],
+				session_id: newFilters.session_id || "",
+				agent_correlation_id: newFilters.agent_correlation_id || "",
+				user_ids: newFilters.user_ids || [],
+				team_ids: newFilters.team_ids || [],
+				customer_ids: newFilters.customer_ids || [],
+				business_unit_ids: newFilters.business_unit_ids || [],
+				project_ids: newFilters.project_ids || [],
+				aliases: newFilters.aliases || [],
+				apps: newFilters.apps || [],
+				complexity_tiers: newFilters.complexity_tiers || [],
+				complexity_mechanisms: newFilters.complexity_mechanisms || [],
+				topic_ids: newFilters.topic_ids || [],
+			});
+		},
+		[setUrlState, urlState.start_time, urlState.end_time],
+	);
+
+	// Date range for picker
+	const dateRange = useMemo(
+		() => ({
+			from: dateUtils.fromUnixTimestamp(urlState.start_time),
+			to: dateUtils.fromUnixTimestamp(urlState.end_time),
+		}),
+		[urlState.start_time, urlState.end_time],
+	);
+
+	const handlePeriodChange = useCallback(
+		(period: string | undefined) => {
+			if (!period) return;
+			const { from, to } = getRangeForPeriod(period);
+			setUrlState({
+				period,
+				start_time: Math.floor(from.getTime() / 1000),
+				end_time: Math.floor(to.getTime() / 1000),
+			});
+		},
+		[setUrlState],
+	);
+
+	const handleDateRangeChange = useCallback(
+		(range: { from?: Date; to?: Date }) => {
+			if (!range.from || !range.to) return;
+			setUrlState({
+				period: "",
+				start_time: dateUtils.toUnixTimestamp(range.from),
+				end_time: dateUtils.toUnixTimestamp(range.to),
+			});
+		},
+		[setUrlState],
+	);
+
+	// PDF export mode
+	const dashboardMinHeightRef = useRef<string>("");
+	const hiddenTabsRef = useRef<HTMLElement[]>([]);
+
+	const handlePdfExport = useCallback(
+		async (scope: ExportTab): Promise<{ element: HTMLElement; label: string }[]> => {
+			// Enters export mode, force-mounts the scoped tabs and waits for the
+			// loaded snapshots to render.
+			await handlePreloadData(scope);
+
+			// Only an all-tabs export has hidden sections to reveal; a single-tab
+			// export captures the section already on screen.
+			if (scope === "all") {
+				const hiddenTabs = document.querySelectorAll<HTMLElement>('[data-slot="tabs-content"][hidden]');
+				hiddenTabsRef.current = Array.from(hiddenTabs);
+				for (const tab of hiddenTabs) {
+					tab.removeAttribute("hidden");
+					tab.style.display = "block";
+				}
+			}
+
+			const dashboardEl = document.getElementById("dashboard-root");
+			if (dashboardEl) {
+				dashboardMinHeightRef.current = dashboardEl.style.minHeight;
+				dashboardEl.style.minHeight = "0";
+			}
+
+			window.dispatchEvent(new Event("resize"));
+			await nextFrames();
+
+			const tabs = scope === "all" ? DASHBOARD_EXPORT_TABS : DASHBOARD_EXPORT_TABS.filter((t) => t.value === scope);
+			return tabs
+				.map(({ sectionId, label }) => ({ element: document.getElementById(sectionId), label }))
+				.filter((s): s is { element: HTMLElement; label: string } => s.element !== null);
+		},
+		[handlePreloadData],
+	);
+
+	const handleExportDone = useCallback(() => {
+		const dashboardEl = document.getElementById("dashboard-root");
+		if (dashboardEl) {
+			dashboardEl.style.minHeight = dashboardMinHeightRef.current;
+		}
+
+		for (const tab of hiddenTabsRef.current) {
+			tab.setAttribute("hidden", "");
+			tab.style.display = "";
+		}
+		hiddenTabsRef.current = [];
+
+		setExportScope(null);
+	}, []);
+
+	const activeTab = (urlState.tab || "overview") as DashboardTab;
+
+	return (
+		<div
+			id="dashboard-root"
+			className="no-padding-parent no-border-parent bg-background flex h-[calc(var(--app-content-viewport)_-_var(--app-bottom-padding))] w-full gap-3"
+		>
+			{/* Sidebar Filters */}
+			<LogsFilterSidebar filters={filters} onFiltersChange={setFilters} />
+
+			{/* Main Content */}
+			<ScrollArea className="bg-card flex min-w-0 flex-1 flex-col gap-4 rounded-md border" viewportClassName="no-table">
+				<div className="p-4">
+					{/* Tabs */}
+					<Tabs value={activeTab} onValueChange={handleTabChange}>
+						<div className="mb-2 flex flex-col gap-2 lg:flex-row lg:items-center">
+							{/* min-w-0 keeps the tab strip from pushing the filters off the row —
+							    there are eleven tabs. TabsList collapses whatever does not fit
+							    into its own dropdown, so no horizontal scrolling is needed. */}
+							<div className="max-w-full min-w-0 flex-1">
+								{/* Stays w-max: TabsTrigger is flex-1, so a full-width list would
+								    stretch every tab across the row. */}
+								<TabsList className="w-max min-w-max">
+									<TabsTrigger className="shrink-0" value="overview" data-testid="dashboard-tab-overview">
+										{t("dashboard.tabs.overview")}
+									</TabsTrigger>
+									<TabsTrigger className="shrink-0" value="provider-usage" data-testid="dashboard-tab-provider-usage">
+										{t("dashboard.tabs.providerUsage")}
+									</TabsTrigger>
+									<TabsTrigger className="shrink-0" value="rankings" data-testid="dashboard-tab-rankings">
+										{t("dashboard.tabs.modelRankings")}
+									</TabsTrigger>
+									<TabsTrigger className="shrink-0" value="mcp" data-testid="dashboard-tab-mcp">
+										{t("dashboard.tabs.mcpUsage")}
+									</TabsTrigger>
+									<TabsTrigger className="shrink-0" value="user-rankings" data-testid="dashboard-tab-user-rankings">
+										{t("dashboard.tabs.userRankings")}
+									</TabsTrigger>
+									<TabsTrigger className="shrink-0" value="virtual-key-rankings" data-testid="dashboard-tab-virtual-key-rankings">
+										{t("dashboard.tabs.virtualKeyRankings")}
+									</TabsTrigger>
+									<TabsTrigger className="shrink-0" value="bu-rankings" data-testid="dashboard-tab-bu-rankings">
+										{t("dashboard.tabs.buRankings")}
+									</TabsTrigger>
+									<TabsTrigger className="shrink-0" value="project-rankings" data-testid="dashboard-tab-project-rankings">
+										{t("dashboard.tabs.projectRankings")}
+									</TabsTrigger>
+									<TabsTrigger value="app-rankings" data-testid="dashboard-tab-app-rankings">
+										{t("dashboard.tabs.appRankings")}
+									</TabsTrigger>
+								</TabsList>
+							</div>
+							<div className="flex shrink-0 flex-wrap items-center gap-2 lg:ml-auto">
+								<ExportPopover
+									getData={getDashboardData}
+									activeTab={activeTab}
+									onPreloadData={handlePreloadData}
+									onPdfExport={handlePdfExport}
+									onExportDone={handleExportDone}
+								/>
+								{activeTab === "mcp" && mcpFilterData && (
+									<div className="flex w-full flex-wrap items-center gap-1 sm:w-auto">
+										{(mcpFilterData.tool_names?.length ?? 0) > 0 && (
+											<ModelFilterSelect
+												models={mcpFilterData.tool_names ?? []}
+												selectedModel={selectedMcpToolNames.length === 1 ? selectedMcpToolNames[0] : "all"}
+												onModelChange={(value) => {
+													if (value === "all") {
+														setUrlState({ mcp_tool_names: "" });
+													} else {
+														setUrlState({ mcp_tool_names: value });
+													}
+												}}
+												placeholder={t("labels.allTools")}
+												data-testid="dashboard-mcp-tool-filter"
+											/>
+										)}
+										{(mcpFilterData.server_labels?.length ?? 0) > 0 && (
+											<ModelFilterSelect
+												models={mcpFilterData.server_labels ?? []}
+												selectedModel={selectedMcpServerLabels.length === 1 ? selectedMcpServerLabels[0] : "all"}
+												onModelChange={(value) => {
+													if (value === "all") {
+														setUrlState({ mcp_server_labels: "" });
+													} else {
+														setUrlState({ mcp_server_labels: value });
+													}
+												}}
+												placeholder={t("labels.allServers")}
+												data-testid="dashboard-mcp-server-filter"
+											/>
+										)}
+									</div>
+								)}
+								<DateTimePickerWithRange
+									dateTime={dateRange}
+									onDateTimeUpdate={handleDateRangeChange}
+									preDefinedPeriods={TIME_PERIODS}
+									predefinedPeriod={urlState.period || undefined}
+									onPredefinedPeriodChange={handlePeriodChange}
+									triggerTestId="dashboard-filter-daterange"
+									className="flex-1 lg:flex-none"
+									buttonClassName="w-full lg:w-auto"
+									popupAlignment="end"
+									showTimezone
+									timezone={timezone}
+									onTimezoneChange={setTimezone}
+								/>
+							</div>
+						</div>
+						{/* Overview Tab */}
+						<TabsContent value="overview" {...(exportingAll && { forceMount: true })}>
+							<div id="dashboard-section-overview">
+								<OverviewTabView
+									ref={overviewRef}
+									filters={filters}
+									active={activeTab === "overview" || exportingAll}
+									startTime={urlState.start_time}
+									endTime={urlState.end_time}
+									volumeChartType={toChartType(urlState.volume_chart)}
+									tokenChartType={toChartType(urlState.token_chart)}
+									modelChartType={toChartType(urlState.model_chart)}
+									latencyChartType={toChartType(urlState.latency_chart)}
+									overheadChartType={toChartType(urlState.overhead_chart)}
+									throughputChartType={toChartType(urlState.throughput_chart)}
+									usageModel={urlState.usage_model}
+									onVolumeChartToggle={handleVolumeChartToggle}
+									onTokenChartToggle={handleTokenChartToggle}
+									onModelChartToggle={handleModelChartToggle}
+									onLatencyChartToggle={handleLatencyChartToggle}
+									onOverheadChartToggle={handleOverheadChartToggle}
+									onThroughputChartToggle={handleThroughputChartToggle}
+									onUsageModelChange={handleUsageModelChange}
+								/>
+							</div>
+						</TabsContent>
+
+						{/* Provider Usage Tab */}
+						<TabsContent value="provider-usage" {...(exportingAll && { forceMount: true })}>
+							<div id="dashboard-section-provider-usage">
+								<ProviderUsageTabView
+									ref={providerRef}
+									filters={filters}
+									active={activeTab === "provider-usage" || exportingAll}
+									startTime={urlState.start_time}
+									endTime={urlState.end_time}
+									providerTokenChartType={toChartType(urlState.provider_token_chart)}
+									providerLatencyChartType={toChartType(urlState.provider_latency_chart)}
+									providerThroughputChartType={toChartType(urlState.provider_throughput_chart)}
+									providerTokenProvider={urlState.provider_token_provider}
+									providerLatencyProvider={urlState.provider_latency_provider}
+									providerThroughputProvider={urlState.provider_throughput_provider}
+									onProviderTokenChartToggle={handleProviderTokenChartToggle}
+									onProviderLatencyChartToggle={handleProviderLatencyChartToggle}
+									onProviderThroughputChartToggle={handleProviderThroughputChartToggle}
+									onProviderTokenProviderChange={handleProviderTokenProviderChange}
+									onProviderLatencyProviderChange={handleProviderLatencyProviderChange}
+									onProviderThroughputProviderChange={handleProviderThroughputProviderChange}
+								/>
+							</div>
+						</TabsContent>
+
+						{/* Model Rankings Tab */}
+						<TabsContent value="rankings" {...(exportingAll && { forceMount: true })}>
+							<div id="dashboard-section-rankings">
+								<ModelRankingsTabView
+									ref={modelRankingsRef}
+									filters={filters}
+									active={activeTab === "rankings" || exportingAll}
+									startTime={urlState.start_time}
+									endTime={urlState.end_time}
+									pdfMode={isExportingTab("rankings")}
+								/>
+							</div>
+						</TabsContent>
+
+						{/* MCP Tab */}
+						<TabsContent value="mcp" {...(exportingAll && { forceMount: true })}>
+							<div id="dashboard-section-mcp">
+								<MCPTabView
+									ref={mcpRef}
+									filters={mcpFilters}
+									active={activeTab === "mcp" || exportingAll}
+									startTime={urlState.start_time}
+									endTime={urlState.end_time}
+									mcpVolumeChartType={toChartType(urlState.mcp_volume_chart)}
+									onMcpVolumeChartToggle={handleMcpVolumeChartToggle}
+								/>
+							</div>
+						</TabsContent>
+
+						{/* Business Unit Rankings Tab */}
+						<TabsContent value="bu-rankings" {...(exportingAll && { forceMount: true })}>
+							<div id="dashboard-section-bu-rankings">
+								<DimensionRankingsTabView
+									ref={buRankingsRef}
+									filters={filters}
+									active={activeTab === "bu-rankings" || exportingAll}
+									dimension="business_unit"
+									dimensionLabel={t("labels.businessUnit")}
+									testIdPrefix="dashboard-bu-rankings"
+									dataKey="buRankingsData"
+									pdfMode={isExportingTab("bu-rankings")}
+								/>
+							</div>
+						</TabsContent>
+
+						{/* Project Rankings Tab */}
+						<TabsContent value="project-rankings" {...(exportingAll && { forceMount: true })}>
+							<div id="dashboard-section-project-rankings">
+								<DimensionRankingsTabView
+									ref={projectRankingsRef}
+									filters={filters}
+									active={activeTab === "project-rankings" || exportingAll}
+									dimension="project"
+									dimensionLabel={t("labels.project")}
+									testIdPrefix="dashboard-project-rankings"
+									dataKey="projectRankingsData"
+									pdfMode={isExportingTab("project-rankings")}
+								/>
+							</div>
+						</TabsContent>
+
+						{/* User Rankings Tab */}
+						<TabsContent value="user-rankings" {...(exportingAll && { forceMount: true })}>
+							<div id="dashboard-section-user-rankings">
+								<DimensionRankingsTabView
+									ref={userRankingsRef}
+									filters={filters}
+									active={activeTab === "user-rankings" || exportingAll}
+									dimension="user"
+									dimensionLabel={t("labels.user")}
+									testIdPrefix="dashboard-user-rankings"
+									dataKey="userRankingsData"
+									pdfMode={isExportingTab("user-rankings")}
+								/>
+							</div>
+						</TabsContent>
+
+						{/* Virtual Key Rankings Tab */}
+						<TabsContent value="virtual-key-rankings" {...(exportingAll && { forceMount: true })}>
+							<div id="dashboard-section-virtual-key-rankings">
+								<DimensionRankingsTabView
+									ref={virtualKeyRankingsRef}
+									filters={filters}
+									active={activeTab === "virtual-key-rankings" || exportingAll}
+									dimension="virtual_key"
+									dimensionLabel={t("labels.virtualKey")}
+									testIdPrefix="dashboard-virtual-key-rankings"
+									dataKey="virtualKeyRankingsData"
+									pdfMode={isExportingTab("virtual-key-rankings")}
+								/>
+							</div>
+						</TabsContent>
+						{/* App Rankings Tab */}
+						<TabsContent value="app-rankings" {...(isExportingTab("app-rankings") && { forceMount: true })}>
+							<div id="dashboard-section-app-rankings">
+								<DimensionRankingsTabView
+									ref={appRankingsRef}
+									filters={filters}
+									active={activeTab === "app-rankings" || isExportingTab("app-rankings")}
+									dimension="app"
+									dimensionLabel={t("labels.app")}
+									testIdPrefix="dashboard-app-rankings"
+									dataKey="appRankingsData"
+									pdfMode={isExportingTab("app-rankings")}
+								/>
+							</div>
+						</TabsContent>
+					</Tabs>
+				</div>
+			</ScrollArea>
+		</div>
+	);
+}
