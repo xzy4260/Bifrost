@@ -27,22 +27,27 @@
   # Set environment for CGO-enabled build (required for go-sqlite3)
   ENV CGO_ENABLED=1 GOOS=linux
 
-  COPY transports/go.mod transports/go.sum ./
-  RUN ls
-  RUN cat go.mod
-  RUN go mod download
+  # The module replaces core, framework and the resolver plugin with the local
+  # copies, so the whole workspace is copied, not just the transport module.
+  COPY core/ ./core/
+  COPY framework/ ./framework/
+  COPY plugins/ ./plugins/
+  COPY transports/ ./transports/
 
-  # Copy source code and dependencies
-  COPY transports/ ./
+  # The UI the transport embeds.
+  COPY --from=ui-builder /app/out ./transports/bifrost-http/ui
 
-  COPY --from=ui-builder /app/out ./bifrost-http/ui
+  WORKDIR /app/transports
 
   # Build the binary with CGO enabled and static SQLite linking
   ENV GOWORK=off
+  # Registry access can be unreliable from this host; a mirror keeps the module
+  # download from stalling in the build.
+  ENV GOPROXY=https://goproxy.cn,https://proxy.golang.org,direct
   ARG VERSION=unknown
   RUN go build \
     -ldflags="-w -s -X main.Version=v${VERSION} -extldflags '-static'" \
-    -a -trimpath \
+    -trimpath \
     -tags "sqlite_static" \
     -o /app/main \
     ./bifrost-http
@@ -63,7 +68,7 @@
 
   # Create data directory and set up user
   COPY --from=builder /app/main .
-  COPY --from=builder /app/docker-entrypoint.sh .
+  COPY --from=builder /app/transports/docker-entrypoint.sh .
 
   # Getting arguments
   ARG ARG_APP_PORT=8080
