@@ -63,7 +63,7 @@ docker run -p 8080:8080 -v "$PWD/data:/app/data" bifrost:1.0.1
 | `plugins/` | 内置插件（治理、日志、模型目录解析等） |
 | `transports/` | HTTP 传输层与内嵌前端产物 |
 | `ui/` | 管理界面（React + Vite） |
-| `tests/`、`examples/`、`docs/` | 上游保留的测试、示例与文档（文档中的大体积演示媒体未包含） |
+| `tests/`、`examples/` | 上游保留的测试与示例（文档站 `docs/` 已删除） |
 
 ## 上游与原作者
 

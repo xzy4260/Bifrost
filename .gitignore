@@ -17,7 +17,6 @@ private
 private.*
 
 # Heavy upstream demo media, not shipped in this fork
-docs/media/
 
 # Enterprise
 ui/app/enterprise

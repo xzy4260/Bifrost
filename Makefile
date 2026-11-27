@@ -67,7 +67,7 @@ define EXPOSE_ENV
 	fi
 endef
 
-.PHONY: test-memory all help dev dev-pulse build-ui build build-cli run run-cli install-air install-pulse clean test test-cli install-ui setup-workspace work-init work-clean docs docker-image docker-run cleanup-enterprise mod-tidy test-integrations test-integrations-py test-integrations-ts install-playwright run-e2e run-a11y-audit run-e2e-ui run-e2e-headed e2e-ui-down run-e2e-api run-mcp-codemode-test run-warp-test format ui install-newman run-provider-harness-test smoke-provider-harness-test run-cli-harness-test cli-harness-report test-harness-runner-lib run-video-costing-test list-video-costing-cases test-semantic-cache test-semantic-cache-complete _test-semantic-cache-complete-inner helm-index install-microsocks socks5-proxy install-tinyproxy http-proxy install-squid install-stunnel run-e2e-api-proxy run-mcp-harness-test run-log-store-matrix
+.PHONY: test-memory all help dev dev-pulse build-ui build build-cli run run-cli install-air install-pulse clean test test-cli install-ui setup-workspace work-init work-clean docker-image docker-run cleanup-enterprise mod-tidy test-integrations test-integrations-py test-integrations-ts install-playwright run-e2e run-a11y-audit run-e2e-ui run-e2e-headed e2e-ui-down run-e2e-api run-mcp-codemode-test format ui install-newman run-provider-harness-test smoke-provider-harness-test run-cli-harness-test cli-harness-report test-harness-runner-lib run-video-costing-test list-video-costing-cases test-semantic-cache test-semantic-cache-complete _test-semantic-cache-complete-inner helm-index install-microsocks socks5-proxy install-tinyproxy http-proxy install-squid install-stunnel run-e2e-api-proxy run-mcp-harness-test run-log-store-matrix
 
 all: help
 
@@ -498,12 +498,6 @@ docker-run: ## Run Docker container (Usage: make docker-run [CONFIG=path/to/conf
 		CONFIG_MOUNT=""; \
 	fi; \
 	docker run -e APP_PORT=$(PORT) -e APP_HOST=0.0.0.0 -p $(PORT):$(PORT) -e LOG_LEVEL=$(LOG_LEVEL) -e LOG_STYLE=$(LOG_STYLE) -v $(shell pwd):/app/data $$CONFIG_MOUNT bifrost
-
-docs: ## Prepare local docs (bundles OpenAPI spec then starts Mintlify dev server)
-	@$(ECHO) "$(GREEN)Bundling OpenAPI spec...$(NC)"
-	@cd docs/openapi && python3 bundle.py
-	@$(ECHO) "$(GREEN)Preparing local docs...$(NC)"
-	@cd docs && npx --yes mintlify@latest dev
 
 run: build ## Build and run bifrost-http (no hot reload)
 	@$(ECHO) "$(GREEN)Running bifrost-http...$(NC)"
@@ -1871,22 +1865,6 @@ run-log-store-matrix: ## Relay and LLM log permutation matrix on every log store
 	fi; \
 	BIFROST_E2E_POSTGRES_URL="$(POSTGRES_URL)" node tests/e2e/api/runners/run-log-store-matrix.mjs --binary "$$BINARY" \
 		$(if $(CELLS),--cells "$(CELLS)") $(if $(SUITES),--suites "$(SUITES)") $(if $(PARALLEL),--parallel "$(PARALLEL)") $(if $(SKIP_CONTENT_MATRIX),--skip-content-matrix)
-
-run-warp-test: install-newman ## Run the Warp E2E suite: boots Bifrost on a throwaway Postgres DB, seeds it (tests/cmd/seed/warpseed) and asks Warp questions with a live model. Needs OPENAI_API_KEY (or WARP_UPSTREAM_BIFROST=<url> to use a running Bifrost's key), Postgres and Weaviate (tests/docker-compose.yml). Builds tmp/bifrost-http unless BINARY is given (Usage: make run-warp-test [BINARY=path/to/bifrost-http] [FOLDER="Guardrails"] [WARP_UPSTREAM_BIFROST=http://localhost:8080] [WEAVIATE_HOST=localhost:9000] [POSTGRES_PORT=5432] [USE_INFISICAL=1])
-	@$(EXPOSE_ENV); \
-	BINARY="$(BINARY)"; \
-	if [ -z "$$BINARY" ]; then \
-		$(MAKE) build LOCAL=1 || exit 1; \
-		BINARY=tmp/bifrost-http; \
-	fi; \
-	if [ ! -x "$$BINARY" ]; then \
-		$(ECHO) "$(RED)Error: bifrost-http binary not found or not executable: $$BINARY$(NC)"; \
-		exit 1; \
-	fi; \
-	BINARY="$$(cd "$$(dirname "$$BINARY")" && pwd)/$$(basename "$$BINARY")"; \
-	$(ECHO) "$(GREEN)Running Warp E2E tests against $$BINARY...$(NC)"; \
-	./tests/e2e/api/runners/individual/run-newman-warp-tests.sh --binary "$$BINARY" $(if $(FOLDER),--folder "$(FOLDER)",)
-
 # Quick start with example config
 quick-start: ## Quick start with example config and maxim plugin
 	@$(ECHO) "$(GREEN)Quick starting Bifrost with example configuration...$(NC)"
