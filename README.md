@@ -48,7 +48,7 @@ docker build --build-arg VERSION=1.0.0 -f transports/Dockerfile -t bifrost:1.0.0
 docker run -p 8080:8080 -v "$PWD/data:/app/data" bifrost:1.0.0
 ```
 
-> 说明：本仓库的维护环境没有安装 Docker，因此未发布现成镜像；上面的命令可在任意装有 Docker 的机器上自行构建。若需要镜像，可以推送到自己的仓库，例如 `ghcr.io/xzy4260/bifrost:1.0.0`。
+> 也可以直接使用已发布镜像：`docker pull ghcr.io/xzy4260/bifrost:1.0.0`。
 
 ## 配置
 
@@ -65,9 +65,22 @@ docker run -p 8080:8080 -v "$PWD/data:/app/data" bifrost:1.0.0
 | `ui/` | 管理界面（React + Vite） |
 | `tests/`、`examples/`、`docs/` | 上游保留的测试、示例与文档（文档中的大体积演示媒体未包含） |
 
-## 上游与许可
+## 上游与原作者
 
-本项目基于 [maximhq/bifrost](https://github.com/maximhq/bifrost) 修改，遵循 [Apache License 2.0](./LICENSE)。原始版权归上游作者所有；本仓库仅包含个人使用所需的修改。
+- 原仓库：[maximhq/bifrost](https://github.com/maximhq/bifrost)
+- 原作者：Maxim AI（GitHub 组织 [maximhq](https://github.com/maximhq)）及 Bifrost 社区贡献者
+- 本项目是其衍生修改版，遵循 [Apache License 2.0](./LICENSE)，原始版权归原作者所有；本仓库仅包含个人使用所需的修改。
+
+## 发行版与镜像
+
+- 编译产物（二进制）通过 GitHub Releases 发布：<https://github.com/xzy4260/Bifrost/releases>
+- 容器镜像通过 GitHub Packages（ghcr.io）发布：`ghcr.io/xzy4260/bifrost:1.0.0`
+
+```bash
+docker pull ghcr.io/xzy4260/bifrost:1.0.0
+```
+
+> 仓库中不存放编译产物与镜像层，源码仓库只保留代码。
 
 ## Issues
 
