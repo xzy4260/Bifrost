@@ -994,11 +994,15 @@ export interface ConcurrencyKeyStat {
 	// Masked key value; empty for requests that carried no virtual key.
 	value: string;
 	active: number;
+	// Live output token rate of this key's in-flight streams (tokens/sec).
+	tokens_per_second: number;
 }
 
 // GET /api/concurrency payload: the live in-flight request count.
 export interface ConcurrencyResponse {
 	total: number;
+	// Live output token rate across every in-flight stream (tokens/sec).
+	tokens_per_second: number;
 	keys: ConcurrencyKeyStat[];
 }
 

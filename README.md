@@ -10,7 +10,7 @@
 - **模型即删即下线**：在模型目录删除某个模型后，该模型会从路由目录中移除，带不带 provider 前缀的请求都无法再调用它；重新添加或编辑该模型即可恢复。
 - **界面汉化**：模型目录的上下文窗口 / 最大输出筛选、删除确认，以及设置页的功能开关名称与描述均提供中文。
 - **Warp 调整**：内置提示词改为个人版说明，去掉了官方文档、Discord 与官方仓库链接，反馈入口指向本仓库。
-- **右上角入口精简**：只保留 GitHub 与反馈，版本号从 `v1.0.1` 起。
+- **右上角入口精简**：只保留 GitHub 与反馈，版本号从 `v1.0.2` 起。
 
 ## 快速开始
 
@@ -35,7 +35,7 @@ go run ./bifrost-http -app-dir ./data -port 8080
 cd ui && npm install && npm run build && npm run copy-build
 cd ../transports
 CGO_ENABLED=1 go build -trimpath \
-  -ldflags "-s -w -X main.Version=v1.0.1" \
+  -ldflags "-s -w -X main.Version=v1.0.2" \
   -o ../dist/bifrost-http ./bifrost-http
 ```
 
@@ -44,11 +44,11 @@ CGO_ENABLED=1 go build -trimpath \
 仓库自带 [transports/Dockerfile](./transports/Dockerfile)，多阶段构建（Node 构建前端 + Go 编译）：
 
 ```bash
-docker build --build-arg VERSION=1.0.1 -f transports/Dockerfile -t bifrost:1.0.1 .
-docker run -p 8080:8080 -v "$PWD/data:/app/data" bifrost:1.0.1
+docker build --build-arg VERSION=1.0.2 -f transports/Dockerfile -t bifrost:1.0.2 .
+docker run -p 8080:8080 -v "$PWD/data:/app/data" bifrost:1.0.2
 ```
 
-> 也可以直接使用已发布镜像：`docker pull ghcr.io/xzy4260/bifrost:1.0.1`。
+> 也可以直接使用已发布镜像：`docker pull ghcr.io/xzy4260/bifrost:1.0.2`。
 
 ## 配置
 
@@ -74,10 +74,10 @@ docker run -p 8080:8080 -v "$PWD/data:/app/data" bifrost:1.0.1
 ## 发行版与镜像
 
 - 编译产物（二进制）通过 GitHub Releases 发布：<https://github.com/xzy4260/Bifrost/releases>
-- 容器镜像通过 GitHub Packages（ghcr.io）发布：`ghcr.io/xzy4260/bifrost:1.0.1`
+- 容器镜像通过 GitHub Packages（ghcr.io）发布：`ghcr.io/xzy4260/bifrost:1.0.2`
 
 ```bash
-docker pull ghcr.io/xzy4260/bifrost:1.0.1
+docker pull ghcr.io/xzy4260/bifrost:1.0.2
 ```
 
 > 仓库中不存放编译产物与镜像层，源码仓库只保留代码。

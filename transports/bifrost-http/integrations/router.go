@@ -2993,7 +2993,9 @@ func (g *GenericRouter) handleStreaming(ctx *fasthttp.RequestCtx, bifrostCtx *sc
 	// which batches multiple SSE events into single TCP segments.
 	reader := lib.NewTrackedSSEStreamReader(ctx)
 	ctx.Response.SetBodyStream(reader, -1)
-
+	// The slot the reader releases at end of stream also carries this request's
+	// output-token counter, for the dashboard's live toks/s figure.
+	tokenSlot := lib.ConcurrencySlotFrom(ctx)
 	// Producer goroutine: processes the stream channel, formats events, sends to reader
 	go func() {
 		// Transport-side overhead split (streaming): (B) outbound convert+marshal CPU
@@ -3227,6 +3229,7 @@ func (g *GenericRouter) handleStreaming(ctx *fasthttp.RequestCtx, bifrostCtx *sc
 						continue
 					}
 				}
+				tokenSlot.AddTokens(lib.EstimateStreamOutputTokens(chunk))
 				// Handle successful responses
 				// Convert response to integration-specific streaming format
 				var eventType string

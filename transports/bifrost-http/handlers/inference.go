@@ -2398,6 +2398,9 @@ func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bi
 	// Each event is delivered individually via a channel, ensuring one HTTP chunk per event.
 	reader := lib.NewTrackedSSEStreamReader(ctx)
 	ctx.Response.SetBodyStream(reader, -1)
+	// The same slot the reader releases at end of stream also carries this
+	// request's output-token counter, so the dashboard can show a live toks/s.
+	tokenSlot := lib.ConcurrencySlotFrom(ctx)
 	// Producer goroutine: processes the stream channel, formats SSE events, sends to reader
 	go func() {
 		var transportLogs []schemas.PluginLogEntry
@@ -2565,6 +2568,7 @@ func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bi
 				}
 			}
 
+			tokenSlot.AddTokens(lib.EstimateStreamOutputTokens(chunk))
 			// Convert response to JSON (transport-goroutine CPU).
 			cpuStart := time.Now()
 			chunkJSON, err := sonic.Marshal(chunk)

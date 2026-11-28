@@ -204,7 +204,14 @@ function OverviewTabImpl({
 					loading={loadingConcurrency}
 					testId="chart-concurrency"
 					totalLabel={t("labels.total")}
-					total={concurrency ? <NumberFlow value={concurrency.total} format={COMPACT_NUMBER_FORMAT} /> : undefined}
+					total={
+						concurrency ? (
+							<span className="flex items-baseline gap-2">
+								<NumberFlow value={concurrency.total} format={COMPACT_NUMBER_FORMAT} />
+								<span className="text-muted-foreground text-xs font-normal">{formatTokensPerSecond(concurrency.tokens_per_second)}</span>
+							</span>
+						) : undefined
+					}
 					totalTooltip={concurrency ? concurrency.total.toLocaleString(getLocale()) : undefined}
 				>
 					{concurrencyKeys.length === 0 ? (
@@ -225,7 +232,10 @@ function OverviewTabImpl({
 										</span>
 										{key.value && <span className="text-muted-foreground truncate font-mono text-xs">{key.value}</span>}
 									</span>
-									<span className="shrink-0 font-semibold tabular-nums">{key.active}</span>
+									<span className="flex shrink-0 items-baseline gap-2">
+										<span className="font-semibold tabular-nums">{key.active}</span>
+										<span className="text-muted-foreground text-xs tabular-nums">{formatTokensPerSecond(key.tokens_per_second)}</span>
+									</span>
 								</div>
 							))}
 						</div>

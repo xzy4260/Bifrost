@@ -11,8 +11,9 @@ import (
 // streaming handler claims the slot first so the release waits for the stream
 // to finish instead.
 type ConcurrencySlot struct {
-	claimed atomic.Bool
-	release func()
+	claimed   atomic.Bool
+	release   func()
+	addTokens func(int)
 }
 
 // Claim takes ownership of the release and returns it, so the caller can run it
@@ -20,6 +21,15 @@ type ConcurrencySlot struct {
 func (s *ConcurrencySlot) Claim() func() {
 	s.claimed.Store(true)
 	return s.release
+}
+
+// AddTokens reports the output tokens a streamed chunk added to this request, so
+// the live token rate can be attributed to the caller's virtual key.
+func (s *ConcurrencySlot) AddTokens(n int) {
+	if s == nil || s.addTokens == nil || n <= 0 {
+		return
+	}
+	s.addTokens(n)
 }
 
 // Claimed reports whether a streaming handler took over the release.
@@ -48,7 +58,8 @@ func ConcurrencySlotFrom(ctx *fasthttp.RequestCtx) *ConcurrencySlot {
 	return slot
 }
 
-// NewConcurrencySlot builds a slot around release.
-func NewConcurrencySlot(release func()) *ConcurrencySlot {
-	return &ConcurrencySlot{release: release}
+// NewConcurrencySlot builds a slot around release. addTokens may be nil; the
+// tracker passes it so streamed chunks can report their output tokens.
+func NewConcurrencySlot(release func(), addTokens func(int)) *ConcurrencySlot {
+	return &ConcurrencySlot{release: release, addTokens: addTokens}
 }
