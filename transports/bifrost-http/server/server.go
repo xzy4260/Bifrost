@@ -309,13 +309,13 @@ type BifrostHTTPServer struct {
 	wsSpeechHandler      *handlers.WSSpeechSessionHandler
 	webrtcLiveHandler    *handlers.WebRTCLiveHandler
 
-	AuthMiddleware       *handlers.AuthMiddleware
-	setupLockInstalled   bool // OSS setup-lock gate guards /api (see AuthMiddleware.SetupLockMiddleware); never set on enterprise
-	CORSMiddleware       *handlers.CorsMiddleware
-	TracingMiddleware    *handlers.TracingMiddleware
+	AuthMiddleware     *handlers.AuthMiddleware
+	setupLockInstalled bool // OSS setup-lock gate guards /api (see AuthMiddleware.SetupLockMiddleware); never set on enterprise
+	CORSMiddleware     *handlers.CorsMiddleware
+	TracingMiddleware  *handlers.TracingMiddleware
 	// ConcurrencyTracker counts in-flight inference requests per virtual key; it
 	// backs the dashboard's live concurrency card.
-	ConcurrencyTracker *handlers.ConcurrencyTracker
+	ConcurrencyTracker   *handlers.ConcurrencyTracker
 	WSTicketStore        *handlers.WSTicketStore
 	TempTokens           *temptoken.Service
 	TempTokenSweepWorker *temptoken.SweepWorker
@@ -345,7 +345,7 @@ type BifrostHTTPServer struct {
 	// VirtualKeyBusinessUnitResolver names each VK's owning business unit on the
 	// governance read paths. Nil on OSS builds; set by the enterprise wrapper.
 	VirtualKeyBusinessUnitResolver handlers.VirtualKeyBusinessUnitResolver
-	SidekiqRunner *sidekiq.Runner
+	SidekiqRunner                  *sidekiq.Runner
 	// GovernanceHandler is kept so the expired-key cleanup scheduler can be started and stopped.
 	GovernanceHandler     *handlers.GovernanceHandler
 	SidekiqDispatcherStop func()
@@ -3927,7 +3927,18 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 	// The concurrency tracker must exist before the API routes are registered: the
 	// dashboard's live concurrency card reads GET /api/concurrency, and the
 	// inference chain below counts every request through it.
-	s.ConcurrencyTracker = handlers.NewConcurrencyTracker()
+	// The tracker resolves each key's max_concurrency; a nil store (persistence
+	// off) keeps every key unlimited while the dashboard still counts requests.
+	var concurrencyStore configstore.ConfigStore
+	if s.Config != nil {
+		concurrencyStore = s.Config.ConfigStore
+	}
+	s.ConcurrencyTracker = handlers.NewConcurrencyTracker(concurrencyStore)
+	if s.GovernanceHandler != nil {
+		// Share the tracker so a max_concurrency edit applies on the next request
+		// rather than after the tracker's limit cache expires.
+		s.GovernanceHandler.SetConcurrencyTracker(s.ConcurrencyTracker)
+	}
 	err = s.RegisterAPIRoutes(s.Ctx, s, apiMiddlewares...)
 	if err != nil {
 		s.CloseAgentGateway()

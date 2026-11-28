@@ -1669,34 +1669,285 @@ func (r *OpenAITranscriptionRequest) IsStreamingRequested() bool {
 	return r.Stream != nil && *r.Stream
 }
 
-// JSONInt decodes a JSON number that may be fractional or quoted, rounding to
-// the nearest integer. Providers report context windows as 1048576.0 and a few
+// tokenCountSeparators strips the thousands separators some providers put in
+// numeric strings ("128,000", "128 000").
+var tokenCountSeparators = strings.NewReplacer(",", "", "_", "", " ", "")
+
+// tokenCountObjectKeys are the object keys a token limit may be nested under,
+// in the order they are trusted: an explicit default wins over a maximum, and a
+// window named "context" wins over a generic "limit".
+var tokenCountObjectKeys = []string{
+	"default",
+	"value",
+	"tokens",
+	"context",
+	"context_window",
+	"context_window_tokens",
+	"context_length",
+	"max_context_length",
+	"max_model_len",
+	"max",
+	"maximum",
+	"max_input_tokens",
+	"max_output_tokens",
+	"output",
+	"input",
+	"limit",
+	"size",
+	"max_allowed_size",
+}
+
+// parseTokenCount decodes a token count from any shape compatible servers use:
+// a number (possibly fractional), a numeric string, an object carrying the
+// count under a known key or listing the supported sizes, or an array of sizes.
+// Anything unreadable, zero or negative is treated as absent so one odd row
+// cannot fail a whole list-models call.
+func parseTokenCount(value gjson.Result) (int, bool) {
+	switch value.Type {
+	case gjson.Number:
+		return positiveTokenCount(value.Float())
+	case gjson.String:
+		return parseTokenCountString(value.String())
+	case gjson.JSON:
+		if value.IsObject() {
+			for _, key := range tokenCountObjectKeys {
+				if count, ok := parseTokenCount(findModelField(value, key)); ok {
+					return count, true
+				}
+			}
+			// A window that only advertises the sizes it supports still tells us
+			// the largest one; take it rather than reporting nothing.
+			if supported := findModelField(value, "supported", "supported_sizes", "sizes", "values"); supported.IsArray() {
+				return largestTokenCount(supported)
+			}
+			return 0, false
+		}
+		if value.IsArray() {
+			return largestTokenCount(value)
+		}
+	}
+	return 0, false
+}
+
+// parseTokenCountString reads a numeric string, accepting the "128k"/"1M"
+// shorthand and thousands separators.
+func parseTokenCountString(raw string) (int, bool) {
+	raw = tokenCountSeparators.Replace(strings.TrimSpace(raw))
+	if raw == "" {
+		return 0, false
+	}
+	multiplier := 1.0
+	switch raw[len(raw)-1] {
+	case 'k', 'K':
+		multiplier, raw = 1_000, raw[:len(raw)-1]
+	case 'm', 'M':
+		multiplier, raw = 1_000_000, raw[:len(raw)-1]
+	}
+	f, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil {
+		return 0, false
+	}
+	return positiveTokenCount(f * multiplier)
+}
+
+// positiveTokenCount rounds and rejects values no model could report.
+func positiveTokenCount(f float64) (int, bool) {
+	if math.IsNaN(f) || math.IsInf(f, 0) || f <= 0 {
+		return 0, false
+	}
+	count := int(math.Round(f))
+	if count <= 0 {
+		return 0, false
+	}
+	return count, true
+}
+
+// largestTokenCount returns the biggest readable element of an array of sizes.
+func largestTokenCount(values gjson.Result) (int, bool) {
+	largest, found := 0, false
+	for _, item := range values.Array() {
+		if count, ok := parseTokenCount(item); ok && count > largest {
+			largest, found = count, true
+		}
+	}
+	return largest, found
+}
+
+// findModelField looks a key up case-insensitively and ignoring underscores:
+// providers disagree on snake_case versus camelCase for the same limit.
+func findModelField(block gjson.Result, names ...string) gjson.Result {
+	if !block.IsObject() {
+		return gjson.Result{}
+	}
+	found := gjson.Result{}
+	block.ForEach(func(key, value gjson.Result) bool {
+		name := normalizeModelFieldKey(key.String())
+		for _, candidate := range names {
+			if name == normalizeModelFieldKey(candidate) {
+				found = value
+				return false
+			}
+		}
+		return true
+	})
+	return found
+}
+
+// normalizeModelFieldKey folds a field name's case and separators so
+// "max_output_tokens", "maxOutputTokens" and "maxoutputtokens" compare equal.
+func normalizeModelFieldKey(name string) string {
+	return strings.ToLower(tokenCountSeparators.Replace(name))
+}
+
+// firstTokenCount returns the first readable count among the named fields of
+// block, or false when the block does not carry one.
+func firstTokenCount(block gjson.Result, names ...string) (int, bool) {
+	for _, name := range names {
+		if count, ok := parseTokenCount(findModelField(block, name)); ok {
+			return count, true
+		}
+	}
+	return 0, false
+}
+
+// modelContextLengthFields are the top-level names for the context window.
+var modelContextLengthFields = []string{
+	"context_length",
+	"context_size",
+	"max_context_length",
+	"max_model_len",
+	"max_context_tokens",
+	"context_window_tokens",
+	"max_input_tokens",
+	"input_token_limit",
+}
+
+// modelLimitsContextFields are the names a nested limit block may use for the
+// window. Singular "limit" and plural "limits" both appear upstream.
+var modelLimitsContextFields = []string{
+	"context",
+	"context_window",
+	"context_window_tokens",
+	"context_length",
+	"context_size",
+	"max_context_length",
+	"max_model_len",
+	"max_input_tokens",
+	"input",
+}
+
+// modelOutputFields are the top-level names for the output-token ceiling.
+var modelOutputFields = []string{
+	"max_output_tokens",
+	"max_completion_tokens",
+	"max_tokens",
+	"output_token_limit",
+	"max_output_length",
+	"max_new_tokens",
+}
+
+// modelLimitsOutputFields are the names a nested limit block may use for the
+// output ceiling.
+var modelLimitsOutputFields = []string{
+	"output",
+	"max_output_tokens",
+	"max_completion_tokens",
+	"max_tokens",
+	"max_new_tokens",
+}
+
+// extractContextLength reads the model's total context window from a raw model
+// object, falling back through every name compatible servers use for it.
+func extractContextLength(root gjson.Result) (int, bool) {
+	if count, ok := parseTokenCount(findModelField(root, "context_window")); ok {
+		return count, true
+	}
+	if count, ok := firstTokenCount(root, modelContextLengthFields...); ok {
+		return count, true
+	}
+	for _, blockName := range []string{"limit", "limits"} {
+		if block := findModelField(root, blockName); block.Exists() {
+			if count, ok := firstTokenCount(block, modelLimitsContextFields...); ok {
+				return count, true
+			}
+		}
+	}
+	if block := findModelField(root, "top_provider"); block.Exists() {
+		if count, ok := firstTokenCount(block, "context_length", "max_context_length", "context_window"); ok {
+			return count, true
+		}
+	}
+	if block := findModelField(root, "metadata"); block.Exists() {
+		if count, ok := firstTokenCount(block, "context_length", "max_context_length", "context_window"); ok {
+			return count, true
+		}
+	}
+	// Ollama nests the window in model_info under "<architecture>.context_length".
+	if info := findModelField(root, "model_info"); info.IsObject() {
+		largest, found := 0, false
+		info.ForEach(func(key, value gjson.Result) bool {
+			name := normalizeModelFieldKey(key.String())
+			if !strings.HasSuffix(name, ".contextlength") && !strings.HasSuffix(name, ".contextsize") && name != "contextlength" && name != "contextsize" {
+				return true
+			}
+			if count, ok := parseTokenCount(value); ok && count > largest {
+				largest, found = count, true
+			}
+			return true
+		})
+		if found {
+			return largest, true
+		}
+	}
+	// llama.cpp reports the trained window under meta.
+	if meta := findModelField(root, "meta"); meta.Exists() {
+		if count, ok := firstTokenCount(meta, "n_ctx_train", "n_ctx", "n_ctx_max"); ok {
+			return count, true
+		}
+	}
+	// Last resorts: the request-size ceiling some gateways report, and raw
+	// llama.cpp/transformers keys.
+	return firstTokenCount(root, "max_allowed_size", "n_ctx_train", "n_ctx", "max_position_embeddings")
+}
+
+// extractMaxOutputTokens reads the model's output-token ceiling from a raw
+// model object.
+func extractMaxOutputTokens(root gjson.Result) (int, bool) {
+	if count, ok := firstTokenCount(root, modelOutputFields...); ok {
+		return count, true
+	}
+	for _, blockName := range []string{"limit", "limits"} {
+		if block := findModelField(root, blockName); block.Exists() {
+			if count, ok := firstTokenCount(block, modelLimitsOutputFields...); ok {
+				return count, true
+			}
+		}
+	}
+	if block := findModelField(root, "top_provider"); block.Exists() {
+		if count, ok := firstTokenCount(block, "max_completion_tokens", "max_output_tokens", "max_tokens"); ok {
+			return count, true
+		}
+	}
+	if block := findModelField(root, "metadata"); block.Exists() {
+		if count, ok := firstTokenCount(block, "max_output_tokens", "max_completion_tokens"); ok {
+			return count, true
+		}
+	}
+	return 0, false
+}
+
+// JSONInt decodes a JSON number that may be fractional, quoted, or wrapped in
+// the object/array shapes literal-wise limits arrive in, rounding to the
+// nearest integer. Providers report context windows as 1048576.0 and a few
 // report them as strings; decoding straight into an int would fail the whole
 // list-models call over one such row.
 type JSONInt int
 
 func (n *JSONInt) UnmarshalJSON(data []byte) error {
-	trimmed := bytes.TrimSpace(data)
-	if len(trimmed) == 0 || string(trimmed) == "null" {
-		return nil
+	if count, ok := parseTokenCount(gjson.ParseBytes(data)); ok {
+		*n = JSONInt(count)
 	}
-	if trimmed[0] == '"' {
-		var s string
-		if err := sonic.Unmarshal(trimmed, &s); err != nil {
-			return err
-		}
-		s = strings.TrimSpace(s)
-		if s == "" {
-			return nil
-		}
-		trimmed = []byte(s)
-	}
-	f, err := strconv.ParseFloat(string(trimmed), 64)
-	if err != nil {
-		// A value we cannot read is treated as absent rather than failing the row.
-		return nil
-	}
-	*n = JSONInt(math.Round(f))
+	// A value we cannot read is treated as absent rather than failing the row.
 	return nil
 }
 
@@ -1749,13 +2000,24 @@ type OpenAIModel struct {
 
 	// OpenRouter nests the ceiling under top_provider.
 	TopProvider *OpenAIModelTopProvider `json:"top_provider,omitempty"`
+
+	// The limits the raw payload reported under any of the names compatible
+	// servers use, resolved once at decode time. Unexported: they are an input
+	// detail, and the wire shape stays context_window / max_output_tokens.
+	parsedContextLength   *int
+	parsedMaxOutputTokens *int
 }
 
 // OpenAIModelLimits is the nested limits block some compatible servers return
 // instead of the top-level window fields.
 type OpenAIModelLimits struct {
+	Context             *JSONInt `json:"context,omitempty"`
+	Output              *JSONInt `json:"output,omitempty"`
+	Input               *JSONInt `json:"input,omitempty"`
 	ContextWindow       *JSONInt `json:"context_window,omitempty"`
 	ContextLength       *JSONInt `json:"context_length,omitempty"`
+	MaxContextLength    *JSONInt `json:"max_context_length,omitempty"`
+	MaxInputTokens      *JSONInt `json:"max_input_tokens,omitempty"`
 	MaxOutputTokens     *JSONInt `json:"max_output_tokens,omitempty"`
 	MaxCompletionTokens *JSONInt `json:"max_completion_tokens,omitempty"`
 }
@@ -1766,29 +2028,63 @@ type OpenAIModelTopProvider struct {
 	MaxCompletionTokens *JSONInt `json:"max_completion_tokens,omitempty"`
 }
 
+// UnmarshalJSON decodes the modelled fields and records the limits the raw
+// payload reported under any alias, including the shapes the typed fields
+// cannot hold (context_window objects, singular limit blocks, meta/model_info).
+func (model *OpenAIModel) UnmarshalJSON(data []byte) error {
+	type alias OpenAIModel
+	var decoded alias
+	if err := sonic.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*model = OpenAIModel(decoded)
+
+	root := gjson.ParseBytes(data)
+	if count, ok := extractContextLength(root); ok {
+		model.parsedContextLength = &count
+	}
+	if count, ok := extractMaxOutputTokens(root); ok {
+		model.parsedMaxOutputTokens = &count
+	}
+	return nil
+}
+
 // EffectiveContextLength is the model's context window, falling back through
-// the names compatible servers use for it.
+// the names compatible servers use for it. Zero and negative values are
+// treated as absent: a field present with no readable number must not shadow a
+// later alias.
 func (model *OpenAIModel) EffectiveContextLength() *int {
 	if model == nil {
 		return nil
 	}
-	switch {
-	case model.ContextWindow != nil:
-		return model.ContextWindow.IntPtr()
-	case model.ContextLength != nil:
-		return model.ContextLength.IntPtr()
-	case model.ContextSize != nil:
-		return model.ContextSize.IntPtr()
-	case model.MaxContextLength != nil:
-		return model.MaxContextLength.IntPtr()
-	case model.MaxModelLen != nil:
-		return model.MaxModelLen.IntPtr()
-	case model.Limits != nil && model.Limits.ContextWindow != nil:
-		return model.Limits.ContextWindow.IntPtr()
-	case model.Limits != nil && model.Limits.ContextLength != nil:
-		return model.Limits.ContextLength.IntPtr()
-	case model.TopProvider != nil:
-		return model.TopProvider.ContextLength.IntPtr()
+	if model.parsedContextLength != nil {
+		if count := *model.parsedContextLength; count > 0 {
+			return &count
+		}
+	}
+	candidates := []*JSONInt{
+		model.ContextWindow,
+		model.ContextLength,
+		model.ContextSize,
+		model.MaxContextLength,
+		model.MaxModelLen,
+	}
+	if model.Limits != nil {
+		candidates = append(candidates,
+			model.Limits.Context,
+			model.Limits.ContextWindow,
+			model.Limits.ContextLength,
+			model.Limits.MaxContextLength,
+			model.Limits.MaxInputTokens,
+		)
+	}
+	if model.TopProvider != nil {
+		candidates = append(candidates, model.TopProvider.ContextLength)
+	}
+	for _, candidate := range candidates {
+		if count := positiveTokenCountValue(candidate); count != nil {
+			return count
+		}
 	}
 	return nil
 }
@@ -1799,21 +2095,45 @@ func (model *OpenAIModel) EffectiveMaxOutputTokens() *int {
 	if model == nil {
 		return nil
 	}
-	switch {
-	case model.MaxOutputTokens != nil:
-		return model.MaxOutputTokens.IntPtr()
-	case model.MaxCompletionTokens != nil:
-		return model.MaxCompletionTokens.IntPtr()
-	case model.MaxTokens != nil:
-		return model.MaxTokens.IntPtr()
-	case model.Limits != nil && model.Limits.MaxOutputTokens != nil:
-		return model.Limits.MaxOutputTokens.IntPtr()
-	case model.Limits != nil && model.Limits.MaxCompletionTokens != nil:
-		return model.Limits.MaxCompletionTokens.IntPtr()
-	case model.TopProvider != nil:
-		return model.TopProvider.MaxCompletionTokens.IntPtr()
+	if model.parsedMaxOutputTokens != nil {
+		if count := *model.parsedMaxOutputTokens; count > 0 {
+			return &count
+		}
+	}
+	candidates := []*JSONInt{
+		model.MaxOutputTokens,
+		model.MaxCompletionTokens,
+		model.MaxTokens,
+	}
+	if model.Limits != nil {
+		candidates = append(candidates,
+			model.Limits.Output,
+			model.Limits.MaxOutputTokens,
+			model.Limits.MaxCompletionTokens,
+		)
+	}
+	if model.TopProvider != nil {
+		candidates = append(candidates, model.TopProvider.MaxCompletionTokens)
+	}
+	for _, candidate := range candidates {
+		if count := positiveTokenCountValue(candidate); count != nil {
+			return count
+		}
 	}
 	return nil
+}
+
+// positiveTokenCountValue converts a decoded value, treating nil and
+// non-positive as absent.
+func positiveTokenCountValue(value *JSONInt) *int {
+	if value == nil {
+		return nil
+	}
+	count := int(*value)
+	if count <= 0 {
+		return nil
+	}
+	return &count
 }
 
 // OpenAIListModelsResponse represents an OpenAI list models response
@@ -1831,19 +2151,21 @@ func (response *OpenAIListModelsResponse) UnmarshalJSON(data []byte) error {
 		return sonic.Unmarshal(trimmed, (*envelope)(response))
 	}
 
-	var models []struct {
-		OpenAIModel
-		Organization string `json:"organization"`
-	}
-	if err := sonic.Unmarshal(trimmed, &models); err != nil {
+	// Decode each row on its own: embedding OpenAIModel in a struct would
+	// promote its UnmarshalJSON and silently drop the sibling fields (the
+	// "organization" key Together uses for owned_by).
+	var raws []json.RawMessage
+	if err := sonic.Unmarshal(trimmed, &raws); err != nil {
 		return err
 	}
 
-	response.Data = make([]OpenAIModel, len(models))
-	for i, model := range models {
-		response.Data[i] = model.OpenAIModel
+	response.Data = make([]OpenAIModel, len(raws))
+	for i, raw := range raws {
+		if err := sonic.Unmarshal(raw, &response.Data[i]); err != nil {
+			return err
+		}
 		if response.Data[i].OwnedBy == "" {
-			response.Data[i].OwnedBy = model.Organization
+			response.Data[i].OwnedBy = gjson.GetBytes(raw, "organization").String()
 		}
 	}
 	return nil

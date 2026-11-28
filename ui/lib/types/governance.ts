@@ -118,6 +118,9 @@ export interface VirtualKey {
 	previous_value_expires_at?: string | null; // When set, the pre-rotation value still authenticates until this time
 	rotated_at?: string | null; // Timestamp of the last value rotation
 	calendar_aligned?: boolean;
+	// Caps how many inference requests this key may have in flight at once.
+	// Absent or 0 means unlimited.
+	max_concurrency?: number | null;
 	// When true, every provider is allowed; provider_configs remain optional per-provider overrides
 	allow_all_providers?: boolean;
 	// Tri-state: absent/null inherits client.disable_content_logging, true forces content off for
@@ -260,6 +263,7 @@ export interface CreateVirtualKeyRequest {
 	is_active?: boolean;
 	calendar_aligned?: boolean;
 	allow_all_providers?: boolean; // When true, all providers are allowed
+	max_concurrency?: number; // Caps in-flight inference requests; omit or 0 for unlimited
 	expires_at?: string; // RFC3339 UTC timestamp; omit for a key that never expires
 	disable_content_logging?: boolean; // Omit to inherit the client setting; true forces content off, false forces it on
 	metadata?: Record<string, string>; // Custom key/value attribution; omit for none
@@ -282,6 +286,7 @@ export interface UpdateVirtualKeyRequest {
 	is_active?: boolean;
 	calendar_aligned?: boolean;
 	allow_all_providers?: boolean; // When true, all providers are allowed; omit to leave unchanged
+	max_concurrency?: number; // Caps in-flight inference requests; 0 clears back to unlimited
 	reset_budget_usage?: boolean;
 	expires_at?: string; // RFC3339 UTC timestamp sets a new expiry, "" clears it, omit to leave unchanged
 	disable_content_logging?: boolean | null; // null clears back to inherit, true/false set it, omit to leave unchanged

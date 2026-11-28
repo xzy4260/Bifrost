@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"sort"
 	"sync"
 	"time"
@@ -84,6 +85,20 @@ func (r *tokenRate) perSecond(now time.Time) float64 {
 	return float64(total) / (tokenRateBuckets * tokenRateBucketMS / 1000.0)
 }
 
+// concurrencyLimitTTL bounds how long a resolved per-key concurrency limit is
+// cached. Inference requests resolve their key's limit at most once per TTL, so
+// the limiter costs no database round-trip on the hot path; an edit applies
+// within this window even without an explicit invalidation.
+const concurrencyLimitTTL = 15 * time.Second
+
+// concurrencyLimitEntry is one cached limit. limit == 0 means unlimited, and
+// unknown virtual keys are cached the same way so a caller cannot turn a
+// made-up key into a database query per request.
+type concurrencyLimitEntry struct {
+	limit   int
+	expires time.Time
+}
+
 // ConcurrencyTracker counts the inference requests currently in flight, keyed by
 // the virtual key the caller presented, and the tokens those streams generate.
 type ConcurrencyTracker struct {
@@ -92,11 +107,23 @@ type ConcurrencyTracker struct {
 	total       int
 	tokens      map[string]*tokenRate
 	totalTokens tokenRate
+
+	// store resolves each key's max_concurrency. nil disables enforcement.
+	store configstore.ConfigStore
+
+	limitsMu sync.Mutex
+	limits   map[string]concurrencyLimitEntry
 }
 
-// NewConcurrencyTracker returns an empty tracker.
-func NewConcurrencyTracker() *ConcurrencyTracker {
-	return &ConcurrencyTracker{active: make(map[string]int), tokens: make(map[string]*tokenRate)}
+// NewConcurrencyTracker returns an empty tracker. A nil store keeps counting
+// but leaves every key unlimited.
+func NewConcurrencyTracker(store configstore.ConfigStore) *ConcurrencyTracker {
+	return &ConcurrencyTracker{
+		active: make(map[string]int),
+		tokens: make(map[string]*tokenRate),
+		store:  store,
+		limits: make(map[string]concurrencyLimitEntry),
+	}
 }
 
 // Middleware counts the wrapped request for its whole lifetime. A streamed
@@ -104,6 +131,9 @@ func NewConcurrencyTracker() *ConcurrencyTracker {
 // fasthttp a body stream, and the tokens are written afterwards — so a
 // streaming handler claims the request's lib.ConcurrencySlot through its stream
 // reader, and the count drops when the stream ends instead.
+//
+// A key whose max_concurrency is already reached is rejected here with 429
+// before any provider work happens.
 func (t *ConcurrencyTracker) Middleware() schemas.BifrostHTTPMiddleware {
 	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 		return func(ctx *fasthttp.RequestCtx) {
@@ -111,7 +141,11 @@ func (t *ConcurrencyTracker) Middleware() schemas.BifrostHTTPMiddleware {
 			if vk := governance.ParseVirtualKeyFromFastHTTPRequest(ctx); vk != nil && *vk != "" {
 				key = *vk
 			}
-			t.add(key, 1)
+			if !t.acquire(key, t.limitFor(ctx, key)) {
+				ctx.Response.Header.Set("Retry-After", "1")
+				SendError(ctx, fasthttp.StatusTooManyRequests, "Virtual key concurrency limit reached")
+				return
+			}
 			var once sync.Once
 			slot := lib.NewConcurrencySlot(
 				func() { once.Do(func() { t.add(key, -1) }) },
@@ -130,6 +164,60 @@ func (t *ConcurrencyTracker) Middleware() schemas.BifrostHTTPMiddleware {
 			next(ctx)
 		}
 	}
+}
+
+// acquire claims a slot for key unless its limit is already reached. limit == 0
+// means unlimited. It reports whether the request may proceed.
+func (t *ConcurrencyTracker) acquire(key string, limit int) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if limit > 0 && t.active[key] >= limit {
+		return false
+	}
+	t.total++
+	t.active[key]++
+	return true
+}
+
+// limitFor resolves a key's max_concurrency through a short-lived cache. A nil
+// store, an empty key or a failed lookup all mean unlimited.
+func (t *ConcurrencyTracker) limitFor(ctx context.Context, value string) int {
+	if value == "" || value == unknownVirtualKeyLabel {
+		return 0
+	}
+	now := time.Now()
+	t.limitsMu.Lock()
+	if entry, ok := t.limits[value]; ok && now.Before(entry.expires) {
+		t.limitsMu.Unlock()
+		return entry.limit
+	}
+	t.limitsMu.Unlock()
+	if t.store == nil {
+		return 0
+	}
+
+	limit := 0
+	if vk, err := t.store.GetVirtualKeyByValue(ctx, value); err == nil && vk != nil {
+		if vk.MaxConcurrency != nil && *vk.MaxConcurrency > 0 {
+			limit = int(*vk.MaxConcurrency)
+		}
+	}
+
+	t.limitsMu.Lock()
+	t.limits[value] = concurrencyLimitEntry{limit: limit, expires: now.Add(concurrencyLimitTTL)}
+	t.limitsMu.Unlock()
+	return limit
+}
+
+// InvalidateLimit drops the cached limit for one key value, so an edit applies
+// to the next request instead of after the cache expires.
+func (t *ConcurrencyTracker) InvalidateLimit(value string) {
+	if t == nil || value == "" {
+		return
+	}
+	t.limitsMu.Lock()
+	delete(t.limits, value)
+	t.limitsMu.Unlock()
 }
 
 func (t *ConcurrencyTracker) add(key string, delta int) {

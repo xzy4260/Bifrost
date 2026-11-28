@@ -2,6 +2,7 @@ package openai
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -65,6 +66,133 @@ func TestListModelsByKeyResponseShapes(t *testing.T) {
 			require.Equal(t, schemas.Ptr(test.wantContext), response.Data[0].ContextLength)
 		})
 	}
+}
+
+func TestModelLimitFieldCompatibility(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		body        string
+		wantContext *int
+		wantOutput  *int
+	}{
+		{
+			name:        "singular limit block with max_allowed_size",
+			body:        `{"id":"m","limit":{"context":960000,"output":64000},"max_allowed_size":1000000,"max_output_tokens":64000}`,
+			wantContext: schemas.Ptr(960000),
+			wantOutput:  schemas.Ptr(64000),
+		},
+		{
+			name:        "context_window object takes default",
+			body:        `{"id":"m","context_window":{"default":300000,"supported":[300000,600000,960000]},"max_output_tokens":64000}`,
+			wantContext: schemas.Ptr(300000),
+			wantOutput:  schemas.Ptr(64000),
+		},
+		{
+			name:        "context_window object without default takes widest supported",
+			body:        `{"id":"m","context_window":{"supported":[300000,600000,960000]}}`,
+			wantContext: schemas.Ptr(960000),
+		},
+		{
+			name:        "context_window wins over singular limit when both are present",
+			body:        `{"id":"m","context_window":{"default":300000},"limit":{"context":960000,"output":64000}}`,
+			wantContext: schemas.Ptr(300000),
+			wantOutput:  schemas.Ptr(64000),
+		},
+		{
+			name:        "DeepSeek style int context_window",
+			body:        `{"id":"deepseek-flash","context_window":1048576,"max_output_tokens":393216}`,
+			wantContext: schemas.Ptr(1048576),
+			wantOutput:  schemas.Ptr(393216),
+		},
+		{
+			name:        "Alibaba style max_input_tokens alongside the window",
+			body:        `{"id":"qwen","context_window":1000000,"max_input_tokens":991808,"max_output_tokens":131072}`,
+			wantContext: schemas.Ptr(1000000),
+			wantOutput:  schemas.Ptr(131072),
+		},
+		{
+			name:        "OpenRouter style top_provider envelope",
+			body:        `{"id":"x","context_length":200000,"top_provider":{"context_length":200000,"max_completion_tokens":64000}}`,
+			wantContext: schemas.Ptr(200000),
+			wantOutput:  schemas.Ptr(64000),
+		},
+		{
+			name:        "vLLM style max_model_len",
+			body:        `{"id":"x","max_model_len":32768}`,
+			wantContext: schemas.Ptr(32768),
+		},
+		{
+			name:        "LM Studio style max_context_length with max_tokens",
+			body:        `{"id":"x","max_context_length":8192,"max_tokens":4096}`,
+			wantContext: schemas.Ptr(8192),
+			wantOutput:  schemas.Ptr(4096),
+		},
+		{
+			name:        "llama.cpp style meta block",
+			body:        `{"id":"x","meta":{"n_ctx_train":131072,"n_ctx":8192}}`,
+			wantContext: schemas.Ptr(131072),
+		},
+		{
+			name:        "Ollama style dotted model_info key",
+			body:        `{"id":"x","model_info":{"qwen2.context_length":32768}}`,
+			wantContext: schemas.Ptr(32768),
+		},
+		{
+			name:        "plural limits block",
+			body:        `{"id":"x","limits":{"context_window":200000,"max_output_tokens":32000}}`,
+			wantContext: schemas.Ptr(200000),
+			wantOutput:  schemas.Ptr(32000),
+		},
+		{
+			name:        "numeric strings and fractions",
+			body:        `{"id":"x","context_length":"128000","max_output_tokens":1048576.0}`,
+			wantContext: schemas.Ptr(128000),
+			wantOutput:  schemas.Ptr(1048576),
+		},
+		{
+			name:        "shorthand and separated strings",
+			body:        `{"id":"x","context_length":"128k","max_output_tokens":"32,000"}`,
+			wantContext: schemas.Ptr(128000),
+			wantOutput:  schemas.Ptr(32000),
+		},
+		{
+			name:        "camelCase aliases",
+			body:        `{"id":"x","maxInputTokens":64000,"maxOutputTokens":8000}`,
+			wantContext: schemas.Ptr(64000),
+			wantOutput:  schemas.Ptr(8000),
+		},
+		{
+			name: "unreadable shapes are absent, not zero",
+			body: `{"id":"x","context_window":{"unexpected":true},"max_output_tokens":"n/a"}`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			var model OpenAIModel
+			require.NoError(t, json.Unmarshal([]byte(test.body), &model))
+			require.Equal(t, test.wantContext, model.EffectiveContextLength())
+			require.Equal(t, test.wantOutput, model.EffectiveMaxOutputTokens())
+		})
+	}
+}
+
+func TestListModelsArrayKeepsOrganizationAndLimits(t *testing.T) {
+	t.Parallel()
+
+	var response OpenAIListModelsResponse
+	require.NoError(t, json.Unmarshal([]byte(`[
+		{"id":"zai-org/GLM-5.2","organization":"Z.ai","context_length":131072,"max_output_tokens":8192}
+	]`), &response))
+
+	require.Len(t, response.Data, 1)
+	require.Equal(t, "Z.ai", response.Data[0].OwnedBy)
+	require.Equal(t, schemas.Ptr(131072), response.Data[0].EffectiveContextLength())
+	require.Equal(t, schemas.Ptr(8192), response.Data[0].EffectiveMaxOutputTokens())
 }
 
 func TestModelRetrieveResponseShape(t *testing.T) {

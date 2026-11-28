@@ -291,8 +291,18 @@ type GovernanceHandler struct {
 	sidekiq           *sidekiq.Runner
 	notify            schemas.NotificationPublisher
 	expiryCleanupStop context.CancelFunc
+	// concurrencyTracker caches each key's max_concurrency. Optional: nil until the
+	// server wires it, in which case limit edits apply when the cache expires.
+	concurrencyTracker *ConcurrencyTracker
 	// now is the clock, overridden in tests.
 	now func() time.Time
+}
+
+// SetConcurrencyTracker lets the server share the live concurrency tracker, so
+// changing a key's max_concurrency takes effect on the next request instead of
+// after the tracker's limit cache expires.
+func (h *GovernanceHandler) SetConcurrencyTracker(tracker *ConcurrencyTracker) {
+	h.concurrencyTracker = tracker
 }
 
 // GovernanceRouteRegistrar registers one replaceable governance route family.
@@ -395,8 +405,11 @@ type CreateVirtualKeyRequest struct {
 	IsActive          *bool                   `json:"is_active,omitempty"`
 	CalendarAligned   bool                    `json:"calendar_aligned,omitempty"`    // When true, all budgets reset at clean calendar boundaries
 	AllowAllProviders bool                    `json:"allow_all_providers,omitempty"` // When true, all providers are allowed; provider_configs remain optional overrides
-	ExpiresAt         *time.Time              `json:"expires_at,omitempty"`          // Optional expiry; nil means never expires
-	DeleteAfterExpire *bool                   `json:"delete_after_expire,omitempty"` // Omit to inherit client.delete_expired_virtual_keys; true/false override it. Requires expires_at
+	// MaxConcurrency caps how many inference requests this key may have in flight
+	// at once. Omitted or 0 means unlimited.
+	MaxConcurrency    *int64     `json:"max_concurrency,omitempty"`
+	ExpiresAt         *time.Time `json:"expires_at,omitempty"`          // Optional expiry; nil means never expires
+	DeleteAfterExpire *bool      `json:"delete_after_expire,omitempty"` // Omit to inherit client.delete_expired_virtual_keys; true/false override it. Requires expires_at
 	// DisableContentLogging is the key's own content-logging decision. Omit to inherit
 	// client.disable_content_logging; true forces content off for this key's traffic, false forces
 	// it on for the log store. A project a request is scoped to can override it either way.
@@ -460,8 +473,11 @@ type UpdateVirtualKeyRequest struct {
 	IsActive          *bool                        `json:"is_active,omitempty"`
 	CalendarAligned   *bool                        `json:"calendar_aligned,omitempty"`    // When true, all budgets reset at clean calendar boundaries
 	AllowAllProviders *bool                        `json:"allow_all_providers,omitempty"` // When true, all providers are allowed; nil means leave unchanged
-	ResetBudgetUsage  *bool                        `json:"reset_budget_usage,omitempty"`
-	ExpiresAt         *string                      `json:"expires_at,omitempty"` // RFC3339 timestamp sets a new expiry, "" clears it, omitted leaves it unchanged
+	// MaxConcurrency caps how many inference requests this key may have in flight
+	// at once. Omitted leaves it unchanged; 0 clears it back to unlimited.
+	MaxConcurrency   *int64  `json:"max_concurrency,omitempty"`
+	ResetBudgetUsage *bool   `json:"reset_budget_usage,omitempty"`
+	ExpiresAt        *string `json:"expires_at,omitempty"` // RFC3339 timestamp sets a new expiry, "" clears it, omitted leaves it unchanged
 	// DeleteAfterExpire is tri-state on the wire: omitted leaves the current value, null
 	// clears it back to inheriting client.delete_expired_virtual_keys, true/false set it.
 	// A value requires an expiry.
@@ -487,6 +503,16 @@ var errVirtualKeyDualAssociation = errors.New("VirtualKey cannot be attached to 
 // owner beside a blank one, while the identical create succeeded.
 func optionalJSONStringHasValue(value schemas.OptionalJSON[string]) bool {
 	return value.Set && !value.Null && strings.TrimSpace(value.Value) != ""
+}
+
+// normalizeMaxConcurrency turns the request's "0 or absent means unlimited"
+// contract into the stored representation: nil.
+func normalizeMaxConcurrency(value *int64) *int64 {
+	if value == nil || *value <= 0 {
+		return nil
+	}
+	limit := *value
+	return &limit
 }
 
 // virtualKeyOwnerCount counts the owners a create request names. A key belongs to at most one.
@@ -2293,6 +2319,10 @@ func (h *GovernanceHandler) createVirtualKey(ctx *fasthttp.RequestCtx) {
 		SendError(ctx, 400, err.Error())
 		return
 	}
+	if req.MaxConcurrency != nil && *req.MaxConcurrency < 0 {
+		SendError(ctx, 400, "max_concurrency cannot be negative")
+		return
+	}
 	createProviders := make([]string, 0, len(req.ProviderConfigs))
 	for _, pc := range req.ProviderConfigs {
 		createProviders = append(createProviders, pc.Provider)
@@ -2329,6 +2359,7 @@ func (h *GovernanceHandler) createVirtualKey(ctx *fasthttp.RequestCtx) {
 			IsActive:          isActive,
 			CalendarAligned:   req.CalendarAligned,
 			AllowAllProviders: req.AllowAllProviders,
+			MaxConcurrency:    normalizeMaxConcurrency(req.MaxConcurrency),
 			ExpiresAt:         req.ExpiresAt,
 			// Stored as given: nil inherits client.delete_expired_virtual_keys.
 			DeleteAfterExpire: req.DeleteAfterExpire,
@@ -2713,6 +2744,10 @@ func (h *GovernanceHandler) updateVirtualKey(ctx *fasthttp.RequestCtx) {
 			return
 		}
 	}
+	if req.MaxConcurrency != nil && *req.MaxConcurrency < 0 {
+		SendError(ctx, 400, "max_concurrency cannot be negative")
+		return
+	}
 	// provider_configs is the full desired set (configs it leaves out are deleted), so checking the
 	// request alone covers what the key will hold.
 	updateProviders := make([]string, 0, len(req.ProviderConfigs))
@@ -2817,6 +2852,9 @@ func (h *GovernanceHandler) updateVirtualKey(ctx *fasthttp.RequestCtx) {
 		}
 		if req.AllowAllProviders != nil {
 			vk.AllowAllProviders = *req.AllowAllProviders
+		}
+		if req.MaxConcurrency != nil {
+			vk.MaxConcurrency = normalizeMaxConcurrency(req.MaxConcurrency)
 		}
 		applyVirtualKeyContentLoggingUpdate(vk, &req)
 		// VK top-level and per-provider budgets/rate-limits are stored in VK-scoped model
@@ -3194,6 +3232,11 @@ func (h *GovernanceHandler) updateVirtualKey(ctx *fasthttp.RequestCtx) {
 		SendError(ctx, 500, fmt.Sprintf("Failed to update virtual key: %v", err))
 		return
 	}
+	// Apply a max_concurrency change to the next request instead of waiting for
+	// the tracker's limit cache to expire.
+	if h.concurrencyTracker != nil {
+		h.concurrencyTracker.InvalidateLimit(vk.Value.GetValue())
+	}
 	// Load relationships for response
 	preloadedVk, err := h.configStore.GetVirtualKey(ctx, vk.ID)
 	if err != nil {
@@ -3409,6 +3452,9 @@ func (h *GovernanceHandler) deleteVirtualKey(ctx *fasthttp.RequestCtx) {
 	if err != nil {
 		// But we ignore this error because its not
 		logger.Error("failed to remove virtual key: %v", err)
+	}
+	if h.concurrencyTracker != nil {
+		h.concurrencyTracker.InvalidateLimit(vk.Value.GetValue())
 	}
 	lib.RecordAuditChange(ctx, "virtual_key.deleted", "virtual_key", vk.ID, vk.Name, auditVirtualKey(vk), nil)
 	SendJSON(ctx, map[string]interface{}{

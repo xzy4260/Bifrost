@@ -1714,6 +1714,11 @@ func GenerateVirtualKeyHash(vk tables.TableVirtualKey) (string, error) {
 	if vk.BusinessUnitID != nil {
 		hash.Write([]byte("businessUnitID:" + *vk.BusinessUnitID))
 	}
+	// Hash MaxConcurrency only when set, so every key that predates the column keeps its
+	// existing hash and the upgrade triggers no config drift.
+	if vk.MaxConcurrency != nil {
+		hash.Write([]byte(fmt.Sprintf("maxConcurrency:%d", *vk.MaxConcurrency)))
+	}
 	// Hash RateLimitID
 	if vk.RateLimitID != nil {
 		hash.Write([]byte("rateLimitID:" + *vk.RateLimitID))

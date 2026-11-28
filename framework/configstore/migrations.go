@@ -608,6 +608,7 @@ var configstoreMigrationSteps = []migrationStep{
 	{IDs: []string{"add_oauth2_authorize_requests_device_code_columns"}, run: migrationAddOAuth2AuthorizeRequestsDeviceCodeColumns},
 	{IDs: []string{"add_oauth2_authorize_requests_device_code_indexes"}, run: migrationAddOAuth2AuthorizeRequestsDeviceCodeIndexes},
 	{IDs: []string{"add_client_config_mcp_server_max_protocol_version_column"}, run: migrationAddClientConfigMCPServerMaxProtocolVersionColumn},
+	{IDs: []string{"add_virtual_key_max_concurrency_column"}, run: migrationAddVirtualKeyMaxConcurrencyColumn},
 }
 
 // warpLogEmbeddingColumns are the semantic-search configuration columns added
@@ -16566,6 +16567,34 @@ func migrationAddVirtualKeyMetadataColumn(ctx context.Context, db *gorm.DB, logg
 		},
 		Rollback: func(tx *gorm.DB) error {
 			return fmt.Errorf("add_virtual_key_metadata_column is non-rollbackable: dropping metadata would permanently delete every virtual key's metadata; the column is additive and older binaries safely ignore it")
+		},
+	}})
+	if err := m.Migrate(); err != nil {
+		return fmt.Errorf("error while running db migration: %s", err.Error())
+	}
+	return nil
+}
+
+// migrationAddVirtualKeyMaxConcurrencyColumn adds the max_concurrency column
+// that caps a virtual key's in-flight inference requests.
+func migrationAddVirtualKeyMaxConcurrencyColumn(ctx context.Context, db *gorm.DB, logger schemas.Logger) error {
+	migrationName := "add_virtual_key_max_concurrency_column"
+	logger.Info("[configstore] starting migration %s", migrationName)
+	defer logger.Info("[configstore] finished migration %s", migrationName)
+	m := migrator.New(db, migrator.DefaultOptions, []*migrator.Migration{{
+		ID: migrationName,
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			if err := setMigrationLockTimeout(tx); err != nil {
+				return err
+			}
+			if err := addColumnIfNotExists(tx, logger, &tables.TableVirtualKey{}, "max_concurrency"); err != nil {
+				return fmt.Errorf("failed to add max_concurrency column: %w", err)
+			}
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			return fmt.Errorf("add_virtual_key_max_concurrency_column is non-rollbackable: dropping max_concurrency would silently lift every configured concurrency limit; the column is additive and older binaries safely ignore it")
 		},
 	}})
 	if err := m.Migrate(); err != nil {

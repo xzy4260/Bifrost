@@ -91,7 +91,7 @@ var server *bifrostServer.BifrostHTTPServer
 
 func init() {
 	if Version == "" {
-		Version = "v1.0.2"
+		Version = "v1.0.3"
 	}
 	// Set default host from environment variable or use localhost
 	defaultHost := os.Getenv("BIFROST_HOST")

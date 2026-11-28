@@ -698,13 +698,30 @@ export default function VirtualKeyDetailSheet({
 											</div>
 										) : null}
 
-										{displayRateLimit.token_max_limit == null && displayRateLimit.request_max_limit == null && (
+									{/* Max concurrency */}
+									{virtualKey.max_concurrency ? (
+										<div className="space-y-1 rounded-lg border p-4">
+											<span className="text-sm font-medium">{t("virtualKeys.maxConcurrency")}</span>
+											<p className="text-sm">{virtualKey.max_concurrency.toLocaleString(getLocale())}</p>
+											<p className="text-muted-foreground text-xs">{t("virtualKeys.maxConcurrencyHelp")}</p>
+										</div>
+									) : null}
+
+									{displayRateLimit.token_max_limit == null &&
+										displayRateLimit.request_max_limit == null &&
+										!virtualKey.max_concurrency && (
 											<p className="text-muted-foreground text-sm">{t("virtualKeys.noRateLimits")}</p>
 										)}
-									</div>
-								) : (
-									<p className="text-muted-foreground text-sm">{t("virtualKeys.noRateLimits")}</p>
-								)}
+								</div>
+							) : virtualKey.max_concurrency ? (
+								<div className="space-y-1 rounded-lg border p-4">
+									<span className="text-sm font-medium">{t("virtualKeys.maxConcurrency")}</span>
+									<p className="text-sm">{virtualKey.max_concurrency.toLocaleString(getLocale())}</p>
+									<p className="text-muted-foreground text-xs">{t("virtualKeys.maxConcurrencyHelp")}</p>
+								</div>
+							) : (
+								<p className="text-muted-foreground text-sm">{t("virtualKeys.noRateLimits")}</p>
+							)}
 							</div>
 						</>
 					)}

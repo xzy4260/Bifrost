@@ -278,6 +278,11 @@ type TableVirtualKey struct {
 
 	CalendarAligned bool `gorm:"default:false" json:"calendar_aligned"`
 
+	// MaxConcurrency caps how many inference requests this key may have in
+	// flight at once. Nil or 0 means unlimited; the HTTP concurrency tracker
+	// enforces it before a request reaches a provider.
+	MaxConcurrency *int64 `gorm:"default:null" json:"max_concurrency,omitempty"`
+
 	AllowAllProviders bool `gorm:"default:false" json:"allow_all_providers"`
 
 	// DisableContentLogging is the key's own say on whether request and response content is

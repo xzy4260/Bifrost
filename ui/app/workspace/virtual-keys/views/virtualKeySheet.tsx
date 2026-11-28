@@ -178,6 +178,8 @@ const formSchema = z
 		// Request limits
 		requestMaxLimit: z.number().int().nonnegative().optional(),
 		requestResetDuration: z.string().optional(),
+		// Caps how many inference requests this key may have in flight at once.
+		maxConcurrency: z.number().int().nonnegative().optional(),
 	})
 	.refine(
 		(data) => {
@@ -571,6 +573,7 @@ export default function VirtualKeySheet({ virtualKey, defaultOwner, onSave, onCa
 			tokenResetDuration: virtualKey?.rate_limit?.token_reset_duration || "1h",
 			requestMaxLimit: virtualKey?.rate_limit?.request_max_limit ?? undefined,
 			requestResetDuration: virtualKey?.rate_limit?.request_reset_duration || "1h",
+			maxConcurrency: virtualKey?.max_concurrency ?? undefined,
 		},
 	});
 
@@ -804,6 +807,7 @@ export default function VirtualKeySheet({ virtualKey, defaultOwner, onSave, onCa
 		form.setValue("tokenResetDuration", "1h", { shouldDirty: true });
 		form.setValue("requestMaxLimit", undefined, { shouldDirty: true });
 		form.setValue("requestResetDuration", "1h", { shouldDirty: true });
+		form.setValue("maxConcurrency", undefined, { shouldDirty: true });
 	};
 
 	// Build a request rate-limit payload from the form's rate-limit fields. Returns the field
@@ -965,6 +969,10 @@ export default function VirtualKeySheet({ virtualKey, defaultOwner, onSave, onCa
 					...virtualKeyMetadataUpdate(form.formState.defaultValues?.metadata, data.metadata),
 					...expiryPayload,
 					...deleteAfterExpirePayload,
+					// Always sent for key-managed limits: 0 clears the limit back to unlimited,
+					// and the form carries the stored value otherwise. A profile-governed key
+					// has no limit editor, so its payload leaves the stored value alone.
+					...(isGovernedByOwnerProfile ? {} : { max_concurrency: data.maxConcurrency ?? 0 }),
 				};
 
 				// Add rate limit if enabled
@@ -1055,6 +1063,7 @@ export default function VirtualKeySheet({ virtualKey, defaultOwner, onSave, onCa
 					// Omitted means inherit on create.
 					...(data.contentLogging !== "inherit" ? { disable_content_logging: data.contentLogging === "disabled" } : {}),
 					...(Object.keys(data.metadata).length > 0 ? { metadata: data.metadata } : {}),
+					...(data.maxConcurrency !== undefined ? { max_concurrency: data.maxConcurrency } : {}),
 				};
 
 				// Add rate limit if enabled
@@ -1371,7 +1380,7 @@ export default function VirtualKeySheet({ virtualKey, defaultOwner, onSave, onCa
 											<div className="space-y-4">
 												<div className="flex items-center justify-between gap-2">
 													<Label className="text-sm font-medium">{t("virtualKeys.rateLimitingConfiguration")}</Label>
-													{isEditing && (virtualKey?.rate_limit || watchedTokenMaxLimit || watchedRequestMaxLimit) && (
+													{isEditing && (virtualKey?.rate_limit || watchedTokenMaxLimit || watchedRequestMaxLimit || form.watch("maxConcurrency")) && (
 														<Button
 															type="button"
 															variant="ghost"
@@ -1432,6 +1441,34 @@ export default function VirtualKeySheet({ virtualKey, defaultOwner, onSave, onCa
 																}
 																options={resetDurationOptions}
 															/>
+															<FormMessage />
+														</FormItem>
+													)}
+												/>
+
+												<FormField
+													control={form.control}
+													name="maxConcurrency"
+													render={({ field }) => (
+														<FormItem>
+															<FormLabel className="font-normal">{t("virtualKeys.maxConcurrency")}</FormLabel>
+															<FormControl>
+																<Input
+																	id="maxConcurrency"
+																	type="number"
+																	min={0}
+																	step={1}
+																	inputMode="numeric"
+																	placeholder={t("virtualKeys.maxConcurrencyUnlimited")}
+																	value={field.value ?? ""}
+																	onChange={(event) => {
+																		const raw = event.target.value;
+																		field.onChange(raw === "" ? undefined : Math.max(0, Math.floor(Number(raw))));
+																	}}
+																	data-testid="vk-max-concurrency-input"
+																/>
+															</FormControl>
+															<p className="text-muted-foreground text-xs">{t("virtualKeys.maxConcurrencyHelp")}</p>
 															<FormMessage />
 														</FormItem>
 													)}
