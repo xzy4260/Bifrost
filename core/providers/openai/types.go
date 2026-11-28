@@ -1856,10 +1856,40 @@ var modelLimitsOutputFields = []string{
 	"max_new_tokens",
 }
 
+// widestTokenCount reads a switchable-window object: the biggest size it
+// advertises, from the supported list and the single-value keys beside it.
+func widestTokenCount(value gjson.Result) (int, bool) {
+	if !value.IsObject() {
+		return parseTokenCount(value)
+	}
+	largest, found := 0, false
+	if supported := findModelField(value, "supported", "supported_sizes", "sizes", "values"); supported.IsArray() {
+		if count, ok := largestTokenCount(supported); ok {
+			largest, found = count, true
+		}
+	}
+	for _, key := range []string{"default", "value", "tokens", "max", "maximum", "size"} {
+		if count, ok := parseTokenCount(findModelField(value, key)); ok && count > largest {
+			largest, found = count, true
+		}
+	}
+	return largest, found
+}
+
 // extractContextLength reads the model's total context window from a raw model
 // object, falling back through every name compatible servers use for it.
+// An explicit limit.context is the provider's own answer and wins over the
+// switchable windows a model may advertise; when only those windows are
+// present, the widest one is reported rather than the default.
 func extractContextLength(root gjson.Result) (int, bool) {
-	if count, ok := parseTokenCount(findModelField(root, "context_window")); ok {
+	for _, blockName := range []string{"limit", "limits"} {
+		if block := findModelField(root, blockName); block.Exists() {
+			if count, ok := firstTokenCount(block, "context"); ok {
+				return count, true
+			}
+		}
+	}
+	if count, ok := widestTokenCount(findModelField(root, "context_window")); ok {
 		return count, true
 	}
 	if count, ok := firstTokenCount(root, modelContextLengthFields...); ok {

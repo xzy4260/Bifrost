@@ -84,9 +84,9 @@ func TestModelLimitFieldCompatibility(t *testing.T) {
 			wantOutput:  schemas.Ptr(64000),
 		},
 		{
-			name:        "context_window object takes default",
+			name:        "context_window object takes widest switchable window",
 			body:        `{"id":"m","context_window":{"default":300000,"supported":[300000,600000,960000]},"max_output_tokens":64000}`,
-			wantContext: schemas.Ptr(300000),
+			wantContext: schemas.Ptr(960000),
 			wantOutput:  schemas.Ptr(64000),
 		},
 		{
@@ -95,9 +95,9 @@ func TestModelLimitFieldCompatibility(t *testing.T) {
 			wantContext: schemas.Ptr(960000),
 		},
 		{
-			name:        "context_window wins over singular limit when both are present",
-			body:        `{"id":"m","context_window":{"default":300000},"limit":{"context":960000,"output":64000}}`,
-			wantContext: schemas.Ptr(300000),
+			name:        "singular limit context wins over switchable windows",
+			body:        `{"id":"m","context_window":{"default":300000,"supported":[300000,960000]},"limit":{"context":600000,"output":64000}}`,
+			wantContext: schemas.Ptr(600000),
 			wantOutput:  schemas.Ptr(64000),
 		},
 		{
